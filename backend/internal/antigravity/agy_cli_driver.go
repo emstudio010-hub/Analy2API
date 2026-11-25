@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"cmd2api/internal/netx"
 )
 
 const (
@@ -106,7 +108,8 @@ func buildIsolatedCLIEnv(spec NodeSpec) []string {
 	if fp := strings.TrimSpace(spec.Fingerprint.FingerprintID); fp != "" {
 		filtered = append(filtered, "AGY_FINGERPRINT_ID="+fp)
 	}
-	return filtered
+	// 强制 agy CLI Go 运行时始终启用 HTTP/2 客户端连接 Google（移除宿主机可能残留的 http2client=0）
+	return netx.EnsureGODEBUGHTTP2(filtered)
 }
 
 // ListModelsViaCLI 调用真实 `agy models` 命令解析当前 CLI 客户端的真实可用模型列表。
@@ -490,52 +493,97 @@ func ChatStreamViaCLIWithSession(
 		args = append(args, "--effort", built.Effort)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, args...)
-	cmd.Env = buildIsolatedCLIEnv(spec)
-	cmd.Stdin = bytes.NewReader(stdinPayload)
+	isolatedEnv := buildIsolatedCLIEnv(spec)
+	var wsDir string
 	if spec.AuthDir != "" {
-		wsDir := filepath.Join(spec.AuthDir, "workspace")
+		wsDir = filepath.Join(spec.AuthDir, "workspace")
 		_ = os.MkdirAll(wsDir, 0o755)
-		cmd.Dir = wsDir
-	}
-
-	stdoutPipe, err := cmd.StdoutPipe()
-	if err != nil {
-		unlockSession()
-		return nil, preparedBody, fmt.Errorf("创建 agy CLI stdout 管道失败: %w", err)
-	}
-	stderrBuf := &limitedBuffer{limit: 64 * 1024}
-	cmd.Stderr = stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		unlockSession()
-		return nil, preparedBody, fmt.Errorf("启动真实 agy CLI (%s) 失败: %w", bin, err)
 	}
 
 	pr, pw := io.Pipe()
 	reqID := "chatcmpl-agy-" + randomUUIDv4()[:10]
 	created := time.Now().Unix()
 
+	const maxTransientRetries = 2
 	go func() {
 		defer unlockSession()
 		defer pw.Close()
-		capturedConvID := streamAgyNDJSONToOpenAISSE(ctx, stdoutPipe, pw, built.Model, reqID, created, built.ToolsSpec)
-		_ = cmd.Wait()
-		if capturedConvID == "" {
-			capturedConvID = resumeConvID
+
+		var finalConvID string
+		for attempt := 0; attempt <= maxTransientRetries; attempt++ {
+			if ctx != nil && ctx.Err() != nil {
+				return
+			}
+			if attempt > 0 {
+				backoff := time.Duration(800*attempt) * time.Millisecond
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(backoff):
+				}
+			}
+
+			cmd := exec.CommandContext(ctx, bin, args...)
+			cmd.Env = isolatedEnv
+			cmd.Stdin = bytes.NewReader(stdinPayload)
+			if wsDir != "" {
+				cmd.Dir = wsDir
+			}
+			stdoutPipe, pErr := cmd.StdoutPipe()
+			if pErr != nil {
+				writeAgySSEErrorAndDone(pw, fmt.Sprintf("创建 agy CLI stdout 管道失败: %v", pErr))
+				return
+			}
+			stderrBuf := &limitedBuffer{limit: 64 * 1024}
+			cmd.Stderr = stderrBuf
+
+			if sErr := cmd.Start(); sErr != nil {
+				writeAgySSEErrorAndDone(pw, fmt.Sprintf("启动真实 agy CLI (%s) 失败: %v", bin, sErr))
+				return
+			}
+
+			canRetry := attempt < maxTransientRetries
+			capturedConvID, emittedAny, deferredErr := streamAgyNDJSONToOpenAISSEAttempt(
+				ctx, stdoutPipe, pw, built.Model, reqID, created, built.ToolsSpec, canRetry,
+			)
+			waitErr := cmd.Wait()
+
+			if capturedConvID == "" {
+				capturedConvID = resumeConvID
+			}
+			if deferredErr == "" && !emittedAny && waitErr != nil {
+				msg := strings.TrimSpace(stderrBuf.buf.String())
+				if msg == "" {
+					msg = waitErr.Error()
+				}
+				deferredErr = msg
+			}
+
+			if deferredErr != "" && !emittedAny && canRetry && netx.IsTransientNetworkErrorMessage(deferredErr) {
+				if capturedConvID != "" && capturedConvID != resumeConvID {
+					CleanupConversationDiskArtifacts(homeDir, capturedConvID)
+				}
+				continue
+			}
+
+			if deferredErr != "" && !emittedAny {
+				writeAgySSEErrorAndDone(pw, deferredErr)
+			}
+			finalConvID = capturedConvID
+			break
 		}
 
 		// 根据磁盘保留策略处理本轮 agy 会话持久化产物：
 		//   - stateless（默认）或无上游 session_id：请求一结束立即彻底清理本轮 .db / brain 目录，零磁盘占用
 		//   - ephemeral（显式启用会话复用）：登记映射到 sessStore，留待驱逐/过期/删除时由 onEvict 自动清理
 		if retentionMode == SessionRetentionStateless || isEphemeralCaller {
-			if capturedConvID != "" {
-				CleanupConversationDiskArtifacts(homeDir, capturedConvID)
+			if finalConvID != "" {
+				CleanupConversationDiskArtifacts(homeDir, finalConvID)
 			}
 			return
 		}
-		if capturedConvID != "" {
-			sessStore.Bind(resolvedUpstreamSID, capturedConvID, built.Model, built.TotalNonSysMsgs)
+		if finalConvID != "" {
+			sessStore.Bind(resolvedUpstreamSID, finalConvID, built.Model, built.TotalNonSysMsgs)
 		}
 	}()
 
@@ -590,6 +638,17 @@ type agyUsage struct {
 	TotalTokens     int `json:"total_tokens"`
 }
 
+func writeAgySSEErrorAndDone(dst io.Writer, msg string) {
+	errPayload, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": firstNonEmptyStr(msg, "agy CLI returned error status"),
+			"type":    "upstream_error",
+		},
+	})
+	_, _ = fmt.Fprintf(dst, "data: %s\n\n", errPayload)
+	_, _ = io.WriteString(dst, "data: [DONE]\n\n")
+}
+
 // streamAgyNDJSONToOpenAISSE 解析真实 `agy --output-format stream-json` 的每一行 NDJSON，
 // 输出标准 OpenAI `chat.completion.chunk` SSE 事件流，并返回 agy 分配的 conversation_id (si)。
 func streamAgyNDJSONToOpenAISSE(
@@ -601,6 +660,20 @@ func streamAgyNDJSONToOpenAISSE(
 	created int64,
 	toolsSpec AdaptedToolsSpec,
 ) string {
+	convID, _, _ := streamAgyNDJSONToOpenAISSEAttempt(ctx, src, dst, model, reqID, created, toolsSpec, false)
+	return convID
+}
+
+func streamAgyNDJSONToOpenAISSEAttempt(
+	ctx context.Context,
+	src io.Reader,
+	dst io.Writer,
+	model string,
+	reqID string,
+	created int64,
+	toolsSpec AdaptedToolsSpec,
+	deferTransientError bool,
+) (capturedConvID string, emittedAny bool, deferredErr string) {
 	hasTools := toolsSpec.HasTools()
 	scanner := bufio.NewScanner(src)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -636,11 +709,9 @@ func streamAgyNDJSONToOpenAISSE(
 	}
 
 	var (
-		fullText       strings.Builder
-		lastUsage      map[string]any
-		emittedAny     bool
-		hadToolCall    bool
-		capturedConvID string
+		fullText    strings.Builder
+		lastUsage   map[string]any
+		hadToolCall bool
 	)
 
 	toOpenAIUsage := func(u *agyUsage) map[string]any {
@@ -665,7 +736,7 @@ func streamAgyNDJSONToOpenAISSE(
 
 	for scanner.Scan() {
 		if ctx != nil && ctx.Err() != nil {
-			return capturedConvID
+			return capturedConvID, emittedAny, ""
 		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || !strings.HasPrefix(line, "{") {
@@ -692,7 +763,7 @@ func streamAgyNDJSONToOpenAISSE(
 			if ev.StepUpdate.ThinkingDelta != "" {
 				emittedAny = true
 				if !writeChunk(map[string]any{"reasoning_content": ev.StepUpdate.ThinkingDelta}, nil, nil) {
-					return capturedConvID
+					return capturedConvID, emittedAny, ""
 				}
 			}
 			if ev.StepUpdate.TextDelta != "" {
@@ -700,7 +771,7 @@ func streamAgyNDJSONToOpenAISSE(
 				if !hasTools {
 					emittedAny = true
 					if !writeChunk(map[string]any{"content": ev.StepUpdate.TextDelta}, nil, nil) {
-						return capturedConvID
+						return capturedConvID, emittedAny, ""
 					}
 				}
 			}
@@ -715,15 +786,12 @@ func streamAgyNDJSONToOpenAISSE(
 				lastUsage = toOpenAIUsage(ev.Result.Usage)
 			}
 			if strings.EqualFold(ev.Result.Status, "ERROR") || ev.Result.Error != "" {
-				errPayload, _ := json.Marshal(map[string]any{
-					"error": map[string]any{
-						"message": firstNonEmptyStr(ev.Result.Error, "agy CLI returned error status"),
-						"type":    "upstream_error",
-					},
-				})
-				_, _ = fmt.Fprintf(dst, "data: %s\n\n", errPayload)
-				_, _ = io.WriteString(dst, "data: [DONE]\n\n")
-				return capturedConvID
+				errMsg := firstNonEmptyStr(ev.Result.Error, "agy CLI returned error status")
+				if deferTransientError && !emittedAny && netx.IsTransientNetworkErrorMessage(errMsg) {
+					return capturedConvID, false, errMsg
+				}
+				writeAgySSEErrorAndDone(dst, errMsg)
+				return capturedConvID, true, ""
 			}
 			if fullText.Len() == 0 && ev.Result.Response != "" {
 				fullText.WriteString(ev.Result.Response)
@@ -770,9 +838,13 @@ func streamAgyNDJSONToOpenAISSE(
 			finish = "tool_calls"
 		}
 		_ = writeChunk(map[string]any{}, finish, lastUsage)
+		_, _ = io.WriteString(dst, "data: [DONE]\n\n")
+		return capturedConvID, true, ""
 	}
-	_, _ = io.WriteString(dst, "data: [DONE]\n\n")
-	return capturedConvID
+	if !deferTransientError {
+		_, _ = io.WriteString(dst, "data: [DONE]\n\n")
+	}
+	return capturedConvID, false, ""
 }
 
 func firstNonEmptyStr(vals ...string) string {

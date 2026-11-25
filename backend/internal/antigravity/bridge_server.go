@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"cmd2api/internal/netx"
 )
 
 // BridgeConfig 描述单容器独立真实 agy CLI 客户端桥接服务 (`cmdwb2api agy-bridge`) 的运行配置。
@@ -391,6 +393,7 @@ func RunAgyBridgeServer(cfg BridgeConfig) error {
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	netx.EnableServerHTTP2(srv)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

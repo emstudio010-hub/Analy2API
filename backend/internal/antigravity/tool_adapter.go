@@ -515,12 +515,13 @@ func stringFromAny(v any) string {
 }
 
 var (
-	xmlToolCallBlockRe    = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
-	fencedToolCallBlockRe = regexp.MustCompile("(?s)```(?:tool_call|toolcall)\\s*(\\{.*?\\})\\s*```")
+	xmlToolCallBlockRe    = regexp.MustCompile(`(?s)<tool_call(?:\s+[^>]*)?>\s*(?:` + "```" + `(?:json|tool_call|toolcall)?\s*)?([\[{].*?[\]}])(?:\s*` + "```" + `)?\s*</tool_call>`)
+	fencedToolCallBlockRe = regexp.MustCompile("(?s)```(?:tool_call|toolcall)\\s*([\\[{].*?[\\]}])\\s*```")
+	fencedJSONBlockRe     = regexp.MustCompile("(?s)```json\\s*([\\[{].*?[\\]}])\\s*```")
 )
 
 // ExtractToolCallsFromModelText 从 agy 响应文本中精准提取零个或多个外部工具调用，
-// 并分离保留工具标签外的自然语言正文（prose），支持混合正文 + 并行工具调用。
+// 并分离保留工具标签外的自然语言正文（prose），支持混合正文、单块 JSON 数组、内嵌围栏与并行工具调用。
 func ExtractToolCallsFromModelText(raw string, spec AdaptedToolsSpec) (prose string, calls []ExtractedToolCall) {
 	if strings.TrimSpace(raw) == "" {
 		return "", nil
@@ -532,7 +533,20 @@ func ExtractToolCallsFromModelText(raw string, spec AdaptedToolsSpec) (prose str
 		re = fencedToolCallBlockRe
 		locs = re.FindAllStringSubmatchIndex(raw, -1)
 	}
+	if len(locs) == 0 && len(spec.DeclaredByLower) > 0 {
+		// 仅在严格命中已声明工具名时，容错解析 ```json {"name":"<declared>","arguments":...} ```
+		re = fencedJSONBlockRe
+		locs = re.FindAllStringSubmatchIndex(raw, -1)
+	}
 	if len(locs) == 0 {
+		// 仅当整段响应本身就是单条/数组已声明工具调用 JSON 时容错解析
+		trimmed := strings.TrimSpace(raw)
+		if len(spec.DeclaredByLower) > 0 && ((strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}")) ||
+			(strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]"))) {
+			if bareCalls := parseExtractedToolCallsJSON(trimmed, spec); len(bareCalls) > 0 {
+				return "", bareCalls
+			}
+		}
 		return raw, nil
 	}
 
@@ -546,8 +560,8 @@ func ExtractToolCallsFromModelText(raw string, spec AdaptedToolsSpec) (prose str
 		matchStart, matchEnd := loc[0], loc[1]
 		jsonBody := strings.TrimSpace(raw[loc[2]:loc[3]])
 
-		parsed, ok := parseSingleExtractedToolCall(jsonBody, spec)
-		if !ok {
+		parsedCalls := parseExtractedToolCallsJSON(jsonBody, spec)
+		if len(parsedCalls) == 0 {
 			// 非法或未声明工具块保留原文（避免误吞用户正文）
 			proseBuf.WriteString(raw[lastEnd:matchEnd])
 			lastEnd = matchEnd
@@ -555,7 +569,7 @@ func ExtractToolCallsFromModelText(raw string, spec AdaptedToolsSpec) (prose str
 		}
 		proseBuf.WriteString(raw[lastEnd:matchStart])
 		lastEnd = matchEnd
-		calls = append(calls, parsed)
+		calls = append(calls, parsedCalls...)
 	}
 	if lastEnd < len(raw) {
 		proseBuf.WriteString(raw[lastEnd:])
@@ -571,6 +585,30 @@ func ExtractToolCallsFromModelText(raw string, spec AdaptedToolsSpec) (prose str
 		cleanProse = ""
 	}
 	return cleanProse, calls
+}
+
+func parseExtractedToolCallsJSON(jsonBody string, spec AdaptedToolsSpec) []ExtractedToolCall {
+	trimmed := strings.TrimSpace(jsonBody)
+	if trimmed == "" {
+		return nil
+	}
+	if strings.HasPrefix(trimmed, "[") {
+		var arr []json.RawMessage
+		if err := json.Unmarshal([]byte(trimmed), &arr); err != nil {
+			return nil
+		}
+		out := make([]ExtractedToolCall, 0, len(arr))
+		for _, item := range arr {
+			if tc, ok := parseSingleExtractedToolCall(string(item), spec); ok {
+				out = append(out, tc)
+			}
+		}
+		return out
+	}
+	if tc, ok := parseSingleExtractedToolCall(trimmed, spec); ok {
+		return []ExtractedToolCall{tc}
+	}
+	return nil
 }
 
 func parseSingleExtractedToolCall(jsonBody string, spec AdaptedToolsSpec) (ExtractedToolCall, bool) {

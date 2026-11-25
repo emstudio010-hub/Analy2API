@@ -18,6 +18,7 @@ import (
 
 	"cmd2api/internal/antigravity"
 	"cmd2api/internal/config"
+	"cmd2api/internal/netx"
 	"cmd2api/internal/workbuddy"
 )
 
@@ -200,11 +201,7 @@ type Client struct {
 
 // NewClient 构造上游客户端。
 func NewClient(cfg config.CommandCodeConfig, logger *slog.Logger) *Client {
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 20,
-		IdleConnTimeout:     90 * time.Second,
-	}
+	transport := netx.NewHTTP2Transport(nil)
 
 	// 走代理访问上游。刻意用显式配置而不是 http.ProxyFromEnvironment：
 	// 后者会让服务悄悄继承宿主的 HTTP_PROXY，行为随部署环境漂移，

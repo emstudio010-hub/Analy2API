@@ -449,3 +449,63 @@ func TestBuildAgyStreamInputLine(t *testing.T) {
 		t.Fatalf("message 结构异常: %+v", msg)
 	}
 }
+
+func TestExtractRandomToolCallsHardenedAndHTTP2Env(t *testing.T) {
+	spec := AdaptToolsForAgyCLI([]any{
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        "meow_random_9981",
+				"description": "Arbitrary user-invented tool",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{"x": map[string]any{"type": "integer"}}},
+			},
+		},
+		map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":       "小喵自定义工具_42",
+				"parameters": map[string]any{"type": "object", "properties": map[string]any{"msg": map[string]any{"type": "string"}}},
+			},
+		},
+	}, "auto")
+
+	// 1. <tool_call> 内嵌 ```json 代码围栏
+	_, calls1 := ExtractToolCallsFromModelText("<tool_call>\n```json\n{\"name\":\"meow_random_9981\",\"arguments\":{\"x\":7}}\n```\n</tool_call>", spec)
+	if len(calls1) != 1 || calls1[0].Name != "meow_random_9981" || calls1[0].Arguments != `{"x":7}` {
+		t.Fatalf("内嵌 json 围栏提取失败: %+v", calls1)
+	}
+
+	// 2. 单块 <tool_call> 内含并行工具数组
+	_, calls2 := ExtractToolCallsFromModelText(`<tool_call>[{"name":"meow_random_9981","arguments":{"x":1}},{"name":"小喵自定义工具_42","arguments":{"msg":"hi"}}]</tool_call>`, spec)
+	if len(calls2) != 2 || calls2[0].Name != "meow_random_9981" || calls2[1].Name != "小喵自定义工具_42" {
+		t.Fatalf("JSON 数组并行工具提取失败: %+v", calls2)
+	}
+
+	// 3. 精确命中已声明工具的 ```json 围栏与裸 JSON
+	_, calls3 := ExtractToolCallsFromModelText("```json\n{\"name\":\"小喵自定义工具_42\",\"arguments\":{\"msg\":\"ok\"}}\n```", spec)
+	if len(calls3) != 1 || calls3[0].Name != "小喵自定义工具_42" {
+		t.Fatalf("精确声明 json 围栏提取失败: %+v", calls3)
+	}
+	_, calls4 := ExtractToolCallsFromModelText(`{"name":"meow_random_9981","arguments":{"x":99}}`, spec)
+	if len(calls4) != 1 || calls4[0].Name != "meow_random_9981" {
+		t.Fatalf("裸声明工具 JSON 提取失败: %+v", calls4)
+	}
+	// 非声明的普通 JSON 绝不误吞
+	prose5, calls5 := ExtractToolCallsFromModelText("```json\n{\"name\":\"unknown_data\",\"val\":1}\n```", spec)
+	if len(calls5) != 0 || prose5 == "" {
+		t.Fatalf("未声明普通 JSON 不应被误判为工具调用: calls=%+v prose=%q", calls5, prose5)
+	}
+
+	// 4. buildIsolatedCLIEnv 保证 agy 子进程始终强制开启 HTTP/2 客户端
+	env := buildIsolatedCLIEnv(NodeSpec{AuthDir: t.TempDir()})
+	foundH2 := false
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "GODEBUG=") && strings.Contains(kv, "http2client=1") {
+			foundH2 = true
+			break
+		}
+	}
+	if !foundH2 {
+		t.Fatalf("buildIsolatedCLIEnv 未注入 GODEBUG=http2client=1")
+	}
+}

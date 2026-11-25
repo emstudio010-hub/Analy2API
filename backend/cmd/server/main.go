@@ -23,6 +23,7 @@ import (
 	"cmd2api/internal/db"
 	"cmd2api/internal/filter"
 	"cmd2api/internal/handler"
+	"cmd2api/internal/netx"
 	"cmd2api/internal/prompt"
 	"cmd2api/internal/relay"
 	"cmd2api/internal/scheduler"
@@ -252,6 +253,7 @@ func run() error {
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	netx.EnableServerHTTP2(httpServer)
 
 	errCh := make(chan error, 1)
 	go func() {

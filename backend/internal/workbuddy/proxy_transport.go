@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"cmd2api/internal/netx"
+
 	"golang.org/x/net/proxy"
 )
 
@@ -309,6 +311,11 @@ func buildPooledClient(normalizedProxy string) (*pooledClient, error) {
 			return nil, fmt.Errorf("不支持的代理协议: %s", u.Scheme)
 		}
 	}
+
+	// 强制启用完整 HTTP/2 协商（ALPN h2 + ReadIdleTimeout/PingTimeout 帧级保活），
+	// 覆盖直连、HTTP/HTTPS 代理隧道与 SOCKS5/SOCKS5H 隧道访问 Google / WorkBuddy 等全部 HTTPS 上游，
+	// 防止空闲连接被代理静默断开引发 EOF。
+	netx.ConfigureHTTP2Transport(tr)
 
 	// 不设 http.Client.Timeout，流式长回答不会在途中被整体超时强行掐断。
 	client := &http.Client{

@@ -10,7 +10,7 @@
 [![Vue 3](https://img.shields.io/badge/Vue-3%20%2B%20TypeScript-4FC08D?style=flat-square&logo=vue.js&logoColor=white)](https://vuejs.org/)
 [![License: LGPL-3.0](https://img.shields.io/badge/License-LGPL--3.0-ff69b4?style=flat-square)](LICENSE)
 [![Co-Creators](https://img.shields.io/badge/Co--Creators-%E5%B0%8F%E5%96%B5%20%C2%B7%20ChatGPT%20%C2%B7%20Gemini--4-ffb6c1?style=flat-square)](#-共创团队--co-creators)
-[![Release](https://img.shields.io/badge/Release-v1.1.0-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
+[![Release](https://img.shields.io/badge/Release-v1.1.1-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
 
 </div>
 
@@ -168,7 +168,7 @@ flowchart LR
 - **分组级系统提示词引擎**：支持全局/分组两级提示词模板、`append_global` / `override_global` / `replace_all` / `off` 四种策略与动态变量渲染预览。
 - **153 条内置内容风控规则**：支持可视化增删改、在线测试预览与一键恢复默认。
 - **精细计费与仪表盘**：模型定价目录、分组倍率 × 账号倍率、首字延迟 TTFT 与缓存命中去重统计。
-- **稳定可靠底座**：三级超时看门狗（首字 / 流式空闲 / 非流式空闲）、Cron 定时任务调度、设备指纹一键轮换、HTTP 安全头 & 前端静态资源强缓存、SQLite WAL 零依赖默认（可无缝切 PostgreSQL）。
+- **稳定可靠底座（全链路 HTTP/2 抗 EOF）**：全部出站连接（含直连 Google `googleapis.com` / `cloudcode-pa.googleapis.com`、HTTP/HTTPS/SOCKS5 代理隧道、WorkBuddy、CommandCode、OpenCode 与远程拉取 IP）统一强制协商 **HTTP/2 (`ALPN h2` + 25s PING 帧级保活 + 首字节前瞬时 EOF/GOAWAY 自动重建连接重试)**；`agy` 子进程强制 `GODEBUG=http2client=1` 并内置首帧前瞬时断流透明重试；服务端同步支持 HTTP/1.1 + HTTP/2 + H2C。搭配三级超时看门狗、Cron 定时任务、设备指纹轮换、静态资源强缓存与 SQLite WAL 零依赖默认（可无缝切 PostgreSQL）。
 
 ---
 

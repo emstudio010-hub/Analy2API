@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"cmd2api/internal/netx"
 	"cmd2api/internal/workbuddy"
 )
 
@@ -206,26 +207,27 @@ func (c *Client) sendNodeRequest(ctx context.Context, spec NodeSpec, method, pat
 	}
 	targetURL := base + pathAndQuery
 
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, targetURL, reader)
-	if err != nil {
-		return nil, fmt.Errorf("构造节点请求 %s %s 失败: %w", method, targetURL, err)
-	}
-	if hdrs != nil {
-		req.Header = hdrs.Clone()
-	}
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", antigravityClientUA)
-	}
-
 	httpClient, _, err := c.HTTPClientForNode(spec)
 	if err != nil {
 		return nil, fmt.Errorf("选择节点代理客户端失败: %w", err)
 	}
-	return httpClient.Do(req)
+	return netx.DoWithEOFRetry(ctx, httpClient, func() (*http.Request, error) {
+		var rdr io.Reader
+		if body != nil {
+			rdr = bytes.NewReader(body)
+		}
+		req, rErr := http.NewRequestWithContext(ctx, method, targetURL, rdr)
+		if rErr != nil {
+			return nil, fmt.Errorf("构造节点请求 %s %s 失败: %w", method, targetURL, rErr)
+		}
+		if hdrs != nil {
+			req.Header = hdrs.Clone()
+		}
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", antigravityClientUA)
+		}
+		return req, nil
+	}, 2)
 }
 
 func resolveCLIUserAgent(spec NodeSpec) string {

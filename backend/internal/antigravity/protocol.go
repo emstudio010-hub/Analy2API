@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"cmd2api/internal/netx"
 )
 
 const (
@@ -836,10 +838,10 @@ type CodeAssistProjectResult struct {
 	TierName  string `json:"tier_name,omitempty"`
 }
 
-// ExchangeOAuthCode 使用官方 AntiGravity ClientID/ClientSecret + PKCE code_verifier 向 Google 兑换真实 OAuth Token。
+// ExchangeOAuthCode 使用官方 AntiGravity ClientID/ClientSecret + PKCE code_verifier 通过 HTTP/2 向 Google 兑换真实 OAuth Token。
 func ExchangeOAuthCode(ctx context.Context, httpClient *http.Client, code, codeVerifier, redirectURI, tokenURL string) (*OAuthTokenResult, error) {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = netx.NewHTTP2Client(30 * time.Second)
 	}
 	if strings.TrimSpace(tokenURL) == "" {
 		tokenURL = GoogleOAuthTokenURL
@@ -857,15 +859,17 @@ func ExchangeOAuthCode(ctx context.Context, httpClient *http.Client, code, codeV
 	if strings.TrimSpace(codeVerifier) != "" {
 		form.Set("code_verifier", strings.TrimSpace(codeVerifier))
 	}
+	encodedForm := form.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", BuildCLIUserAgent("", "", ""))
-
-	resp, err := httpClient.Do(req)
+	resp, err := netx.DoWithEOFRetry(ctx, httpClient, func() (*http.Request, error) {
+		req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(encodedForm))
+		if rErr != nil {
+			return nil, rErr
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("User-Agent", BuildCLIUserAgent("", "", ""))
+		return req, nil
+	}, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -885,22 +889,23 @@ func ExchangeOAuthCode(ctx context.Context, httpClient *http.Client, code, codeV
 	return &out, nil
 }
 
-// FetchGoogleUserInfo 使用 access_token 拉取 Google 账号邮箱与名称。
+// FetchGoogleUserInfo 使用 access_token 通过 HTTP/2 拉取 Google 账号邮箱与名称。
 func FetchGoogleUserInfo(ctx context.Context, httpClient *http.Client, accessToken, userInfoURL string) (*GoogleUserInfo, error) {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = netx.NewHTTP2Client(20 * time.Second)
 	}
 	if strings.TrimSpace(userInfoURL) == "" {
 		userInfoURL = GoogleUserInfoURL
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, userInfoURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
-	req.Header.Set("User-Agent", BuildCLIUserAgent("", "", ""))
-
-	resp, err := httpClient.Do(req)
+	resp, err := netx.DoWithEOFRetry(ctx, httpClient, func() (*http.Request, error) {
+		req, rErr := http.NewRequestWithContext(ctx, http.MethodGet, userInfoURL, nil)
+		if rErr != nil {
+			return nil, rErr
+		}
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
+		req.Header.Set("User-Agent", BuildCLIUserAgent("", "", ""))
+		return req, nil
+	}, 2)
 	if err != nil {
 		return nil, err
 	}
@@ -917,10 +922,10 @@ func FetchGoogleUserInfo(ctx context.Context, httpClient *http.Client, accessTok
 	return &info, nil
 }
 
-// LoadCodeAssist 调用官方 `POST /v1internal:loadCodeAssist` 获取账号绑定的 cloudaicompanionProject（project_id）与层级。
+// LoadCodeAssist 通过 HTTP/2 调用官方 `POST /v1internal:loadCodeAssist` 获取账号绑定的 cloudaicompanionProject（project_id）与层级。
 func LoadCodeAssist(ctx context.Context, httpClient *http.Client, baseURL, accessToken, userAgent string) (*CodeAssistProjectResult, error) {
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = netx.NewHTTP2Client(30 * time.Second)
 	}
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
@@ -938,15 +943,16 @@ func LoadCodeAssist(ctx context.Context, httpClient *http.Client, baseURL, acces
 			"ideName":    "Antigravity",
 		},
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1internal:loadCodeAssist", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
-	req.Header.Set("User-Agent", ua)
-
-	resp, err := httpClient.Do(req)
+	resp, err := netx.DoWithEOFRetry(ctx, httpClient, func() (*http.Request, error) {
+		req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1internal:loadCodeAssist", bytes.NewReader(body))
+		if rErr != nil {
+			return nil, rErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(accessToken))
+		req.Header.Set("User-Agent", ua)
+		return req, nil
+	}, 2)
 	if err != nil {
 		return nil, err
 	}

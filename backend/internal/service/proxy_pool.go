@@ -24,6 +24,7 @@ import (
 	"cmd2api/ent/account"
 	"cmd2api/ent/systemsetting"
 	"cmd2api/internal/domain"
+	"cmd2api/internal/netx"
 	"cmd2api/internal/workbuddy"
 )
 
@@ -609,26 +610,27 @@ func (s *ProxyPoolService) FetchFromRemote(ctx context.Context, urlOverride stri
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	var bodyRdr io.Reader
-	if method == http.MethodPost && fetchCfg.Body != "" {
-		bodyRdr = strings.NewReader(fetchCfg.Body)
-	}
-	req, err := http.NewRequestWithContext(reqCtx, method, targetURL, bodyRdr)
-	if err != nil {
-		return nil, fmt.Errorf("构造远程拉取请求失败: %w", err)
-	}
-	req.Header.Set("User-Agent", "Analy2API-ProxyPool/1.0")
-	for hk, hv := range fetchCfg.Headers {
-		if strings.TrimSpace(hk) != "" {
-			req.Header.Set(strings.TrimSpace(hk), strings.TrimSpace(hv))
-		}
-	}
-
 	cli := s.httpCli
 	if cli == nil {
-		cli = &http.Client{Timeout: timeout}
+		cli = netx.NewHTTP2Client(timeout)
 	}
-	resp, err := cli.Do(req)
+	resp, err := netx.DoWithEOFRetry(reqCtx, cli, func() (*http.Request, error) {
+		var bodyRdr io.Reader
+		if method == http.MethodPost && fetchCfg.Body != "" {
+			bodyRdr = strings.NewReader(fetchCfg.Body)
+		}
+		req, rErr := http.NewRequestWithContext(reqCtx, method, targetURL, bodyRdr)
+		if rErr != nil {
+			return nil, fmt.Errorf("构造远程拉取请求失败: %w", rErr)
+		}
+		req.Header.Set("User-Agent", "Analy2API-ProxyPool/1.0")
+		for hk, hv := range fetchCfg.Headers {
+			if strings.TrimSpace(hk) != "" {
+				req.Header.Set(strings.TrimSpace(hk), strings.TrimSpace(hv))
+			}
+		}
+		return req, nil
+	}, 2)
 	if err != nil {
 		s.recordFetchStatus(ctx, 0, err.Error())
 		return &ProxyFetchResult{OK: false, FetchedURL: targetURL, DryRun: dryRun, Error: err.Error()}, fmt.Errorf("请求远程代理接口失败: %w", err)

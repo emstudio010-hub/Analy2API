@@ -460,22 +460,49 @@ func convertTools(tools []map[string]any) []ccTool {
 	return out
 }
 
-// convertToolChoice 把 OpenAI 的 tool_choice 转成 CC（Anthropic 风格）形态。
+// convertToolChoice 把 OpenAI / Responses / 特殊工具的 tool_choice 转成 CC（Anthropic 风格）形态。
 func convertToolChoice(choice any) any {
 	switch c := choice.(type) {
 	case nil:
 		return nil
 	case string:
-		mapping := map[string]string{"auto": "auto", "none": "none", "required": "any"}
-		mapped, ok := mapping[c]
-		if !ok {
-			mapped = "auto"
+		trimmed := strings.TrimSpace(c)
+		switch strings.ToLower(trimmed) {
+		case "":
+			return nil
+		case "auto":
+			return map[string]any{"type": "auto"}
+		case "none":
+			return map[string]any{"type": "none"}
+		case "required", "any":
+			return map[string]any{"type": "any"}
+		default:
+			// 裸工具名字符串（例如随机工具名或兼容层扁平化后的函数名）转为精确指定工具
+			return map[string]any{"type": "tool", "name": toWireToolName(trimmed)}
 		}
-		return map[string]any{"type": mapped}
 	case map[string]any:
-		if c["type"] == "function" {
-			fn, _ := c["function"].(map[string]any)
-			return map[string]any{"type": "tool", "name": fn["name"]}
+		tLower := strings.ToLower(strings.TrimSpace(toString(c["type"])))
+		switch tLower {
+		case "function", "custom", "tool":
+			if fn, ok := c["function"].(map[string]any); ok && fn != nil {
+				if name := strings.TrimSpace(toString(fn["name"])); name != "" {
+					return map[string]any{"type": "tool", "name": toWireToolName(name)}
+				}
+			}
+			if name := strings.TrimSpace(toString(c["name"])); name != "" {
+				return map[string]any{"type": "tool", "name": toWireToolName(name)}
+			}
+		case "auto", "none", "any":
+			return map[string]any{"type": tLower}
+		case "required":
+			return map[string]any{"type": "any"}
+		default:
+			if name := strings.TrimSpace(toString(c["name"])); name != "" {
+				return map[string]any{"type": "tool", "name": toWireToolName(name)}
+			}
+			if tLower != "" {
+				return map[string]any{"type": "tool", "name": toWireToolName(tLower)}
+			}
 		}
 		// 已经是 Anthropic 风格就直接透传。
 		return c
