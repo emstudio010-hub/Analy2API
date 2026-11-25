@@ -10,7 +10,7 @@
 [![Vue 3](https://img.shields.io/badge/Vue-3%20%2B%20TypeScript-4FC08D?style=flat-square&logo=vue.js&logoColor=white)](https://vuejs.org/)
 [![License: LGPL-3.0](https://img.shields.io/badge/License-LGPL--3.0-ff69b4?style=flat-square)](LICENSE)
 [![Co-Creators](https://img.shields.io/badge/Co--Creators-%E5%B0%8F%E5%96%B5%20%C2%B7%20ChatGPT%20%C2%B7%20Gemini--4-ffb6c1?style=flat-square)](#-共创团队--co-creators)
-[![Release](https://img.shields.io/badge/Release-v1.0.0-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
+[![Release](https://img.shields.io/badge/Release-v1.1.0-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
 
 </div>
 
@@ -125,18 +125,21 @@ flowchart LR
 
 ---
 
-### 4. 远程补号专用 Key & 统一推号接口
+### 4. 远程补号专用 Key、代理 IP 池与动态拉取自动分配
 
-再也不用手动登后台一个个粘账号啦！只要拿着 **网关网址 + 管理员 Key（或专门签发的最小权限补号 Key）**，发卡机、采集脚本或 CI 机器人就能直接把新号“投喂”进账号池 🥣🐾
+再也不用手动登后台一个个粘账号、配代理啦！只要拿着 **网关网址 + 管理员 Key（或专门签发的最小权限补号 Key）**，发卡机、采集脚本或 CI 机器人就能直接把新号“投喂”进账号池，还能**自动轮询 IP 池、按 Key 独立绑 IP，甚至池空时自动从代理商 API 拉取新 IP** 🥣🐾
 
 - **最小权限安全设计**：
-  - 新增 `push_accounts`（**仅远程补号**）权限档位：拿到这把 Key 的外部机器**只能推号和探活**，访问 `/api/accounts`、`/api/settings` 等任何其它后台接口都会被立刻 `403` 拦下；同时 `full` 全权管理员 Key 也直接支持补号。
+  - 新增 `push_accounts`（**仅远程补号**）权限档位：拿到这把 Key 的外部机器**只能推号、探活与调整自身补号代理 / 更换账号 IP**，访问 `/api/accounts`、`/api/proxy-pool`、`/api/settings` 等任何其它后台接口都会被立刻 `403` 拦下；同时 `full` 全权管理员 Key 也直接支持补号。
   - 支持 Header 鉴权（`X-Push-Key` / `X-Management-Key` / `X-Admin-Key` / `Authorization: Bearer adm-...`）以及补号端点专属 URL 参数（`?key=adm-...` / `?admin_key=adm-...`）。
+- **代理 IP 池 & 远程代理商自动拉取**：
+  - **多格式自动规范化**：支持 `http(s)://user:pass@ip:port`、`socks5(h)://...`、`ip:port:user:pass`、`ip:port` 与行尾 `#标签`（如 `#us` / `#jp`），密码全链路脱敏展示。
+  - **四种分配策略**：`round_robin`（顺序轮询）/ `least_used`（最少账号占用优先）/ `sticky_unique`（独占 IP 优先，用完自动拉新）/ `random`（随机），并支持设置 **每 IP 最大绑定账号数**（填 `1` 即严格 1 账号 1 独立 IP）。
+  - **外部代理商 API 拉取**：支持配置任意 HTTP/HTTPS 提取接口（自动识别纯文本与嵌套 JSON，支持自定义 `json_path`、默认协议与默认账密），支持「手动立即拉取」「定时轮询补充」以及「**池空或达每 IP 上限时补号自动触发拉新**」。
+  - **灵活的四级 IP 分配优先级**：`请求体显式传 ip/proxy_url/proxy_list` → `单把补号 Key 专属代理策略（固定 IP / 限定池标签 / 独立拉取源 / 直连）` → `全局 IP 池轮询与自动拉取` → `直连`；支持通过 `PUT /api/remote/accounts/push/proxy` 让补号 Key 自助调整自身默认 IP 或直接给池内已有账号换 IP（AntiGravity 账号同步更新其 1:1 独立容器出口）。
 - **全平台、全格式、幂等安全**：
-  - 统一入口：`POST /api/remote/accounts/push`（别名 `POST /api/accounts/push`）与探活 `GET /api/remote/accounts/push/info`。
-  - 支持 **AntiGravity / WorkBuddy / Command Code / OpenCode** 四平台，支持单条 JSON、批量 `accounts`/`items`、裸 JSON 数组 `[]`、多行密钥文本 `raw_text`。
-  - 支持平台自动推断、`group_name` 自动匹配或创建、默认幂等更新（`upsert: true`）、AntiGravity 账号自动拉起 1:1 独立容器并写入 `auth_json`；响应体**绝不回显明文密钥 / refresh_token**。
-  - 后台「远程管理密钥」页面内置「**签发补号专用 Key**」快捷按钮、一键复制推号 URL，以及开箱即用的 cURL / Python 四平台补号代码模板。
+  - 统一入口：`POST /api/remote/accounts/push`（别名 `POST /api/accounts/push`）、探活 `GET /api/remote/accounts/push/info`、自助调 IP `GET/PUT /api/remote/accounts/push/proxy` 与触发拉新 `POST /api/remote/accounts/push/proxy/fetch`。
+  - 支持 **AntiGravity / WorkBuddy / Command Code / OpenCode** 四平台，支持单条 JSON、批量 `accounts`/`items`、裸 JSON 数组 `[]`、多行密钥文本 `raw_text`，支持自动建组、默认幂等更新（`upsert: true`）、AGY 自动拉起独立容器；响应体**绝不回显明文密钥或代理密码**。
 
 ---
 
@@ -322,8 +325,10 @@ resp = requests.post(
 print(resp.status_code, resp.json())
 ```
 
-> 💡 极简 Webhook 场景也支持 URL 传参：`POST https://你的域名/api/remote/accounts/push?key=adm-你的补号Key`  
-> 💡 探活接口：`GET https://你的域名/api/remote/accounts/push/info`（返回服务版本、支持平台与推荐字段说明）
+> 💡 极简 Webhook 场景也支持 URL 传参：`POST https://你的域名/api/remote/accounts/push?key=adm-你的补号Key&proxy_mode=pool&proxy_tag=us`  
+> 💡 批量传 IP 列表：`{"proxy_list": ["1.2.3.4:8080:u:p", "socks5://5.6.7.8:1080"], "accounts": [...]}`（按顺序自动轮询分配）  
+> 💡 补号 Key 自助调自身默认 IP / 给已有账号换 IP：`PUT https://你的域名/api/remote/accounts/push/proxy`（支持 `{"mode":"fixed","fixed_proxy_url":"1.2.3.4:8080:u:p"}` 或 `{"account_name":"agy-kitten-01","rotate_from_pool":true}`）  
+> 💡 探活接口：`GET https://你的域名/api/remote/accounts/push/info`（返回服务版本、支持平台、分组清单与当前 IP 池/Key 代理策略摘要）
 
 ---
 

@@ -45,6 +45,7 @@ type Handler struct {
 	toolObf         *service.ToolObfuscationService
 	sessionGuard    *service.SessionGuardService
 	oauth           *service.OAuthService
+	proxyPool       *service.ProxyPoolService
 	cfg             *config.Config
 	logger          *slog.Logger
 
@@ -153,6 +154,16 @@ func (h *Handler) SetSessionGuardService(sg *service.SessionGuardService) {
 func (h *Handler) SetOAuthService(oauth *service.OAuthService) {
 	h.lazyMu.Lock()
 	h.oauth = oauth
+	h.lazyMu.Unlock()
+}
+
+// SetProxyPoolService 注入代理 IP 池与远程补号自动分配服务。
+func (h *Handler) SetProxyPoolService(pp *service.ProxyPoolService) {
+	h.lazyMu.Lock()
+	h.proxyPool = pp
+	if h.accounts != nil && pp != nil {
+		h.accounts.SetProxyPoolService(pp)
+	}
 	h.lazyMu.Unlock()
 }
 
@@ -291,6 +302,22 @@ func (h *Handler) oauthSvc() *service.OAuthService {
 		h.oauth = service.NewOAuthService(h.client, h.accounts, agy, relayCli, h.logger)
 	}
 	return h.oauth
+}
+
+func (h *Handler) proxyPoolSvc() *service.ProxyPoolService {
+	h.lazyMu.Lock()
+	defer h.lazyMu.Unlock()
+	if h.proxyPool == nil {
+		if h.accounts != nil && h.accounts.ProxyPoolService() != nil {
+			h.proxyPool = h.accounts.ProxyPoolService()
+		} else if h.client != nil {
+			h.proxyPool = service.NewProxyPoolService(h.client, h.logger)
+		}
+	}
+	if h.proxyPool != nil && h.accounts != nil && h.accounts.ProxyPoolService() == nil {
+		h.accounts.SetProxyPoolService(h.proxyPool)
+	}
+	return h.proxyPool
 }
 
 // ---- 通用响应 helper ----

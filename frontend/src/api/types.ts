@@ -513,7 +513,103 @@ export interface ApiKeyPayload {
   status?: string
 }
 
-// ---- 远程管理密钥 (/admin-keys) ----
+// ---- 远程管理密钥 (/admin-keys) & 代理 IP 池 (/proxy-pool) ----
+
+export type ProxyPoolStrategy = 'round_robin' | 'least_used' | 'sticky_unique' | 'random'
+export type KeyProxyMode = 'inherit' | 'pool' | 'fixed' | 'fetch' | 'direct'
+
+export interface AdminKeyProxyPolicy {
+  mode: KeyProxyMode | string
+  fixed_proxy_url?: string
+  fixed_proxy_masked?: string
+  pool_tag?: string
+  strategy?: ProxyPoolStrategy | 'inherit' | string
+  fetch_url_override?: string
+  allow_override_in_push?: boolean
+}
+
+export interface ProxyPoolEntry {
+  id: string
+  url: string
+  masked_url?: string
+  tag?: string
+  note?: string
+  enabled: boolean
+  source?: 'manual' | 'remote_fetch' | string
+  added_at?: string
+  last_used_at?: string
+  last_check_ok?: boolean | null
+  last_exit_ip?: string
+  last_latency_ms?: number
+  last_error?: string
+  bound_accounts?: number
+}
+
+export interface ProxyFetchConfig {
+  enabled: boolean
+  url: string
+  method: 'GET' | 'POST' | string
+  headers?: Record<string, string>
+  body?: string
+  default_scheme: 'http' | 'https' | 'socks5' | 'socks5h' | string
+  username?: string
+  password?: string
+  default_tag?: string
+  json_path?: string
+  auto_fetch_on_empty: boolean
+  replace_on_fetch: boolean
+  interval_minutes: number
+  timeout_seconds: number
+  last_fetched_at?: string
+  last_fetch_count?: number
+  last_fetch_error?: string
+}
+
+export interface ProxyPoolConfig {
+  enabled: boolean
+  strategy: ProxyPoolStrategy | string
+  max_accounts_per_ip: number
+  apply_platforms?: string[]
+  entries: ProxyPoolEntry[]
+  fetch: ProxyFetchConfig
+  key_policies?: Record<number, AdminKeyProxyPolicy>
+  cursor?: number
+}
+
+export interface ProxyPoolStats {
+  total_entries: number
+  enabled_entries: number
+  manual_entries: number
+  fetched_entries: number
+  bound_total: number
+  tags: string[]
+}
+
+export interface ProxyPoolView {
+  config: ProxyPoolConfig
+  stats: ProxyPoolStats
+}
+
+export interface ProxyFetchResult {
+  ok: boolean
+  fetched_url: string
+  parsed_count: number
+  added_count: number
+  updated_count: number
+  total_pool_size: number
+  dry_run: boolean
+  sample_proxies: string[]
+  error?: string
+}
+
+export interface ProxyProbeResult {
+  id?: string
+  masked_url: string
+  ok: boolean
+  exit_ip?: string
+  latency_ms: number
+  error?: string
+}
 
 export interface AdminKey {
   id: number
@@ -528,11 +624,13 @@ export interface AdminKey {
   is_bootstrap?: boolean
   created_at: string
   updated_at: string
+  proxy_policy?: AdminKeyProxyPolicy
 }
 
 export interface AdminKeyConnectionInfo {
   base_url: string
   push_accounts_url?: string
+  push_proxy_url?: string
   headers: Record<string, string>
   examples?: Record<string, string>
 }
@@ -549,6 +647,7 @@ export interface CreateAdminKeyPayload {
   allowed_ips?: string
   expires_at?: string | null
   status?: CommonStatus | string
+  proxy_policy?: AdminKeyProxyPolicy
 }
 
 export interface CreateAdminKeyResponse {
@@ -563,6 +662,7 @@ export interface UpdateAdminKeyPayload {
   expires_at?: string | null
   clear_expiry?: boolean
   status?: CommonStatus | string
+  proxy_policy?: AdminKeyProxyPolicy
 }
 
 // ---- 调用明细日志 ----

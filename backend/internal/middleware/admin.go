@@ -244,8 +244,12 @@ func isRemoteAccountPushPath(urlPath string) bool {
 	p := strings.TrimRight(strings.ToLower(strings.TrimSpace(urlPath)), "/")
 	return p == "/api/remote/accounts/push" ||
 		p == "/api/remote/accounts/push/info" ||
+		p == "/api/remote/accounts/push/proxy" ||
+		p == "/api/remote/accounts/push/proxy/fetch" ||
 		p == "/api/accounts/push" ||
-		p == "/api/accounts/push/info"
+		p == "/api/accounts/push/info" ||
+		p == "/api/accounts/push/proxy" ||
+		p == "/api/accounts/push/proxy/fetch"
 }
 
 // extractAdminKey 按优先级提取管理密钥：

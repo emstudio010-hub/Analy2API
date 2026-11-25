@@ -27,6 +27,7 @@ type AccountService struct {
 	relayClient *relay.Client
 	sched       *scheduler.Scheduler
 	agSvc       *AntigravityService
+	proxyPool   *ProxyPoolService
 	logger      *slog.Logger
 }
 
@@ -35,6 +36,21 @@ func (s *AccountService) SetAntigravityService(agSvc *AntigravityService) {
 	if s != nil {
 		s.agSvc = agSvc
 	}
+}
+
+// SetProxyPoolService 注入代理 IP 池服务，用于远程补号自动轮询分配 IP、远程拉取代理与 Key 级策略执行。
+func (s *AccountService) SetProxyPoolService(pp *ProxyPoolService) {
+	if s != nil {
+		s.proxyPool = pp
+	}
+}
+
+// ProxyPoolService 返回当前绑定的代理 IP 池服务（未注入时为 nil）。
+func (s *AccountService) ProxyPoolService() *ProxyPoolService {
+	if s == nil {
+		return nil
+	}
+	return s.proxyPool
 }
 
 // NewAccountService 构造 AccountService。

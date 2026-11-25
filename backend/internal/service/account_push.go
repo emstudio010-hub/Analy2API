@@ -31,6 +31,13 @@ type RemotePushAccountItem struct {
 	BaseURL        string          `json:"base_url,omitempty"`
 	AccountMode    string          `json:"account_mode,omitempty"`
 	ProxyURL       string          `json:"proxy_url,omitempty"`
+	Proxy          string          `json:"proxy,omitempty"`
+	IP             string          `json:"ip,omitempty"`
+	ProxyIP        string          `json:"proxy_ip,omitempty"`
+	ProxyMode      string          `json:"proxy_mode,omitempty"`
+	ProxyTag       string          `json:"proxy_tag,omitempty"`
+	ProxyStrategy  string          `json:"proxy_strategy,omitempty"`
+	ProxyFetchURL  string          `json:"proxy_fetch_url,omitempty"`
 	Qimei36        string          `json:"qimei36,omitempty"`
 	MachineID      string          `json:"machine_id,omitempty"`
 	ProjectID      string          `json:"project_id,omitempty"`
@@ -48,19 +55,25 @@ type RemotePushAccountItem struct {
 	Upsert         *bool           `json:"upsert,omitempty"`
 }
 
-// RemotePushAccountsInput 描述一次远程推号请求（支持单条或批量数组 + 默认覆盖参数）。
+// RemotePushAccountsInput 描述一次远程推号请求（支持单条或批量数组 + 默认覆盖参数 + 代理 IP 分配策略）。
 type RemotePushAccountsInput struct {
+	AdminKeyID           int64
 	DefaultPlatform      string
 	DefaultGroupIDs      []int64
 	DefaultGroupName     string
 	DefaultProxyURL      string
+	DefaultProxyList     []string
+	DefaultProxyMode     string
+	DefaultProxyTag      string
+	DefaultProxyStrategy string
+	DefaultProxyFetchURL string
 	DefaultAccountMode   string
 	DefaultUpsert        bool
 	DefaultAutoProvision bool
 	Items                []RemotePushAccountItem
 }
 
-// RemotePushAccountItemResult 描述单条远程推号的执行明细（绝不回显明文密钥）。
+// RemotePushAccountItemResult 描述单条远程推号的执行明细（绝不回显明文密钥与代理密码）。
 type RemotePushAccountItemResult struct {
 	Index           int     `json:"index"`
 	OK              bool    `json:"ok"`
@@ -70,6 +83,10 @@ type RemotePushAccountItemResult struct {
 	Platform        string  `json:"platform,omitempty"`
 	GroupIDs        []int64 `json:"group_ids,omitempty"`
 	ContainerNodeID int64   `json:"container_node_id,omitempty"`
+	AssignedProxy   string  `json:"assigned_proxy,omitempty"`
+	ProxySource     string  `json:"proxy_source,omitempty"`
+	ProxyTag        string  `json:"proxy_tag,omitempty"`
+	ProxyWarning    string  `json:"proxy_warning,omitempty"`
 	Error           string  `json:"error,omitempty"`
 }
 
@@ -138,9 +155,10 @@ func (s *AccountService) PushAccounts(ctx context.Context, in RemotePushAccounts
 		Total:   len(in.Items),
 		Results: make([]RemotePushAccountItemResult, 0, len(in.Items)),
 	}
+	inFlightBindings := make(map[string]int)
 
 	for idx, item := range in.Items {
-		itemRes := s.pushSingleAccount(ctx, idx, item, in)
+		itemRes := s.pushSingleAccount(ctx, idx, item, in, inFlightBindings)
 		res.Results = append(res.Results, itemRes)
 		switch itemRes.Action {
 		case "created":
@@ -160,6 +178,7 @@ func (s *AccountService) pushSingleAccount(
 	idx int,
 	item RemotePushAccountItem,
 	batch RemotePushAccountsInput,
+	inFlightBindings map[string]int,
 ) RemotePushAccountItemResult {
 	// 1. 解析附带的 auth_json / token_json（便于直接推送整份 Google/AGY/WorkBuddy OAuth JSON）
 	rawAuthBytes := firstValidJSONBytes(item.AuthJSON, item.TokenJSON)
@@ -207,7 +226,17 @@ func (s *AccountService) pushSingleAccount(
 		batch.DefaultAccountMode,
 		mapStringField(authMap, "account_mode", "mode"),
 	)
-	proxyURL := firstNonEmptyPush(item.ProxyURL, batch.DefaultProxyURL)
+	itemProxyRaw := firstNonEmptyPush(
+		item.ProxyURL,
+		item.Proxy,
+		item.IP,
+		item.ProxyIP,
+		mapStringField(authMap, "proxy_url", "proxy"),
+	)
+	reqProxyMode := firstNonEmptyPush(item.ProxyMode, batch.DefaultProxyMode)
+	reqProxyTag := firstNonEmptyPush(item.ProxyTag, batch.DefaultProxyTag)
+	reqProxyStrategy := firstNonEmptyPush(item.ProxyStrategy, batch.DefaultProxyStrategy)
+	reqProxyFetchURL := firstNonEmptyPush(item.ProxyFetchURL, batch.DefaultProxyFetchURL)
 
 	// 2. 自动识别或归一化目标平台
 	rawPlatform := firstNonEmptyPush(item.Platform, batch.DefaultPlatform, mapStringField(authMap, "platform", "provider"))
@@ -289,6 +318,33 @@ func (s *AccountService) pushSingleAccount(
 	// 5. 幂等查重（优先按 email -> uid -> name -> 相同凭证匹配），命中且 upsert=true 时直接刷新凭证并重新激活
 	if upsert {
 		if existing := s.findExistingAccountForPush(ctx, platform, email, uid, strings.TrimSpace(item.Name), apiKey); existing != nil {
+			alloc, allocErr := s.allocatePushProxy(ctx, ProxyAllocationRequest{
+				AdminKeyID:        batch.AdminKeyID,
+				Platform:          platform,
+				ItemProxyRaw:      itemProxyRaw,
+				BatchProxyRaw:     batch.DefaultProxyURL,
+				BatchProxyList:    batch.DefaultProxyList,
+				BatchIndex:        idx,
+				RequestMode:       reqProxyMode,
+				RequestTag:        reqProxyTag,
+				RequestStrategy:   reqProxyStrategy,
+				FetchURLOverride:  reqProxyFetchURL,
+				InFlightBindings:  inFlightBindings,
+				ExistingProxyURL:  existing.ProxyURL,
+				AllowEmptyOnError: true,
+			})
+			if allocErr != nil {
+				return RemotePushAccountItemResult{
+					Index:    idx,
+					OK:       false,
+					Action:   "failed",
+					Name:     existing.Name,
+					Platform: platform,
+					Error:    allocErr.Error(),
+				}
+			}
+			proxyURL := alloc.ProxyURL
+
 			activeStatus := domain.StatusActive
 			schedTrue := true
 			updIn := UpdateAccountInput{
@@ -308,7 +364,10 @@ func (s *AccountService) pushSingleAccount(
 			if nickname != "" {
 				updIn.Nickname = &nickname
 			}
-			if proxyURL != "" {
+			if alloc.Source == "direct" || alloc.Source == "key_direct" {
+				empty := ""
+				updIn.ProxyURL = &empty
+			} else if proxyURL != "" && alloc.Source != "existing" {
 				updIn.ProxyURL = &proxyURL
 			}
 			if baseURL != "" {
@@ -342,7 +401,7 @@ func (s *AccountService) pushSingleAccount(
 
 			var nodeID int64
 			if platform == domain.PlatformAntigravity && s.agSvc != nil && (autoProvision || len(rawAuthBytes) > 0) {
-				nodeID = s.ensureAntigravityPushContainer(ctx, updated, proxyURL, item.AuthFilename, rawAuthBytes, email, apiKey, refreshToken, projectID)
+				nodeID = s.ensureAntigravityPushContainer(ctx, updated, updated.ProxyURL, item.AuthFilename, rawAuthBytes, email, apiKey, refreshToken, projectID)
 			}
 			return RemotePushAccountItemResult{
 				Index:           idx,
@@ -353,11 +412,42 @@ func (s *AccountService) pushSingleAccount(
 				Platform:        platform,
 				GroupIDs:        extractAccountGroupIDs(updated),
 				ContainerNodeID: nodeID,
+				AssignedProxy:   MaskProxyURL(updated.ProxyURL),
+				ProxySource:     alloc.Source,
+				ProxyTag:        alloc.Tag,
+				ProxyWarning:    alloc.Warning,
 			}
 		}
 	}
 
-	// 6. 新建账号入池
+	// 6. 为新建账号分配代理 IP（请求显式指定 -> 批量 proxy_list -> Key 专属策略 -> 全局 IP 池轮询/最少占用/独占/自动远程拉取）
+	alloc, allocErr := s.allocatePushProxy(ctx, ProxyAllocationRequest{
+		AdminKeyID:        batch.AdminKeyID,
+		Platform:          platform,
+		ItemProxyRaw:      itemProxyRaw,
+		BatchProxyRaw:     batch.DefaultProxyURL,
+		BatchProxyList:    batch.DefaultProxyList,
+		BatchIndex:        idx,
+		RequestMode:       reqProxyMode,
+		RequestTag:        reqProxyTag,
+		RequestStrategy:   reqProxyStrategy,
+		FetchURLOverride:  reqProxyFetchURL,
+		InFlightBindings:  inFlightBindings,
+		AllowEmptyOnError: true,
+	})
+	if allocErr != nil {
+		return RemotePushAccountItemResult{
+			Index:    idx,
+			OK:       false,
+			Action:   "failed",
+			Name:     name,
+			Platform: platform,
+			Error:    allocErr.Error(),
+		}
+	}
+	proxyURL := alloc.ProxyURL
+
+	// 7. 新建账号入池
 	qimei, mid := workbuddy.EnsureDevice(item.Qimei36, item.MachineID)
 	concurrency := item.Concurrency
 	if concurrency <= 0 {
@@ -422,7 +512,136 @@ func (s *AccountService) pushSingleAccount(
 		Platform:        platform,
 		GroupIDs:        extractAccountGroupIDs(created),
 		ContainerNodeID: nodeID,
+		AssignedProxy:   MaskProxyURL(created.ProxyURL),
+		ProxySource:     alloc.Source,
+		ProxyTag:        alloc.Tag,
+		ProxyWarning:    alloc.Warning,
 	}
+}
+
+func (s *AccountService) allocatePushProxy(ctx context.Context, req ProxyAllocationRequest) (ProxyAllocationResult, error) {
+	if s.proxyPool != nil {
+		return s.proxyPool.AllocateForPush(ctx, req)
+	}
+	// 无代理池实例时仍完整支持请求体显式传 IP/代理并规范化
+	if strings.EqualFold(strings.TrimSpace(req.RequestMode), "direct") {
+		return ProxyAllocationResult{Source: "direct"}, nil
+	}
+	raw := strings.TrimSpace(req.ItemProxyRaw)
+	src := "request"
+	if raw == "" && len(req.BatchProxyList) > 0 {
+		raw = strings.TrimSpace(req.BatchProxyList[req.BatchIndex%len(req.BatchProxyList)])
+		src = "request_list"
+	}
+	if raw == "" {
+		raw = strings.TrimSpace(req.BatchProxyRaw)
+		src = "request_default"
+	}
+	if raw == "" {
+		if strings.TrimSpace(req.ExistingProxyURL) != "" {
+			return ProxyAllocationResult{ProxyURL: req.ExistingProxyURL, MaskedProxyURL: MaskProxyURL(req.ExistingProxyURL), Source: "existing"}, nil
+		}
+		return ProxyAllocationResult{Source: "direct"}, nil
+	}
+	norm, err := NormalizeProxyAddress(raw, "http", "", "")
+	if err != nil {
+		return ProxyAllocationResult{}, fmt.Errorf("代理地址格式不合法 (%q): %w", raw, err)
+	}
+	return ProxyAllocationResult{ProxyURL: norm, MaskedProxyURL: MaskProxyURL(norm), Source: src}, nil
+}
+
+// ReassignAccountProxyInput 描述远程调整指定已有账号代理 IP 的输入。
+type ReassignAccountProxyInput struct {
+	AdminKeyID       int64
+	AccountID        int64
+	AccountName      string
+	Email            string
+	ProxyRaw         string
+	ProxyMode        string // "" | "pool" | "fetch" | "direct"
+	ProxyTag         string
+	ProxyStrategy    string
+	FetchURLOverride string
+}
+
+// ReassignAccountProxyResult 描述远程更换已有账号代理 IP 的结果。
+type ReassignAccountProxyResult struct {
+	OK            bool   `json:"ok"`
+	AccountID     int64  `json:"account_id"`
+	Name          string `json:"name"`
+	Platform      string `json:"platform"`
+	AssignedProxy string `json:"assigned_proxy"`
+	ProxySource   string `json:"proxy_source"`
+	ProxyTag      string `json:"proxy_tag,omitempty"`
+}
+
+// ReassignAccountProxy 供远程补号 Key / 管理员随时给池中已有账号更换或轮换出口代理 IP（AntiGravity 同步更新容器出口）。
+func (s *AccountService) ReassignAccountProxy(ctx context.Context, in ReassignAccountProxyInput) (*ReassignAccountProxyResult, error) {
+	var target *ent.Account
+	if in.AccountID > 0 {
+		row, err := s.client.Account.Query().
+			Where(account.IDEQ(in.AccountID), account.DeletedAtIsNil()).
+			Only(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("未找到账号 #%d", in.AccountID)
+		}
+		target = row
+	} else {
+		q := s.client.Account.Query().Where(account.DeletedAtIsNil())
+		if email := strings.TrimSpace(in.Email); email != "" {
+			row, err := q.Clone().Where(account.EmailEqualFold(email)).First(ctx)
+			if err == nil {
+				target = row
+			}
+		}
+		if target == nil && strings.TrimSpace(in.AccountName) != "" {
+			row, err := q.Clone().Where(account.NameEQ(strings.TrimSpace(in.AccountName))).First(ctx)
+			if err == nil {
+				target = row
+			}
+		}
+		if target == nil {
+			return nil, errors.New("未找到匹配的目标账号（请提供有效的 account_id、account_name 或 email）")
+		}
+	}
+
+	mode := strings.TrimSpace(in.ProxyMode)
+	if mode == "" && strings.TrimSpace(in.ProxyRaw) == "" {
+		mode = KeyProxyModePool
+	}
+	alloc, err := s.allocatePushProxy(ctx, ProxyAllocationRequest{
+		AdminKeyID:        in.AdminKeyID,
+		Platform:          domain.NormalizePlatform(target.Platform),
+		ItemProxyRaw:      in.ProxyRaw,
+		RequestMode:       mode,
+		RequestTag:        in.ProxyTag,
+		RequestStrategy:   in.ProxyStrategy,
+		FetchURLOverride:  in.FetchURLOverride,
+		AllowEmptyOnError: false,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	nextProxy := alloc.ProxyURL
+	updated, err := s.Update(ctx, target.ID, UpdateAccountInput{ProxyURL: &nextProxy})
+	if err != nil {
+		return nil, fmt.Errorf("更新账号代理失败: %w", err)
+	}
+	// AntiGravity 账号同步更新其绑定的 1:1 容器节点出口代理
+	if domain.NormalizePlatform(updated.Platform) == domain.PlatformAntigravity && s.agSvc != nil {
+		if nodeID := extractExtraInt64(updated.Extra, "node_id"); nodeID > 0 {
+			_, _ = s.agSvc.UpdateNode(ctx, nodeID, UpdateContainerNodeInput{ProxyURL: &nextProxy})
+		}
+	}
+	return &ReassignAccountProxyResult{
+		OK:            true,
+		AccountID:     updated.ID,
+		Name:          updated.Name,
+		Platform:      domain.NormalizePlatform(updated.Platform),
+		AssignedProxy: MaskProxyURL(updated.ProxyURL),
+		ProxySource:   alloc.Source,
+		ProxyTag:      alloc.Tag,
+	}, nil
 }
 
 func (s *AccountService) ensureAntigravityPushContainer(

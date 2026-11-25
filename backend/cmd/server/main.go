@@ -184,6 +184,11 @@ func run() error {
 	accountService.SetAntigravityService(antigravityService)
 	rewardsService := service.NewRewardsService(client, accountService, antigravityService, logger)
 	oauthService := service.NewOAuthService(client, accountService, antigravityService, relayClient, logger)
+	proxyPoolService := service.NewProxyPoolService(client, logger)
+	if err := proxyPoolService.EnsureSeeded(ctx); err != nil {
+		return fmt.Errorf("初始化代理 IP 池: %w", err)
+	}
+	accountService.SetProxyPoolService(proxyPoolService)
 
 	cronService := service.NewCronService(client, accountService, logger)
 	if err := cronService.EnsureSeeded(ctx); err != nil {
@@ -216,6 +221,7 @@ func run() error {
 	}
 
 	go cronService.Start(ctx)
+	go proxyPoolService.Start(ctx)
 
 	h := handler.New(client, vault, issuer, sched, relayService, accountService, cfg, logger, filterService)
 	h.SetCronService(cronService)
@@ -228,6 +234,7 @@ func run() error {
 	h.SetToolObfuscationService(toolObfService)
 	h.SetSessionGuardService(sessionGuardService)
 	h.SetOAuthService(oauthService)
+	h.SetProxyPoolService(proxyPoolService)
 
 	router := server.NewRouter(server.Options{
 		Handler:              h,

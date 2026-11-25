@@ -64,6 +64,10 @@ import type {
   PromptTemplate,
   PromptTemplateListResponse,
   PromptTemplatePayload,
+  ProxyFetchResult,
+  ProxyPoolConfig,
+  ProxyPoolView,
+  ProxyProbeResult,
   ProxyTestResult,
   RequestAntigravityOAuthPayload,
   RewardsOverviewResponse,
@@ -465,6 +469,36 @@ export const adminKeysApi = {
   create: createAdminKey,
   update: updateAdminKey,
   remove: deleteAdminKey,
+}
+
+// ---- 代理 IP 池 & 远程拉取 (/proxy-pool) ----
+
+export function getProxyPool() {
+  return get<ProxyPoolView>('/proxy-pool')
+}
+
+export function updateProxyPool(payload: ProxyPoolConfig & { raw_proxies?: string; raw_tag?: string }) {
+  return put<ProxyPoolView>('/proxy-pool', payload)
+}
+
+export function addProxyPoolEntries(payload: { raw_text?: string; proxies?: string[]; tag?: string; note?: string }) {
+  return post<{ ok: boolean; added: number; view: ProxyPoolView }>('/proxy-pool/entries', payload)
+}
+
+export function deleteProxyPoolEntry(id: string) {
+  return del<ProxyPoolView>(`/proxy-pool/entries/${encodeURIComponent(id)}`)
+}
+
+export function fetchProxyPool(payload?: { url?: string; dry_run?: boolean }) {
+  return post<{ ok: boolean; result: ProxyFetchResult; view?: ProxyPoolView; error?: string }>('/proxy-pool/fetch', payload ?? {})
+}
+
+export function probeProxyPool(payload?: { entry_id?: string; proxy_url?: string; limit?: number }) {
+  return post<{ ok: boolean; results: ProxyProbeResult[] }>('/proxy-pool/test', payload ?? {})
+}
+
+export function allocateProxyPoolPreview(payload?: { admin_key_id?: number; platform?: string; tag?: string; strategy?: string; mode?: string; fetch_url?: string }) {
+  return post<{ ok: boolean; masked_proxy_url: string; source: string; tag?: string; entry_id?: string; warning?: string }>('/proxy-pool/allocate', payload ?? {})
 }
 
 // ---- 内容风控与词库 ----

@@ -102,8 +102,23 @@ func NewRouter(opts Options) *gin.Engine {
 			// 四端上游账号池与远程补号推送入口（支持 full 与最小权限 push_accounts 补号专用密钥）
 			admin.POST("/remote/accounts/push", h.RemotePushAccounts)
 			admin.GET("/remote/accounts/push/info", h.GetRemotePushInfo)
+			admin.GET("/remote/accounts/push/proxy", h.GetRemotePushProxyConfig)
+			admin.PUT("/remote/accounts/push/proxy", h.UpdateRemotePushProxyConfig)
+			admin.POST("/remote/accounts/push/proxy/fetch", h.FetchRemotePushProxyPool)
 			admin.POST("/accounts/push", h.RemotePushAccounts)
 			admin.GET("/accounts/push/info", h.GetRemotePushInfo)
+			admin.GET("/accounts/push/proxy", h.GetRemotePushProxyConfig)
+			admin.PUT("/accounts/push/proxy", h.UpdateRemotePushProxyConfig)
+			admin.POST("/accounts/push/proxy/fetch", h.FetchRemotePushProxyPool)
+
+			// 代理 IP 池管理、远程拉取代理源与轮询/独占自动分配
+			admin.GET("/proxy-pool", h.GetProxyPool)
+			admin.PUT("/proxy-pool", h.UpdateProxyPool)
+			admin.POST("/proxy-pool/entries", h.AddProxyPoolEntries)
+			admin.DELETE("/proxy-pool/entries/:id", h.DeleteProxyPoolEntry)
+			admin.POST("/proxy-pool/fetch", h.FetchProxyPool)
+			admin.POST("/proxy-pool/test", h.ProbeProxyPool)
+			admin.POST("/proxy-pool/allocate", h.AllocateProxyPoolPreview)
 
 			admin.GET("/accounts", h.ListAccounts)
 			admin.POST("/accounts", h.CreateAccount)

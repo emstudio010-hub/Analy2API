@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"cmd2api/internal/middleware"
 	"cmd2api/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -18,6 +19,15 @@ type remotePushEnvelope struct {
 	GroupIDs      []int64                         `json:"group_ids,omitempty"`
 	GroupName     string                          `json:"group_name,omitempty"`
 	ProxyURL      string                          `json:"proxy_url,omitempty"`
+	Proxy         string                          `json:"proxy,omitempty"`
+	IP            string                          `json:"ip,omitempty"`
+	ProxyIP       string                          `json:"proxy_ip,omitempty"`
+	ProxyList     []string                        `json:"proxy_list,omitempty"`
+	IPs           []string                        `json:"ips,omitempty"`
+	ProxyMode     string                          `json:"proxy_mode,omitempty"`
+	ProxyTag      string                          `json:"proxy_tag,omitempty"`
+	ProxyStrategy string                          `json:"proxy_strategy,omitempty"`
+	ProxyFetchURL string                          `json:"proxy_fetch_url,omitempty"`
 	AccountMode   string                          `json:"account_mode,omitempty"`
 	Upsert        *bool                           `json:"upsert,omitempty"`
 	AutoProvision *bool                           `json:"auto_provision,omitempty"`
@@ -26,7 +36,7 @@ type remotePushEnvelope struct {
 	RawText       string                          `json:"raw_text,omitempty"`
 }
 
-// GetRemotePushInfo 返回远程补号接口的连通性状态、支持平台及活跃分组清单
+// GetRemotePushInfo 返回远程补号接口的连通性状态、支持平台、活跃分组清单及代理 IP 池/当前 Key 策略摘要
 // （GET /api/remote/accounts/push/info 及 GET /api/accounts/push/info）。
 func (h *Handler) GetRemotePushInfo(c *gin.Context) {
 	info, err := h.accounts.GetRemotePushInfo(c.Request.Context())
@@ -35,22 +45,43 @@ func (h *Handler) GetRemotePushInfo(c *gin.Context) {
 		return
 	}
 	baseURL := h.deriveConnectionBaseURL(c)
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"ok":                  info.OK,
 		"service":             info.Service,
 		"push_url":            baseURL + "/api/remote/accounts/push",
+		"push_proxy_url":      baseURL + "/api/remote/accounts/push/proxy",
 		"supported_platforms": info.SupportedPlatforms,
 		"groups":              info.Groups,
-	})
+	}
+	if pp := h.proxyPoolSvc(); pp != nil {
+		if view, vErr := pp.GetView(c.Request.Context()); vErr == nil && view != nil {
+			resp["proxy_pool"] = gin.H{
+				"enabled":             view.Config.Enabled,
+				"strategy":            view.Config.Strategy,
+				"max_accounts_per_ip": view.Config.MaxAccountsPerIP,
+				"enabled_entries":     view.Stats.EnabledEntries,
+				"tags":                view.Stats.Tags,
+				"remote_fetch_ready":  view.Config.Fetch.Enabled && strings.TrimSpace(view.Config.Fetch.URL) != "",
+			}
+		}
+		if ak, ok := middleware.AdminKeyFrom(c); ok && ak != nil {
+			resp["key_proxy_policy"] = pp.GetKeyPolicy(c.Request.Context(), ak.ID)
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // RemotePushAccounts 远程推送补号接口（POST /api/remote/accounts/push 及 POST /api/accounts/push）：
 // 拿着节点网址 + 管理员 Key（full 或专用 push_accounts 权限）即可单条或批量补号进池：
 //   - 支持单账号 JSON 对象：{ "platform": "antigravity", "email": "...", "refresh_token": "...", ... }
-//   - 支持批量数组信封：{ "platform": "workbuddy", "group_name": "prod", "accounts": [ ... ] }
+//   - 支持批量数组信封：{ "platform": "workbuddy", "group_name": "prod", "proxy_list": [...], "accounts": [ ... ] }
 //   - 支持直接裸 JSON 数组：[ { ... }, { ... } ]
 //   - 支持原始 Command Code auth.json / 多行 `名称,user_xxx` 文本：{ "raw_text": "..." }
+//   - 代理 IP 自动按「单条传参 -> 批量 proxy_list/proxy_url -> Key 专属策略 -> 全局 IP 池轮询/自动远程拉取」分配。
 func (h *Handler) RemotePushAccounts(c *gin.Context) {
+	// 确保 ProxyPoolService 已懒加载并绑定至 AccountService
+	_ = h.proxyPoolSvc()
+
 	rawBody, err := io.ReadAll(io.LimitReader(c.Request.Body, 8<<20))
 	if err != nil {
 		fail(c, http.StatusBadRequest, "读取请求体失败")
@@ -62,7 +93,18 @@ func (h *Handler) RemotePushAccounts(c *gin.Context) {
 		return
 	}
 
+	var adminKeyID int64
+	if ak, ok := middleware.AdminKeyFrom(c); ok && ak != nil {
+		adminKeyID = ak.ID
+	}
+
 	input := service.RemotePushAccountsInput{
+		AdminKeyID:           adminKeyID,
+		DefaultProxyURL:      firstNonEmptyStr(c.Query("proxy_url"), c.Query("proxy"), c.Query("ip")),
+		DefaultProxyMode:     strings.TrimSpace(c.Query("proxy_mode")),
+		DefaultProxyTag:      strings.TrimSpace(c.Query("proxy_tag")),
+		DefaultProxyStrategy: strings.TrimSpace(c.Query("proxy_strategy")),
+		DefaultProxyFetchURL: strings.TrimSpace(c.Query("proxy_fetch_url")),
 		DefaultUpsert:        true,
 		DefaultAutoProvision: true,
 	}
@@ -82,7 +124,16 @@ func (h *Handler) RemotePushAccounts(c *gin.Context) {
 		}
 		input.DefaultPlatform = strings.TrimSpace(env.Platform)
 		input.DefaultGroupName = strings.TrimSpace(env.GroupName)
-		input.DefaultProxyURL = strings.TrimSpace(env.ProxyURL)
+		input.DefaultProxyURL = firstNonEmptyStr(env.ProxyURL, env.Proxy, env.IP, env.ProxyIP, input.DefaultProxyURL)
+		if len(env.ProxyList) > 0 {
+			input.DefaultProxyList = append(input.DefaultProxyList, env.ProxyList...)
+		} else if len(env.IPs) > 0 {
+			input.DefaultProxyList = append(input.DefaultProxyList, env.IPs...)
+		}
+		input.DefaultProxyMode = firstNonEmptyStr(env.ProxyMode, input.DefaultProxyMode)
+		input.DefaultProxyTag = firstNonEmptyStr(env.ProxyTag, input.DefaultProxyTag)
+		input.DefaultProxyStrategy = firstNonEmptyStr(env.ProxyStrategy, input.DefaultProxyStrategy)
+		input.DefaultProxyFetchURL = firstNonEmptyStr(env.ProxyFetchURL, input.DefaultProxyFetchURL)
 		input.DefaultAccountMode = strings.TrimSpace(env.AccountMode)
 		if len(env.GroupIDs) > 0 {
 			input.DefaultGroupIDs = append(input.DefaultGroupIDs, env.GroupIDs...)

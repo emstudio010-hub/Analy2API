@@ -14,21 +14,22 @@ import (
 )
 
 type adminKeyDTO struct {
-	ID         int64     `json:"id"`
-	Name       string    `json:"name"`
-	KeyPrefix  string    `json:"key_prefix"`
-	MaskedKey  string    `json:"masked_key"`
-	Scopes     string    `json:"scopes"`
-	AllowedIPs string    `json:"allowed_ips"`
-	Status     string    `json:"status"`
-	LastUsedAt *string   `json:"last_used_at"`
-	ExpiresAt  *string   `json:"expires_at"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ID          int64                        `json:"id"`
+	Name        string                       `json:"name"`
+	KeyPrefix   string                       `json:"key_prefix"`
+	MaskedKey   string                       `json:"masked_key"`
+	Scopes      string                       `json:"scopes"`
+	AllowedIPs  string                       `json:"allowed_ips"`
+	Status      string                       `json:"status"`
+	LastUsedAt  *string                      `json:"last_used_at"`
+	ExpiresAt   *string                      `json:"expires_at"`
+	CreatedAt   time.Time                    `json:"created_at"`
+	UpdatedAt   time.Time                    `json:"updated_at"`
+	ProxyPolicy *service.AdminKeyProxyPolicy `json:"proxy_policy,omitempty"`
 }
 
-func toAdminKeyDTO(row *ent.AdminKey) adminKeyDTO {
-	return adminKeyDTO{
+func toAdminKeyDTO(row *ent.AdminKey, policy ...service.AdminKeyProxyPolicy) adminKeyDTO {
+	dto := adminKeyDTO{
 		ID:         row.ID,
 		Name:       row.Name,
 		KeyPrefix:  row.KeyPrefix,
@@ -41,6 +42,11 @@ func toAdminKeyDTO(row *ent.AdminKey) adminKeyDTO {
 		CreatedAt:  row.CreatedAt,
 		UpdatedAt:  row.UpdatedAt,
 	}
+	if len(policy) > 0 {
+		p := policy[0]
+		dto.ProxyPolicy = &p
+	}
+	return dto
 }
 
 func (h *Handler) deriveConnectionBaseURL(c *gin.Context) string {
@@ -77,9 +83,20 @@ func (h *Handler) ListAdminKeys(c *gin.Context) {
 		return
 	}
 
+	var policies map[int64]service.AdminKeyProxyPolicy
+	if pp := h.proxyPoolSvc(); pp != nil {
+		policies = pp.GetAllKeyPolicies(c.Request.Context())
+	}
+
 	items := make([]adminKeyDTO, 0, len(rows))
 	for _, r := range rows {
-		items = append(items, toAdminKeyDTO(r))
+		if p, ok := policies[r.ID]; ok {
+			items = append(items, toAdminKeyDTO(r, p))
+		} else if pp := h.proxyPoolSvc(); pp != nil {
+			items = append(items, toAdminKeyDTO(r, pp.GetKeyPolicy(c.Request.Context(), r.ID)))
+		} else {
+			items = append(items, toAdminKeyDTO(r))
+		}
 	}
 
 	baseURL := h.deriveConnectionBaseURL(c)
@@ -89,6 +106,7 @@ func (h *Handler) ListAdminKeys(c *gin.Context) {
 		"connection": gin.H{
 			"base_url":          baseURL,
 			"push_accounts_url": baseURL + "/api/remote/accounts/push",
+			"push_proxy_url":    baseURL + "/api/remote/accounts/push/proxy",
 			"headers": gin.H{
 				"X-Management-Key": "adm-<your_secret_key>",
 				"X-Push-Key":       "adm-<your_secret_key>",
@@ -99,12 +117,13 @@ func (h *Handler) ListAdminKeys(c *gin.Context) {
 }
 
 type createAdminKeyRequest struct {
-	Name          string  `json:"name"`
-	Scopes        string  `json:"scopes"`
-	AllowedIPs    string  `json:"allowed_ips"`
-	ExpiresInDays int     `json:"expires_in_days"`
-	ExpiresAt     *string `json:"expires_at"`
-	Status        string  `json:"status"`
+	Name          string                       `json:"name"`
+	Scopes        string                       `json:"scopes"`
+	AllowedIPs    string                       `json:"allowed_ips"`
+	ExpiresInDays int                          `json:"expires_in_days"`
+	ExpiresAt     *string                      `json:"expires_at"`
+	Status        string                       `json:"status"`
+	ProxyPolicy   *service.AdminKeyProxyPolicy `json:"proxy_policy,omitempty"`
 }
 
 // CreateAdminKey 签发新的远程管理密钥并一次性返回明文（POST /api/admin-keys）。
@@ -143,22 +162,41 @@ func (h *Handler) CreateAdminKey(c *gin.Context) {
 		return
 	}
 
+	var dto adminKeyDTO
+	if pp := h.proxyPoolSvc(); pp != nil {
+		if req.ProxyPolicy != nil {
+			savedPolicy, pErr := pp.SetKeyPolicy(c.Request.Context(), row.ID, *req.ProxyPolicy)
+			if pErr != nil {
+				// 代理策略不合法时回滚刚建的密钥避免产生半成品
+				_ = svc.Delete(c.Request.Context(), row.ID)
+				fail(c, http.StatusBadRequest, pErr.Error())
+				return
+			}
+			dto = toAdminKeyDTO(row, savedPolicy)
+		} else {
+			dto = toAdminKeyDTO(row, pp.GetKeyPolicy(c.Request.Context(), row.ID))
+		}
+	} else {
+		dto = toAdminKeyDTO(row)
+	}
+
 	c.JSON(http.StatusCreated, gin.H{
 		"key":  plainKey,
-		"item": toAdminKeyDTO(row),
+		"item": dto,
 	})
 }
 
 type updateAdminKeyRequest struct {
-	Name        *string `json:"name"`
-	Scopes      *string `json:"scopes"`
-	AllowedIPs  *string `json:"allowed_ips"`
-	ExpiresAt   *string `json:"expires_at"`
-	ClearExpiry bool    `json:"clear_expiry"`
-	Status      *string `json:"status"`
+	Name        *string                      `json:"name"`
+	Scopes      *string                      `json:"scopes"`
+	AllowedIPs  *string                      `json:"allowed_ips"`
+	ExpiresAt   *string                      `json:"expires_at"`
+	ClearExpiry bool                         `json:"clear_expiry"`
+	Status      *string                      `json:"status"`
+	ProxyPolicy *service.AdminKeyProxyPolicy `json:"proxy_policy,omitempty"`
 }
 
-// UpdateAdminKey 更新远程管理密钥权限、IP 白名单、有效期或状态（PUT /api/admin-keys/:id）。
+// UpdateAdminKey 更新远程管理密钥权限、IP 白名单、有效期、代理分配策略或状态（PUT /api/admin-keys/:id）。
 func (h *Handler) UpdateAdminKey(c *gin.Context) {
 	svc := h.adminKeySvc()
 	if svc == nil {
@@ -208,8 +246,24 @@ func (h *Handler) UpdateAdminKey(c *gin.Context) {
 		return
 	}
 
+	var dto adminKeyDTO
+	if pp := h.proxyPoolSvc(); pp != nil {
+		if req.ProxyPolicy != nil {
+			savedPolicy, pErr := pp.SetKeyPolicy(c.Request.Context(), id, *req.ProxyPolicy)
+			if pErr != nil {
+				fail(c, http.StatusBadRequest, pErr.Error())
+				return
+			}
+			dto = toAdminKeyDTO(updated, savedPolicy)
+		} else {
+			dto = toAdminKeyDTO(updated, pp.GetKeyPolicy(c.Request.Context(), id))
+		}
+	} else {
+		dto = toAdminKeyDTO(updated)
+	}
+
 	middleware.InvalidateAdminKeyCache(h.client)
-	c.JSON(http.StatusOK, toAdminKeyDTO(updated))
+	c.JSON(http.StatusOK, dto)
 }
 
 // DeleteAdminKey 吊销并删除远程管理密钥（DELETE /api/admin-keys/:id）。
@@ -231,6 +285,9 @@ func (h *Handler) DeleteAdminKey(c *gin.Context) {
 		}
 		h.failInternal(c, "删除管理密钥失败", err)
 		return
+	}
+	if pp := h.proxyPoolSvc(); pp != nil {
+		pp.DeleteKeyPolicy(c.Request.Context(), id)
 	}
 
 	middleware.InvalidateAdminKeyCache(h.client)
