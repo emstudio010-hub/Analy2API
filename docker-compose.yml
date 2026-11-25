@@ -1,0 +1,88 @@
+# Analy2API 一体化部署（App + PostgreSQL）。
+#
+# 启动前：cp .env.example .env 并填好 DB_PASSWORD / JWT_SECRET / ENCRYPTION_KEY / BOOTSTRAP_ADMIN_PASSWORD，
+# 然后执行 `docker compose up -d --build`。
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: analy2api-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:-analy2api}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD 必须设置}
+      POSTGRES_DB: ${DB_NAME:-analy2api}
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-analy2api} -d ${DB_NAME:-analy2api}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - analy2api
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: analy2api:latest
+    container_name: analy2api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: "8080"
+      GIN_MODE: release
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: ${TZ:-Asia/Shanghai}
+
+      DB_DRIVER: postgres
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER:-analy2api}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD 必须设置}
+      DB_NAME: ${DB_NAME:-analy2api}
+      DB_SSLMODE: disable
+
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET 必须设置}
+      JWT_TTL: ${JWT_TTL:-24h}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY 必须设置}
+
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-admin@analy2api.local}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?BOOTSTRAP_ADMIN_PASSWORD 必须设置}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+
+      AGY_DOCKER_IMAGE: ${AGY_DOCKER_IMAGE:-analy2api-agy-cli:latest}
+      AGY_SESSION_RETENTION: ${AGY_SESSION_RETENTION:-stateless}
+      AGY_PROMPT_BLEND_MODE: ${AGY_PROMPT_BLEND_MODE:-blend_clean}
+
+      CC_API_BASE: ${CC_API_BASE:-https://api.commandcode.ai}
+      CC_UPSTREAM_PROXY: ${CC_UPSTREAM_PROXY:-}
+      CC_FIRST_TOKEN_TIMEOUT: ${CC_FIRST_TOKEN_TIMEOUT:-300s}
+      CC_STREAM_IDLE: ${CC_STREAM_IDLE:-180s}
+      CC_NONSTREAM_IDLE: ${CC_NONSTREAM_IDLE:-600s}
+      CC_MAX_BODY_MB: ${CC_MAX_BODY_MB:-100}
+
+      HEALTH_CHECK_ENABLED: ${HEALTH_CHECK_ENABLED:-true}
+      HEALTH_CHECK_INTERVAL: ${HEALTH_CHECK_INTERVAL:-10m}
+      HEALTH_FAILURE_THRESHOLD: ${HEALTH_FAILURE_THRESHOLD:-5}
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8080}:8080"
+    networks:
+      - analy2api
+
+volumes:
+  postgres-data:
+    driver: local
+
+networks:
+  analy2api:
+    driver: bridge

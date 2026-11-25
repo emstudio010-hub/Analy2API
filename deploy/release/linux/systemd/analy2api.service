@@ -1,0 +1,36 @@
+[Unit]
+Description=Analy2API — Multi-Platform AI Gateway & Isolated Container Orchestrator
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=analy2api
+Group=analy2api
+SupplementaryGroups=docker
+WorkingDirectory=/opt/analy2api
+EnvironmentFile=/etc/analy2api/env
+ExecStart=/opt/analy2api/analy2api
+Restart=always
+RestartSec=3
+StartLimitIntervalSec=300
+StartLimitBurst=10
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=analy2api
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+ReadOnlyPaths=/opt/analy2api
+ReadWritePaths=/opt/analy2api/data /opt/analy2api/tmp
+
+[Install]
+WantedBy=multi-user.target

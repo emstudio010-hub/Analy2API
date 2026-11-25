@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Analy2API · 多源 AI 网关与容器调度台</title>
+
+    <link rel="icon" href="/favicon.ico" sizes="any" />
+    <link rel="icon" type="image/png" href="/favicon-32.png" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta id="meta-theme-color" name="theme-color" content="#0b0d11" />
+    <script>
+      // 首屏同步恢复主题，避免 FOUC 闪烁。默认采用 Slate/Zinc 暗黑工程台。
+      try {
+        var savedTheme =
+          localStorage.getItem('analy2api.theme') ||
+          localStorage.getItem('cmdwb2api.theme') ||
+          localStorage.getItem('cmd2api.theme')
+        var root = document.documentElement
+        var meta = document.getElementById('meta-theme-color')
+        if (savedTheme === 'light') {
+          root.classList.remove('dark')
+          root.classList.add('light')
+          if (meta) meta.setAttribute('content', '#f4f6f9')
+        } else {
+          root.classList.add('dark')
+          root.classList.remove('light')
+          if (meta) meta.setAttribute('content', '#0b0d11')
+        }
+      } catch (e) {
+        /* 隐私模式下 localStorage 不可用时保持默认深色 */
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,48 @@
+# 本地配置与密钥 —— 绝不入库
+.env
+.env.local
+*.env
+
+# 参考用的上游仓库（只用于对照协议，不属于本项目）
+ref/
+
+# Go
+backend/cmd2api
+backend/cmd2api.exe
+cmdwb2api
+cmdwb2api.exe
+backend/cmdwb2api.exe
+*.test
+*.out
+
+# Runtime data (SQLite DB / auto-generated secrets)
+data/
+backend/data/
+
+# Python（脚本目录里跑冒烟测试会留下字节码缓存）
+__pycache__/
+*.pyc
+
+# 前端
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.tsbuildinfo
+
+# 备份文件
+*.sql.gz
+*.sql
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 交叉编译出的 Linux 部署二进制与发布包（本地构建产物，不入库）
+backend/cmd2api-linux-amd64
+cmdwb2api-linux-*
+*.tar.gz
+*.exe~
+dist/
+

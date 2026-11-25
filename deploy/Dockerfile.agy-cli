@@ -1,0 +1,30 @@
+# Analy2API — Single Isolated Real AntiGravity CLI (`agy`) Client Container Image
+# 1 Container = 1 Real `agy` CLI client = 1 Proxy IP = 1 Device Fingerprint = 1 Account
+#
+# Build example (after compiling analy2api-linux-amd64):
+#   docker build -f deploy/Dockerfile.agy-cli -t analy2api-agy-cli:latest .
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install official Google Antigravity CLI (`agy`) inside the container
+RUN curl -fsSL https://antigravity.google/install.sh | bash || true
+ENV PATH="/root/.local/bin:/root/.antigravity/bin:/usr/local/bin:${PATH}"
+
+# Copy Analy2API binary (provides the `analy2api agy-bridge` single-client HTTP bridge)
+COPY analy2api-linux-amd64 /usr/local/bin/analy2api
+RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api
+
+ENV AGY_SINGLE_CLIENT=1
+ENV AGY_SESSION_RETENTION=stateless
+ENV AGY_PROMPT_BLEND_MODE=blend_clean
+ENV AGY_BRIDGE_ADDR=:8317
+ENV AGY_AUTH_DIR=/app/auths
+
+EXPOSE 8317
+
+ENTRYPOINT ["/usr/local/bin/analy2api", "agy-bridge"]

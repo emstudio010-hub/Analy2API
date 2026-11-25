@@ -1,0 +1,188 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------
+   工程控制台双主题令牌系统
+   ------------------------------------------------------------------
+   - 深色（默认，`html.dark`）：Slate/Zinc 精密暗黑工程台
+   - 浅色（`html:not(.dark)` / `html.light`）：清爽白灰工业风
+   杜绝廉价紫色霓虹渐变与重阴影，依靠表面明度阶梯与 1px 描边建立层次。
+   ------------------------------------------------------------------ */
+@layer base {
+  :root,
+  html.dark {
+    color-scheme: dark;
+
+    --c-canvas: 11 13 17;
+    --c-surface: 17 20 26;
+    --c-raised: 24 28 36;
+    --c-overlay: 32 38 48;
+
+    --c-line: 38 45 56;
+    --c-line-strong: 56 66 82;
+
+    --c-fg: 236 240 245;
+    --c-muted: 156 166 181;
+    --c-subtle: 114 125 142;
+
+    --c-accent: 59 130 246;
+    --c-accent-fg: 255 255 255;
+
+    --c-success: 16 185 129;
+    --c-warning: 245 158 11;
+    --c-danger: 239 68 68;
+    --c-info: 14 165 233;
+
+    --shadow-panel: 0 1px 2px 0 rgb(0 0 0 / 0.28);
+    --shadow-pop: 0 16px 36px -10px rgb(0 0 0 / 0.55), 0 2px 8px -2px rgb(0 0 0 / 0.36);
+  }
+
+  html:not(.dark),
+  html.light {
+    color-scheme: light;
+
+    --c-canvas: 244 246 249;
+    --c-surface: 255 255 255;
+    --c-raised: 247 248 250;
+    --c-overlay: 237 240 245;
+
+    --c-line: 222 227 235;
+    --c-line-strong: 195 203 215;
+
+    --c-fg: 15 23 36;
+    --c-muted: 73 84 100;
+    --c-subtle: 106 117 134;
+
+    --c-accent: 37 99 235;
+    --c-accent-fg: 255 255 255;
+
+    --c-success: 5 150 105;
+    --c-warning: 180 83 9;
+    --c-danger: 220 38 38;
+    --c-info: 2 132 199;
+
+    --shadow-panel: 0 1px 2px 0 rgb(15 23 36 / 0.05);
+    --shadow-pop: 0 14px 32px -10px rgb(15 23 36 / 0.16), 0 2px 6px -1px rgb(15 23 36 / 0.08);
+  }
+
+  html,
+  body,
+  #app {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas font-sans text-sm text-fg antialiased;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    caret-color: rgb(var(--c-accent));
+  }
+
+  ::selection {
+    background-color: rgb(var(--c-accent) / 0.22);
+    color: rgb(var(--c-fg));
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-accent ring-offset-1 ring-offset-canvas;
+  }
+
+  .tnum {
+    font-variant-numeric: tabular-nums;
+  }
+
+  kbd {
+    @apply inline-flex items-center rounded border border-line-strong bg-raised px-1.5 py-0.5 font-mono text-2xs font-medium text-muted;
+  }
+}
+
+@layer components {
+  /* 高密度工程表格单元 */
+  .th {
+    @apply whitespace-nowrap px-3 py-2 text-left text-2xs font-semibold uppercase tracking-wider text-subtle select-none;
+  }
+
+  .td {
+    @apply whitespace-nowrap px-3 py-2 align-middle text-[13px] text-fg;
+  }
+
+  .card {
+    @apply rounded-panel border border-line bg-surface shadow-panel;
+  }
+
+  .panel-inset {
+    @apply rounded-md border border-line bg-raised/60;
+  }
+
+  /* 表单控件统一底座 */
+  .field {
+    @apply w-full rounded-md border border-line bg-raised px-2.5 py-1.5 text-[13px] text-fg
+      placeholder:text-subtle transition
+      hover:border-line-strong
+      focus:border-accent focus:bg-surface focus:outline-none focus:ring-1 focus:ring-accent
+      disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  .field-sm {
+    @apply px-2 py-1 text-xs;
+  }
+
+  /* 细滚动条：适配深浅双色面板 */
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--c-line-strong)) transparent;
+  }
+
+  .scroll-thin::-webkit-scrollbar {
+    height: 7px;
+    width: 7px;
+  }
+
+  .scroll-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .scroll-thin::-webkit-scrollbar-thumb {
+    background-color: rgb(var(--c-line-strong));
+    border-radius: 9999px;
+  }
+
+  .scroll-thin::-webkit-scrollbar-thumb:hover {
+    background-color: rgb(var(--c-subtle));
+  }
+}
+
+/* 克制的工程台过渡效果 */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 120ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.pop-enter-active,
+.pop-leave-active {
+  transition:
+    opacity 130ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 130ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(4px) scale(0.985);
+}
+
+.slide-enter-active,
+.slide-leave-active {
+  transition: transform 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.slide-enter-from,
+.slide-leave-to {
+  transform: translateX(-100%);
+}
