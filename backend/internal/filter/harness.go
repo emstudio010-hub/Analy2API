@@ -8,18 +8,89 @@ import (
 type harnessSpan struct {
 	Start           int
 	End             int
+	Tag             string
+	Platform        string
+	StripInSystem   bool
 	DropLineIfEmpty bool
 }
 
-var harnessXMLTags = []string{
-	"system-reminder",
-	"permissions instructions",
-	"environment_context",
-	"collaboration_mode",
-	"skills_instructions",
-	"plugins_instructions",
-	"user_instructions",
-	"INSTRUCTIONS",
+// DetectedHarness describes a recognized platform-specific wrapper tag or telemetry header
+// encountered during system/user prompt inspection or harness sanitization.
+type DetectedHarness struct {
+	Tag      string `json:"tag"`
+	Platform string `json:"platform"`
+	Scope    string `json:"scope"`
+	Action   string `json:"action"`
+	Preview  string `json:"preview"`
+}
+
+type harnessTagDef struct {
+	tag           string
+	platform      string
+	stripInSystem bool
+}
+
+// Ordered longest-first where prefixes overlap so matching is deterministic across all 11 platforms.
+var harnessTagRegistry = []harnessTagDef{
+	// Cursor Agent / Composer
+	{tag: "open_and_recently_viewed_files", platform: "cursor", stripInSystem: true},
+	{tag: "cursor_context", platform: "cursor", stripInSystem: true},
+	{tag: "cursor_rules", platform: "cursor", stripInSystem: false},
+	{tag: "attached_files", platform: "cursor", stripInSystem: true},
+	{tag: "user_info", platform: "cursor", stripInSystem: true},
+
+	// Windsurf Cascade
+	{tag: "cascade_memories", platform: "windsurf", stripInSystem: true},
+	{tag: "windsurf_context", platform: "windsurf", stripInSystem: true},
+	{tag: "cascade_context", platform: "windsurf", stripInSystem: true},
+
+	// Cline / Roo Code
+	{tag: "environment_details", platform: "cline", stripInSystem: true},
+	{tag: "task_progress", platform: "cline", stripInSystem: true},
+	{tag: "cline_rules", platform: "cline", stripInSystem: false},
+	{tag: "roo_rules", platform: "cline", stripInSystem: false},
+
+	// Claude Code CLI
+	{tag: "user-prompt-submit-hook", platform: "claude_code", stripInSystem: true},
+	{tag: "system-reminder", platform: "claude_code", stripInSystem: true},
+	{tag: "fast_mode_info", platform: "claude_code", stripInSystem: true},
+	{tag: "claude_context", platform: "claude_code", stripInSystem: true},
+
+	// Gemini CLI & AntiGravity agy CLI
+	{tag: "conversation_transcript", platform: "antigravity", stripInSystem: true},
+	{tag: "featured_plugins", platform: "antigravity", stripInSystem: true},
+	{tag: "user_information", platform: "antigravity", stripInSystem: true},
+	{tag: "tool_declarations", platform: "antigravity", stripInSystem: true},
+	{tag: "slash_commands", platform: "antigravity", stripInSystem: true},
+	{tag: "builtin_tools", platform: "antigravity", stripInSystem: true},
+	{tag: "user_memory", platform: "gemini_cli", stripInSystem: true},
+	{tag: "mcp_servers", platform: "antigravity", stripInSystem: true},
+	{tag: "artifacts", platform: "antigravity", stripInSystem: true},
+	{tag: "messaging", platform: "antigravity", stripInSystem: true},
+	{tag: "subagents", platform: "antigravity", stripInSystem: true},
+	{tag: "user_rules", platform: "antigravity", stripInSystem: false},
+	{tag: "skills", platform: "antigravity", stripInSystem: true},
+	{tag: "identity", platform: "antigravity", stripInSystem: false},
+
+	// OpenAI Codex CLI
+	{tag: "permissions instructions", platform: "codex_cli", stripInSystem: true},
+	{tag: "plugins_instructions", platform: "codex_cli", stripInSystem: true},
+	{tag: "skills_instructions", platform: "codex_cli", stripInSystem: true},
+	{tag: "environment_context", platform: "codex_cli", stripInSystem: true},
+	{tag: "collaboration_mode", platform: "codex_cli", stripInSystem: true},
+	{tag: "user_instructions", platform: "codex_cli", stripInSystem: false},
+	{tag: "INSTRUCTIONS", platform: "codex_cli", stripInSystem: false},
+
+	// DSH (DeepSeek Shell Harness)
+	{tag: "dsh_instructions", platform: "dsh", stripInSystem: false},
+	{tag: "dsh_environment", platform: "dsh", stripInSystem: true},
+	{tag: "dsh_context", platform: "dsh", stripInSystem: true},
+	{tag: "dsh_env", platform: "dsh", stripInSystem: true},
+
+	// OpenCode / Command Code / WorkBuddy
+	{tag: "commandcode_context", platform: "commandcode", stripInSystem: true},
+	{tag: "workbuddy_context", platform: "workbuddy", stripInSystem: true},
+	{tag: "opencode_context", platform: "opencode", stripInSystem: true},
 }
 
 var harnessHeaderLineRe = regexp.MustCompile(
@@ -29,12 +100,152 @@ var harnessHeaderLineRe = regexp.MustCompile(
 var (
 	agentsMDHeadingRe = regexp.MustCompile(`(?i)^[ \t]*# AGENTS\.md instructions(?:\b|$)`)
 	claudeMDHeadingRe = regexp.MustCompile(`(?i)^[ \t]*# claudeMd(?:\b|$)`)
+	dshMDHeadingRe    = regexp.MustCompile(`(?i)^[ \t]*# DSH\.md instructions(?:\b|$)`)
 )
 
 // HasHarnessInjection reports whether text contains any client-harness-injected
 // blocks or headers outside user code fences and inline backticks.
 func HasHarnessInjection(text string) bool {
 	return len(findHarnessSpans(text)) > 0
+}
+
+// InspectHarnessBlocks scans text (ignoring fenced code blocks and inline backticks)
+// and returns structured metadata for every detected platform wrapper block or header.
+func InspectHarnessBlocks(text string, scope string) []DetectedHarness {
+	spans := findHarnessSpans(text)
+	if len(spans) == 0 {
+		return []DetectedHarness{}
+	}
+	sc := strings.ToLower(strings.TrimSpace(scope))
+	if sc == "" {
+		sc = ScopeUser
+	}
+	out := make([]DetectedHarness, 0, len(spans))
+	for _, sp := range spans {
+		action := "isolate"
+		if sc == ScopeSystem && sp.StripInSystem {
+			action = "strip"
+		}
+		out = append(out, DetectedHarness{
+			Tag:      sp.Tag,
+			Platform: sp.Platform,
+			Scope:    sc,
+			Action:   action,
+			Preview:  compactPreview(text[sp.Start:sp.End], 120),
+		})
+	}
+	return out
+}
+
+// StripConflictingSystemHarnesses removes host/IDE-specific conflicting wrapper blocks
+// (e.g., AGY <artifacts>/<slash_commands>/<skills>, Cursor <open_and_recently_viewed_files>/<user_info>,
+// Windsurf <cascade_context>, Cline <environment_details>, Claude Code billing headers/<fast_mode_info>,
+// Gemini <user_memory>, Codex <environment_context>, DSH <dsh_context>) from a system prompt
+// while keeping core engineering rules and persona instructions intact.
+func StripConflictingSystemHarnesses(systemPrompt string) (string, []DetectedHarness) {
+	if strings.TrimSpace(systemPrompt) == "" {
+		return systemPrompt, []DetectedHarness{}
+	}
+	spans := findHarnessSpans(systemPrompt)
+	if len(spans) == 0 {
+		return systemPrompt, []DetectedHarness{}
+	}
+
+	var b strings.Builder
+	b.Grow(len(systemPrompt))
+	detected := make([]DetectedHarness, 0, len(spans))
+	cursor := 0
+	strippedAny := false
+
+	for _, sp := range spans {
+		if sp.Start < cursor {
+			continue
+		}
+		action := "isolate"
+		if sp.StripInSystem {
+			action = "strip"
+		}
+		detected = append(detected, DetectedHarness{
+			Tag:      sp.Tag,
+			Platform: sp.Platform,
+			Scope:    ScopeSystem,
+			Action:   action,
+			Preview:  compactPreview(systemPrompt[sp.Start:sp.End], 120),
+		})
+
+		if !sp.StripInSystem {
+			b.WriteString(systemPrompt[cursor:sp.End])
+			cursor = sp.End
+			continue
+		}
+
+		strippedAny = true
+		b.WriteString(systemPrompt[cursor:sp.Start])
+		nextCursor := sp.End
+		if nextCursor < len(systemPrompt) && systemPrompt[nextCursor] == '\r' && nextCursor+1 < len(systemPrompt) && systemPrompt[nextCursor+1] == '\n' {
+			nextCursor += 2
+		} else if nextCursor < len(systemPrompt) && systemPrompt[nextCursor] == '\n' {
+			nextCursor++
+		}
+		cursor = nextCursor
+	}
+	if cursor < len(systemPrompt) {
+		b.WriteString(systemPrompt[cursor:])
+	}
+	if !strippedAny {
+		return systemPrompt, detected
+	}
+	cleaned := collapseExtraNewlinesRe.ReplaceAllString(b.String(), "\n\n")
+	return strings.TrimSpace(cleaned), detected
+}
+
+// StripUserHarnesses returns a preview of userMessage with detected harness wrapper blocks
+// removed, preserving genuine user prose and fenced/inline code byte-for-byte.
+func StripUserHarnesses(userMessage string) (string, []DetectedHarness) {
+	if strings.TrimSpace(userMessage) == "" {
+		return userMessage, []DetectedHarness{}
+	}
+	spans := findHarnessSpans(userMessage)
+	if len(spans) == 0 {
+		return userMessage, []DetectedHarness{}
+	}
+	var b strings.Builder
+	b.Grow(len(userMessage))
+	detected := make([]DetectedHarness, 0, len(spans))
+	cursor := 0
+	for _, sp := range spans {
+		if sp.Start < cursor {
+			continue
+		}
+		detected = append(detected, DetectedHarness{
+			Tag:      sp.Tag,
+			Platform: sp.Platform,
+			Scope:    ScopeUser,
+			Action:   "isolate",
+			Preview:  compactPreview(userMessage[sp.Start:sp.End], 120),
+		})
+		b.WriteString(userMessage[cursor:sp.Start])
+		nextCursor := sp.End
+		if nextCursor < len(userMessage) && userMessage[nextCursor] == '\r' && nextCursor+1 < len(userMessage) && userMessage[nextCursor+1] == '\n' {
+			nextCursor += 2
+		} else if nextCursor < len(userMessage) && userMessage[nextCursor] == '\n' {
+			nextCursor++
+		}
+		cursor = nextCursor
+	}
+	if cursor < len(userMessage) {
+		b.WriteString(userMessage[cursor:])
+	}
+	cleaned := collapseExtraNewlinesRe.ReplaceAllString(b.String(), "\n\n")
+	return strings.TrimSpace(cleaned), detected
+}
+
+func compactPreview(s string, maxLen int) string {
+	collapsed := strings.Join(strings.Fields(s), " ")
+	if len(collapsed) <= maxLen {
+		return collapsed
+	}
+	return collapsed[:maxLen] + "..."
 }
 
 // applyToHarnessSpans applies fn exclusively to detected harness-injected spans,
@@ -133,10 +344,16 @@ func findHarnessSpans(text string) []harnessSpan {
 			continue
 		}
 
-		// 3. Check known XML harness blocks (<system-reminder>, <environment_context>, etc.).
+		// 3. Check known XML harness blocks across all supported platforms.
 		if text[cursor] == '<' {
-			if endXML, ok := matchXMLHarnessBlock(text, cursor, atLineStart); ok {
-				spans = append(spans, harnessSpan{Start: cursor, End: endXML})
+			if endXML, def, ok := matchXMLHarnessBlock(text, cursor, atLineStart); ok {
+				spans = append(spans, harnessSpan{
+					Start:         cursor,
+					End:           endXML,
+					Tag:           def.tag,
+					Platform:      def.platform,
+					StripInSystem: def.stripInSystem,
+				})
 				cursor = endXML
 				continue
 			}
@@ -151,14 +368,39 @@ func findHarnessSpans(text string) []harnessSpan {
 
 			if agentsMDHeadingRe.MatchString(line) {
 				endSection := findAgentsMDSectionEnd(text, cursor, lineEnd)
-				spans = append(spans, harnessSpan{Start: cursor, End: endSection})
+				spans = append(spans, harnessSpan{
+					Start:         cursor,
+					End:           endSection,
+					Tag:           "# AGENTS.md instructions",
+					Platform:      "codex_cli",
+					StripInSystem: false,
+				})
 				cursor = endSection
 				continue
 			}
 
 			if claudeMDHeadingRe.MatchString(line) {
 				endSection := findNextTopLevelHarnessXML(text, lineEnd)
-				spans = append(spans, harnessSpan{Start: cursor, End: endSection})
+				spans = append(spans, harnessSpan{
+					Start:         cursor,
+					End:           endSection,
+					Tag:           "# claudeMd",
+					Platform:      "claude_code",
+					StripInSystem: false,
+				})
+				cursor = endSection
+				continue
+			}
+
+			if dshMDHeadingRe.MatchString(line) {
+				endSection := findNextTopLevelHarnessXML(text, lineEnd)
+				spans = append(spans, harnessSpan{
+					Start:         cursor,
+					End:           endSection,
+					Tag:           "# DSH.md instructions",
+					Platform:      "dsh",
+					StripInSystem: false,
+				})
 				cursor = endSection
 				continue
 			}
@@ -167,6 +409,9 @@ func findHarnessSpans(text string) []harnessSpan {
 				spans = append(spans, harnessSpan{
 					Start:           cursor,
 					End:             lineEnd,
+					Tag:             "x-anthropic-billing-header",
+					Platform:        "claude_code",
+					StripInSystem:   true,
 					DropLineIfEmpty: true,
 				})
 				cursor = advancePastNewline(text, lineEnd)
@@ -321,17 +566,18 @@ func scanInlineBackticks(text string, pos int) int {
 
 // matchXMLHarnessBlock checks whether text[pos:] opens a known harness XML block.
 // Closed blocks match anywhere outside code; unclosed tags only match when anchored at line start.
-func matchXMLHarnessBlock(text string, pos int, atLineStart bool) (int, bool) {
+func matchXMLHarnessBlock(text string, pos int, atLineStart bool) (int, harnessTagDef, bool) {
 	if !atLineStart {
 		// Also treat indented tags on their own line start as line-anchored.
 		atLineStart = isOnlyHorizontalSpaceBeforeOnLine(text, pos)
 	}
 	rest := text[pos:]
 	if len(rest) < 3 || rest[0] != '<' || rest[1] == '/' {
-		return 0, false
+		return 0, harnessTagDef{}, false
 	}
 
-	for _, tag := range harnessXMLTags {
+	for _, def := range harnessTagRegistry {
+		tag := def.tag
 		if len(rest) < 1+len(tag)+1 {
 			continue
 		}
@@ -346,23 +592,28 @@ func matchXMLHarnessBlock(text string, pos int, atLineStart bool) (int, bool) {
 		// Locate end of opening tag '>'.
 		openEndRel := strings.IndexByte(rest, '>')
 		if openEndRel < 0 {
-			return 0, false
+			return 0, harnessTagDef{}, false
 		}
 		// Reject suspiciously long or multi-line malformed opening tags without '>'.
 		if strings.IndexByte(rest[:openEndRel], '\n') >= 0 && openEndRel > 256 {
-			return 0, false
+			return 0, harnessTagDef{}, false
+		}
+
+		// Handle self-closing tag `<fast_mode_info />`.
+		if openEndRel > 1 && rest[openEndRel-1] == '/' {
+			return pos + openEndRel + 1, def, true
 		}
 
 		searchFrom := pos + openEndRel + 1
 		if closeEnd, found := findClosingTag(text, searchFrom, tag); found {
-			return closeEnd, true
+			return closeEnd, def, true
 		}
 		if atLineStart {
-			return len(text), true
+			return len(text), def, true
 		}
-		return 0, false
+		return 0, harnessTagDef{}, false
 	}
-	return 0, false
+	return 0, harnessTagDef{}, false
 }
 
 func isOnlyHorizontalSpaceBeforeOnLine(text string, pos int) bool {
@@ -436,7 +687,7 @@ func findNextTopLevelHarnessXML(text string, from int) int {
 			continue
 		}
 		if text[cursor] == '<' {
-			if _, ok := matchXMLHarnessBlock(text, cursor, atLineStart); ok {
+			if _, _, ok := matchXMLHarnessBlock(text, cursor, atLineStart); ok {
 				return cursor
 			}
 		}

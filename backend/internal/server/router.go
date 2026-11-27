@@ -140,6 +140,8 @@ func NewRouter(opts Options) *gin.Engine {
 
 			// 前置系统提示词注入中心
 			admin.GET("/prompts/config", h.GetPromptConfig)
+			admin.GET("/prompts/catalog", h.GetPromptCatalog)
+			admin.POST("/prompts/catalog/apply", h.ApplyPromptCatalogItem)
 			admin.PUT("/prompts/global", h.UpdateGlobalPrompt)
 			admin.GET("/prompts/templates", h.ListPromptTemplates)
 			admin.POST("/prompts/templates", h.CreatePromptTemplate)

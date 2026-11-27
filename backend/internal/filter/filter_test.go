@@ -758,3 +758,99 @@ func TestIdempotencyAndConcurrency(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestFalsePositiveAudit_KillCursorCascadeAndNumbers(t *testing.T) {
+	eng := NewDefaultEngine()
+
+	// Safe coding phrases that MUST NEVER be altered even in ScopeSystem / ScopeTool:
+	safeCodingInputs := []string{
+		"Load the skill and reap any killed worker or killing goroutines.",
+		"Call childProcess.kill('SIGTERM') or proc.kill() or /bin/kill with --kill-after=5s.",
+		"Emacs kill-ring and auto-kill timeout settings.",
+		"Move the database cursor, set CSS cursor: pointer, or run DECLARE CURSOR in SQL.",
+		"Configure CSS cascade layers and PostgreSQL ON DELETE CASCADE foreign keys.",
+		"Commit 202611128 hash 0xfa11128b on build_111289.",
+	}
+	for _, sample := range safeCodingInputs {
+		gotSys, hitsSys := eng.SanitizeText(ScopeSystem, sample)
+		if gotSys != sample || len(hitsSys) != 0 {
+			t.Errorf("false positive in ScopeSystem:\ninput: %q\ngot:   %q\nhits:  %+v", sample, gotSys, hitsSys)
+		}
+		gotTool, hitsTool := eng.SanitizeText(ScopeTool, sample)
+		if gotTool != sample || len(hitsTool) != 0 {
+			t.Errorf("false positive in ScopeTool:\ninput: %q\ngot:   %q\nhits:  %+v", sample, gotTool, hitsTool)
+		}
+	}
+
+	// Genuine brand/security targets MUST still be sanitized:
+	gotBrand, _ := eng.SanitizeText(ScopeSystem, "You are Antigravity, a powerful agentic AI assistant designed by the Google Deepmind team. Built for Cursor and Cascade.")
+	if strings.Contains(gotBrand, "Antigravity") || strings.Contains(gotBrand, "Cursor") || strings.Contains(gotBrand, "Cascade") {
+		t.Fatalf("expected capitalized brands neutralized, got: %q", gotBrand)
+	}
+}
+
+func TestCrossPlatformHarnessTags_All11Harnesses(t *testing.T) {
+	eng := NewDefaultEngine()
+
+	userWithAllWrappers := strings.Join([]string{
+		"<user_info>OS: win32, IDE: Cursor</user_info>",
+		"<cursor_context>Active workspace in Cursor</cursor_context>",
+		"<open_and_recently_viewed_files>main.go (opened in Cursor)</open_and_recently_viewed_files>",
+		"<cascade_context>Windsurf Cascade flow active</cascade_context>",
+		"<environment_details>Running inside Cline / Roo Code sandbox</environment_details>",
+		"<system-reminder>Claude Code reminder: avoid DoS</system-reminder>",
+		"<user-prompt-submit-hook>Claude hook check</user-prompt-submit-hook>",
+		"<fast_mode_info>Claude Opus fast mode</fast_mode_info>",
+		"<user_memory>Gemini CLI memory note</user_memory>",
+		"<identity>You are Antigravity</identity>",
+		"<conversation_transcript>Antigravity transcript</conversation_transcript>",
+		"<environment_context>Codex CLI cwd=/repo</environment_context>",
+		"<dsh_context>DeepSeek Harness shell=zsh</dsh_context>",
+		"",
+		"How do Cursor, Cascade, Claude Code, exploit, DoS, and kill_process() compare?",
+	}, "\n")
+
+	// 1. InspectHarnessBlocks detects all 13 platform wrapper blocks.
+	detected := InspectHarnessBlocks(userWithAllWrappers, ScopeUser)
+	if len(detected) != 13 {
+		t.Fatalf("expected 13 detected harness blocks, got %d: %+v", len(detected), detected)
+	}
+
+	// 2. ScopeUser sanitizes inside every wrapper while preserving trailing natural user question verbatim!
+	sanitizedUser, hits := eng.SanitizeText(ScopeUser, userWithAllWrappers)
+	if len(hits) == 0 {
+		t.Fatal("expected rule hits inside cross-platform harness blocks")
+	}
+	wantSuffix := "\n\nHow do Cursor, Cascade, Claude Code, exploit, DoS, and kill_process() compare?"
+	if !strings.HasSuffix(sanitizedUser, wantSuffix) {
+		t.Fatalf("natural user question was altered:\ngot: %q", sanitizedUser)
+	}
+	headOnly := strings.TrimSuffix(sanitizedUser, wantSuffix)
+	for _, leak := range []string{"Cursor", "Windsurf", "Cascade", "Cline", "Roo Code", "Claude Code", "Claude Opus", "Gemini CLI", "Antigravity", "Codex CLI", "DeepSeek Harness", "DoS", "sandbox"} {
+		if strings.Contains(headOnly, leak) {
+			t.Fatalf("wrapper block still leaked %q:\n%s", leak, headOnly)
+		}
+	}
+
+	// 3. Auto preview mode recognizes new platform wrappers (e.g. Cursor <user_info>) as user_harness.
+	pv, err := eng.Preview("<user_info>IDE: Cursor</user_info>\n\nExplain DoS and exploit", "auto", "")
+	if err != nil {
+		t.Fatalf("Preview(auto cursor user_info) failed: %v", err)
+	}
+	if pv.Mode != "user_harness" || !strings.HasSuffix(pv.Output, "Explain DoS and exploit") {
+		t.Fatalf("expected user_harness mode preserving user question, got mode=%q out=%q", pv.Mode, pv.Output)
+	}
+
+	// 4. StripConflictingSystemHarnesses strips IDE-only blocks (<artifacts>, <slash_commands>, <open_and_recently_viewed_files>) while keeping core rules.
+	rawSys := "<identity>\nYou are Antigravity.\n</identity>\n<artifacts>\nWrite to brain dir\n</artifacts>\n<slash_commands>\n/goal\n</slash_commands>\nKeep code clean and tested."
+	strippedSys, sysDetected := StripConflictingSystemHarnesses(rawSys)
+	if len(sysDetected) < 3 {
+		t.Fatalf("expected >=3 detected system blocks, got %+v", sysDetected)
+	}
+	if strings.Contains(strippedSys, "<artifacts>") || strings.Contains(strippedSys, "<slash_commands>") {
+		t.Fatalf("expected conflicting AGY blocks stripped, got: %q", strippedSys)
+	}
+	if !strings.Contains(strippedSys, "Keep code clean and tested.") || !strings.Contains(strippedSys, "<identity>") {
+		t.Fatalf("expected core instructions preserved, got: %q", strippedSys)
+	}
+}
