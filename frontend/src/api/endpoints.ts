@@ -708,4 +708,33 @@ export function previewAntigravityPromptMode(payload: PreviewAgyPromptModePayloa
   return post<AgyInterceptContinuePreview>('/antigravity/prompt-modes/preview', payload)
 }
 
+// === Platform Prompt Catalog & Pipeline Preview ===
+
+import type {
+  ApplyPromptCatalogPayload,
+  ApplyPromptCatalogResponse,
+  FilterPipelinePreviewPayload,
+  FilterPipelinePreviewResponse,
+  PromptCatalogQuery,
+  PromptCatalogResponse,
+} from './types'
+
+export function fetchPromptCatalog(query: PromptCatalogQuery = {}) {
+  return get<PromptCatalogResponse>('/prompts/catalog', { params: clean({ ...query }) })
+}
+
+export function applyPromptCatalogItem(payload: ApplyPromptCatalogPayload) {
+  return post<ApplyPromptCatalogResponse>('/prompts/catalog/apply', payload)
+}
+
+export function previewFilterPipeline(payload: FilterPipelinePreviewPayload) {
+  return post<FilterPipelinePreviewResponse>('/filter-rules/preview', payload)
+}
+
+export const promptCatalogApi = {
+  list: fetchPromptCatalog,
+  apply: applyPromptCatalogItem,
+  previewPipeline: previewFilterPipeline,
+}
+
 export * from './types'
