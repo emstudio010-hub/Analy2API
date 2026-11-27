@@ -1,4 +1,4 @@
-import { onBeforeUnmount, onMounted, ref } from 'vue'
+import { onBeforeUnmount, ref, watch } from 'vue'
 import type { Ref } from 'vue'
 
 /**
@@ -12,22 +12,30 @@ export function useElementSize(): { target: Ref<HTMLElement | null>; width: Ref<
   const width = ref(0)
   let observer: ResizeObserver | null = null
 
-  onMounted(() => {
-    const node = target.value
-    if (!node) return
-    width.value = node.clientWidth
-    if (typeof ResizeObserver === 'undefined') return
-    observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        width.value = entry.contentRect.width
-      }
-    })
-    observer.observe(node)
-  })
-
-  onBeforeUnmount(() => {
+  function disconnect(): void {
     observer?.disconnect()
     observer = null
+  }
+
+  watch(
+    target,
+    (node) => {
+      disconnect()
+      if (!node) return
+      width.value = node.clientWidth
+      if (typeof ResizeObserver === 'undefined') return
+      observer = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+          width.value = entry.contentRect.width
+        }
+      })
+      observer.observe(node)
+    },
+    { immediate: true, flush: 'post' },
+  )
+
+  onBeforeUnmount(() => {
+    disconnect()
   })
 
   return { target, width }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"cmd2api/internal/domain"
@@ -59,6 +60,72 @@ func convertWorkBuddyModels(items []workbuddy.ModelInfo) []Model {
 	return out
 }
 
+type wbCachedRefresh struct {
+	accessToken  string
+	refreshToken string
+	domain       string
+	at           time.Time
+}
+
+func (s *Service) wbRefreshMutex(accountID int64) *sync.Mutex {
+	val, _ := s.wbRefreshLocks.LoadOrStore(accountID, &sync.Mutex{})
+	return val.(*sync.Mutex)
+}
+
+// refreshWorkBuddyCredsSingleflight 按账号串行化 401 Token 续期：
+// 当多个并发请求在同一过期账号上同时遇到 401 时，仅首个协程向远端发起 RefreshToken（避免单次有效 refresh_token 被并发作废），
+// 其余等待协程直接复用刚刚刷新成功的最新凭证重试。
+func (s *Service) refreshWorkBuddyCredsSingleflight(
+	ctx context.Context,
+	accountID int64,
+	wb *workbuddy.Client,
+	creds workbuddy.AccountCreds,
+) (workbuddy.AccountCreds, bool) {
+	mu := s.wbRefreshMutex(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if raw, ok := s.wbRefreshCache.Load(accountID); ok {
+		cached := raw.(wbCachedRefresh)
+		if cached.accessToken != "" && cached.accessToken != creds.AccessToken && time.Since(cached.at) < 30*time.Second {
+			creds.AccessToken = cached.accessToken
+			if cached.refreshToken != "" {
+				creds.RefreshToken = cached.refreshToken
+			}
+			if cached.domain != "" {
+				creds.Domain = cached.domain
+			}
+			return creds, true
+		}
+	}
+
+	refCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	refRes, refErr := wb.RefreshToken(refCtx, creds)
+	cancel()
+	if refErr != nil || strings.TrimSpace(refRes.AccessToken) == "" {
+		return creds, false
+	}
+
+	creds.AccessToken = strings.TrimSpace(refRes.AccessToken)
+	if strings.TrimSpace(refRes.RefreshToken) != "" {
+		creds.RefreshToken = strings.TrimSpace(refRes.RefreshToken)
+	}
+	if strings.TrimSpace(refRes.Domain) != "" {
+		creds.Domain = strings.TrimSpace(refRes.Domain)
+	}
+	s.wbRefreshCache.Store(accountID, wbCachedRefresh{
+		accessToken:  creds.AccessToken,
+		refreshToken: creds.RefreshToken,
+		domain:       creds.Domain,
+		at:           time.Now(),
+	})
+	if s.tokenUpdater != nil {
+		if upErr := s.tokenUpdater.UpdateTokens(context.WithoutCancel(ctx), accountID, creds.AccessToken, creds.RefreshToken); upErr != nil && s.logger != nil {
+			s.logger.Warn("写回 WorkBuddy 续期 Token 失败", "account_id", accountID, "err", upErr)
+		}
+	}
+	return creds, true
+}
 // attemptWorkBuddy 通过 WorkBuddy `/v2/chat/completions` 上游中转单次账号尝试：
 //   - 对标准化请求执行 NormalizeCompat（developer->system、tool_choice、孤儿 tool_calls、DeepSeek reasoning_content、stream:true）
 //   - 严格使用账号绑定的 ProxyURL 与 Qimei36/MachineID
@@ -95,22 +162,8 @@ func (s *Service) attemptWorkBuddy(
 	if err != nil {
 		var apiErr *workbuddy.APIError
 		if errors.As(err, &apiErr) && apiErr.IsAuthFailure() && strings.TrimSpace(creds.RefreshToken) != "" {
-			refCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-			refRes, refErr := wb.RefreshToken(refCtx, creds)
-			cancel()
-			if refErr == nil && strings.TrimSpace(refRes.AccessToken) != "" {
-				creds.AccessToken = refRes.AccessToken
-				if strings.TrimSpace(refRes.RefreshToken) != "" {
-					creds.RefreshToken = refRes.RefreshToken
-				}
-				if strings.TrimSpace(refRes.Domain) != "" {
-					creds.Domain = refRes.Domain
-				}
-				if s.tokenUpdater != nil {
-					if upErr := s.tokenUpdater.UpdateTokens(ctx, lease.Account.ID, creds.AccessToken, creds.RefreshToken); upErr != nil && s.logger != nil {
-						s.logger.Warn("写回 WorkBuddy 续期 Token 失败", "account_id", lease.Account.ID, "err", upErr)
-					}
-				}
+			if nextCreds, refreshed := s.refreshWorkBuddyCredsSingleflight(ctx, lease.Account.ID, wb, creds); refreshed {
+				creds = nextCreds
 				resp, err = wb.ChatStream(ctx, creds, payloadBytes)
 			}
 		}
@@ -290,8 +343,8 @@ func (s *Service) consumeWorkBuddyStream(
 				if tc.ID != "" && st.ID == "" {
 					st.ID = tc.ID
 				}
-				if tc.Name != "" && st.Function.Name == "" {
-					st.Function.Name = tc.Name
+				if tc.Name != "" {
+					st.Function.Name += tc.Name
 				}
 			}
 			if tc.Arguments != "" {
@@ -538,26 +591,38 @@ func (s *Service) recordPlatformUsage(
 	}
 }
 
+type wbAnthToolState struct {
+	id       string
+	name     string
+	args     strings.Builder
+	blockIdx int
+	started  bool
+	closed   bool
+}
+
 // wbAnthropicStreamEncoder 直接把 NormalizedChunk 编码为 Anthropic Messages SSE，
 // 避免 CompletionTokens 缺失时误判为空响应。
 type wbAnthropicStreamEncoder struct {
 	model     string
 	messageID string
 
-	started         bool
-	nextBlockIndex  int
-	openBlockType   string
-	openBlockIndex  int
-	thinkingBuf     strings.Builder
-	activeToolCalls map[int]int
-	hasToolCalls    bool
+	started        bool
+	nextBlockIndex int
+	openBlockType  string
+	openBlockIndex int
+	openToolIdx    int
+	thinkingBuf    strings.Builder
+	toolStates     map[int]*wbAnthToolState
+	toolOrder      []int
+	hasToolCalls   bool
 }
 
 func newWBAnthropicStreamEncoder(model, messageID string) *wbAnthropicStreamEncoder {
 	return &wbAnthropicStreamEncoder{
-		model:           model,
-		messageID:       messageID,
-		activeToolCalls: make(map[int]int),
+		model:       model,
+		messageID:   messageID,
+		openToolIdx: -1,
+		toolStates:  make(map[int]*wbAnthToolState),
 	}
 }
 
@@ -601,11 +666,62 @@ func (e *wbAnthropicStreamEncoder) closeActiveBlock() []string {
 			},
 		}))
 	}
+	if e.openBlockType == "tool_use" && e.openToolIdx >= 0 {
+		if st := e.toolStates[e.openToolIdx]; st != nil {
+			st.closed = true
+		}
+		e.openToolIdx = -1
+	}
 	out = append(out, anthropicSSEFrame("content_block_stop", map[string]any{
 		"type":  "content_block_stop",
 		"index": e.openBlockIndex,
 	}))
 	e.openBlockType = ""
+	return out
+}
+
+func (e *wbAnthropicStreamEncoder) startToolBlock(tcIdx int, st *wbAnthToolState) []string {
+	var out []string
+	out = append(out, e.closeActiveBlock()...)
+	blockIdx := e.nextBlockIndex
+	e.nextBlockIndex++
+	st.blockIdx = blockIdx
+	st.started = true
+	e.openBlockType = "tool_use"
+	e.openBlockIndex = blockIdx
+	e.openToolIdx = tcIdx
+
+	callID := st.id
+	if callID == "" {
+		callID = fmt.Sprintf("toolu_%s_%d", e.messageID, tcIdx)
+		st.id = callID
+	}
+	name := st.name
+	if name == "" {
+		name = "tool"
+	}
+	out = append(out, anthropicSSEFrame("content_block_start", map[string]any{
+		"type":  "content_block_start",
+		"index": blockIdx,
+		"content_block": map[string]any{
+			"type":  "tool_use",
+			"id":    callID,
+			"name":  name,
+			"input": map[string]any{},
+		},
+	}))
+	if st.args.Len() > 0 {
+		buffered := st.args.String()
+		st.args.Reset()
+		out = append(out, anthropicSSEFrame("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": blockIdx,
+			"delta": map[string]any{
+				"type":         "input_json_delta",
+				"partial_json": buffered,
+			},
+		}))
+	}
 	return out
 }
 
@@ -671,39 +787,48 @@ func (e *wbAnthropicStreamEncoder) EncodeChunk(chunk *NormalizedChunk) []string 
 
 	for _, tc := range chunk.ToolCalls {
 		e.hasToolCalls = true
-		blockIdx, exists := e.activeToolCalls[tc.Index]
+		st, exists := e.toolStates[tc.Index]
 		if !exists {
-			out = append(out, e.closeActiveBlock()...)
-			blockIdx = e.nextBlockIndex
-			e.nextBlockIndex++
-			e.activeToolCalls[tc.Index] = blockIdx
-			e.openBlockType = "tool_use"
-			e.openBlockIndex = blockIdx
-			callID := tc.ID
-			if callID == "" {
-				callID = fmt.Sprintf("toolu_%s_%d", e.messageID, tc.Index)
+			st = &wbAnthToolState{
+				id:   tc.ID,
+				name: tc.Name,
 			}
-			out = append(out, anthropicSSEFrame("content_block_start", map[string]any{
-				"type":  "content_block_start",
-				"index": blockIdx,
-				"content_block": map[string]any{
-					"type":  "tool_use",
-					"id":    callID,
-					"name":  tc.Name,
-					"input": map[string]any{},
-				},
-			}))
+			e.toolStates[tc.Index] = st
+			e.toolOrder = append(e.toolOrder, tc.Index)
+		} else {
+			if tc.ID != "" && st.id == "" {
+				st.id = tc.ID
+			}
+			if tc.Name != "" {
+				st.name += tc.Name
+			}
 		}
+
+		if st.started {
+			if !st.closed && tc.Arguments != "" {
+				out = append(out, anthropicSSEFrame("content_block_delta", map[string]any{
+					"type":  "content_block_delta",
+					"index": st.blockIdx,
+					"delta": map[string]any{
+						"type":         "input_json_delta",
+						"partial_json": tc.Arguments,
+					},
+				}))
+			}
+			continue
+		}
+
 		if tc.Arguments != "" {
-			out = append(out, anthropicSSEFrame("content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": blockIdx,
-				"delta": map[string]any{
-					"type":         "input_json_delta",
-					"partial_json": tc.Arguments,
-				},
-			}))
+			st.args.WriteString(tc.Arguments)
 		}
+		// 若首片仅携带 id 而尚未送达工具名，或当前已有另一个正在等待参数的并行 tool_use 块，暂缓开启新块以避免空名或提前关闭前序块。
+		if st.name == "" {
+			continue
+		}
+		if e.openBlockType == "tool_use" && e.openToolIdx != tc.Index && tc.Arguments == "" {
+			continue
+		}
+		out = append(out, e.startToolBlock(tc.Index, st)...)
 	}
 	return out
 }
@@ -711,6 +836,11 @@ func (e *wbAnthropicStreamEncoder) EncodeChunk(chunk *NormalizedChunk) []string 
 func (e *wbAnthropicStreamEncoder) Finish(finishReason string, usage *NormalizedUsage) []string {
 	var out []string
 	out = append(out, e.ensureStarted()...)
+	for _, idx := range e.toolOrder {
+		if st := e.toolStates[idx]; st != nil && !st.started {
+			out = append(out, e.startToolBlock(idx, st)...)
+		}
+	}
 	out = append(out, e.closeActiveBlock()...)
 
 	if e.hasToolCalls && (finishReason == "" || finishReason == "stop") {

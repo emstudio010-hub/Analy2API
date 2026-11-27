@@ -621,7 +621,7 @@ func (s *AccountService) TestAccountProxy(ctx context.Context, id int64, overrid
 	}
 	proxyURL := strings.TrimSpace(acc.ProxyURL)
 	if overrideProxyURL != nil {
-		proxyURL = strings.TrimSpace(*overrideProxyURL)
+		proxyURL = workbuddy.PreserveRedactedProxyPassword(strings.TrimSpace(*overrideProxyURL), acc.ProxyURL)
 	}
 	if proxyURL != "" {
 		norm, pErr := workbuddy.NormalizeProxyURL(proxyURL)
@@ -669,8 +669,12 @@ func (s *AccountService) IssueLoginLink(ctx context.Context, id int64, target st
 	return s.wbClient().IssueLoginLink(ctx, creds, target)
 }
 
-// RefreshToken 主动刷新单个 WorkBuddy 账号的 AccessToken / RefreshToken 并写回数据库。
+// RefreshToken 主动刷新单个 WorkBuddy 账号的 AccessToken / RefreshToken 并写回数据库（按账号加锁防并发续期冲撞）。
 func (s *AccountService) RefreshToken(ctx context.Context, id int64) (*TokenRefreshOutput, error) {
+	mu := s.accountRefreshMutex(id)
+	mu.Lock()
+	defer mu.Unlock()
+
 	acc, err := s.getActiveAccount(ctx, id)
 	if err != nil {
 		return nil, err

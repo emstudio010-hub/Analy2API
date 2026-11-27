@@ -182,6 +182,45 @@ func RedactProxyURL(raw string) string {
 	return u.String()
 }
 
+// PreserveRedactedProxyPassword 在前端回传脱敏代理地址（如 http://user:***@ip:port）时，
+// 若协议、主机端口与用户名跟数据库原代理一致，自动还原并保留原真实密码，防止编辑操作把密码覆盖成字面量 "***"。
+func PreserveRedactedProxyPassword(newRaw, existingRaw string) string {
+	n := strings.TrimSpace(newRaw)
+	if n == "" || (!strings.Contains(n, "***") && !strings.Contains(strings.ToUpper(n), "%2A%2A%2A")) {
+		return n
+	}
+	e := strings.TrimSpace(existingRaw)
+	if e == "" {
+		return n
+	}
+	uNew, errNew := url.Parse(n)
+	uOld, errOld := url.Parse(e)
+	if errNew != nil || errOld != nil || uNew.User == nil || uOld.User == nil {
+		return n
+	}
+	if !strings.EqualFold(uNew.Scheme, uOld.Scheme) || !strings.EqualFold(uNew.Host, uOld.Host) {
+		return n
+	}
+	newUser := uNew.User.Username()
+	newPass, hasNewPass := uNew.User.Password()
+	oldUser := uOld.User.Username()
+	oldPass, hasOldPass := uOld.User.Password()
+
+	if hasNewPass && newPass == "***" && newUser == oldUser && hasOldPass {
+		uNew.User = url.UserPassword(oldUser, oldPass)
+		return uNew.String()
+	}
+	if !hasNewPass && newUser == "***" {
+		if hasOldPass {
+			uNew.User = url.UserPassword(oldUser, oldPass)
+		} else {
+			uNew.User = url.User(oldUser)
+		}
+		return uNew.String()
+	}
+	return n
+}
+
 // Client 返回对应账号代理 URL 的缓存 *http.Client（不设 Client.Timeout，避免流式响应被掐断）。
 func (p *ProxyPool) Client(accountProxyURL string) (*http.Client, error) {
 	_, client, _, err := p.resolveEntry(accountProxyURL, false)

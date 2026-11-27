@@ -22,13 +22,19 @@ import (
 
 // AccountService 负责上游账号的增删改查、WorkBuddy 凭证/设备/代理管理与健康检查。
 type AccountService struct {
-	client      *ent.Client
-	vault       *crypto.Vault
-	relayClient *relay.Client
-	sched       *scheduler.Scheduler
-	agSvc       *AntigravityService
-	proxyPool   *ProxyPoolService
-	logger      *slog.Logger
+	client       *ent.Client
+	vault        *crypto.Vault
+	relayClient  *relay.Client
+	sched        *scheduler.Scheduler
+	agSvc        *AntigravityService
+	proxyPool    *ProxyPoolService
+	logger       *slog.Logger
+	refreshLocks sync.Map // map[int64]*sync.Mutex
+}
+
+func (s *AccountService) accountRefreshMutex(accountID int64) *sync.Mutex {
+	val, _ := s.refreshLocks.LoadOrStore(accountID, &sync.Mutex{})
+	return val.(*sync.Mutex)
 }
 
 // SetAntigravityService 注入 AntiGravity 容器编排服务，用于新建 antigravity 账号时自动分配 1:1 专属 agy 容器。
@@ -398,7 +404,7 @@ func (s *AccountService) Update(ctx context.Context, id int64, in UpdateAccountI
 		builder = builder.SetDomain(dom)
 	}
 	if in.ProxyURL != nil {
-		proxy := strings.TrimSpace(*in.ProxyURL)
+		proxy := workbuddy.PreserveRedactedProxyPassword(strings.TrimSpace(*in.ProxyURL), current.ProxyURL)
 		if proxy != "" {
 			normProxy, pErr := workbuddy.NormalizeProxyURL(proxy)
 			if pErr != nil {

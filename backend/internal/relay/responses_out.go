@@ -57,6 +57,7 @@ type respToolCallState struct {
 	callID      string
 	name        string
 	isCustom    bool
+	added       bool
 	args        strings.Builder
 	closed      bool
 }
@@ -93,6 +94,22 @@ func (e *ResponsesStreamEncoder) isCustomTool(name string) bool {
 		return false
 	}
 	return e.customTools[strings.ToLower(strings.TrimSpace(name))]
+}
+
+func (e *ResponsesStreamEncoder) isCustomToolPrefix(partial string) bool {
+	if e == nil || len(e.customTools) == 0 {
+		return false
+	}
+	p := strings.ToLower(strings.TrimSpace(partial))
+	if p == "" {
+		return false
+	}
+	for full := range e.customTools {
+		if full != p && strings.HasPrefix(full, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *ResponsesStreamEncoder) nextSeq() int {
@@ -344,6 +361,55 @@ func (e *ResponsesStreamEncoder) closeMessageItem() []string {
 	}
 }
 
+func (e *ResponsesStreamEncoder) emitToolCallAdded(st *respToolCallState) []string {
+	if st == nil || st.added {
+		return nil
+	}
+	st.added = true
+	if st.name == "" {
+		st.name = "tool"
+	}
+	st.isCustom = e.isCustomTool(st.name)
+	if st.isCustom {
+		st.itemID = "ctc_" + strings.TrimPrefix(st.callID, "ctc_")
+		return []string{
+			e.sseFrame("response.output_item.added", map[string]any{
+				"output_index": st.outputIndex,
+				"item": map[string]any{
+					"id":      st.itemID,
+					"type":    "custom_tool_call",
+					"status":  "in_progress",
+					"call_id": st.callID,
+					"name":    st.name,
+					"input":   "",
+				},
+			}),
+		}
+	}
+	st.itemID = "fc_" + strings.TrimPrefix(st.callID, "fc_")
+	out := []string{
+		e.sseFrame("response.output_item.added", map[string]any{
+			"output_index": st.outputIndex,
+			"item": map[string]any{
+				"id":        st.itemID,
+				"type":      "function_call",
+				"status":    "in_progress",
+				"call_id":   st.callID,
+				"name":      st.name,
+				"arguments": "",
+			},
+		}),
+	}
+	if st.args.Len() > 0 {
+		out = append(out, e.sseFrame("response.function_call_arguments.delta", map[string]any{
+			"item_id":      st.itemID,
+			"output_index": st.outputIndex,
+			"delta":        st.args.String(),
+		}))
+	}
+	return out
+}
+
 func (e *ResponsesStreamEncoder) encodeToolCallDelta(tc ToolCallDelta) []string {
 	var out []string
 	out = append(out, e.closeReasoningItem()...)
@@ -357,54 +423,31 @@ func (e *ResponsesStreamEncoder) encodeToolCallDelta(tc ToolCallDelta) []string 
 		if callID == "" {
 			callID = "call_" + strconv.FormatInt(e.createdAt, 36) + "_" + strconv.Itoa(tc.Index)
 		}
-		itemID := "fc_" + strings.TrimPrefix(callID, "fc_")
-		isCustom := e.isCustomTool(tc.Name)
-		if isCustom {
-			itemID = "ctc_" + strings.TrimPrefix(callID, "ctc_")
-		}
 		st = &respToolCallState{
 			outputIndex: outIdx,
-			itemID:      itemID,
+			itemID:      "fc_" + strings.TrimPrefix(callID, "fc_"),
 			callID:      callID,
 			name:        tc.Name,
-			isCustom:    isCustom,
 		}
 		e.activeToolCalls[tc.Index] = st
 		e.toolOrder = append(e.toolOrder, tc.Index)
-
-		if isCustom {
-			out = append(out, e.sseFrame("response.output_item.added", map[string]any{
-				"output_index": outIdx,
-				"item": map[string]any{
-					"id":      itemID,
-					"type":    "custom_tool_call",
-					"status":  "in_progress",
-					"call_id": callID,
-					"name":    st.name,
-					"input":   "",
-				},
-			}))
-		} else {
-			out = append(out, e.sseFrame("response.output_item.added", map[string]any{
-				"output_index": outIdx,
-				"item": map[string]any{
-					"id":        itemID,
-					"type":      "function_call",
-					"status":    "in_progress",
-					"call_id":   callID,
-					"name":      st.name,
-					"arguments": "",
-				},
-			}))
-		}
 	} else {
 		if tc.ID != "" && st.callID == "" {
 			st.callID = tc.ID
 		}
-		if tc.Name != "" && st.name == "" {
-			st.name = tc.Name
-			st.isCustom = e.isCustomTool(tc.Name)
+		if tc.Name != "" {
+			st.name += tc.Name
 		}
+	}
+
+	if !st.added {
+		if tc.Arguments != "" {
+			st.args.WriteString(tc.Arguments)
+		}
+		if st.name != "" && (!e.isCustomToolPrefix(st.name) || st.args.Len() > 0) {
+			out = append(out, e.emitToolCallAdded(st)...)
+		}
+		return out
 	}
 
 	if tc.Arguments != "" {
@@ -424,6 +467,10 @@ func (e *ResponsesStreamEncoder) closeToolCall(st *respToolCallState) []string {
 	if st == nil || st.closed {
 		return nil
 	}
+	var prefix []string
+	if !st.added {
+		prefix = e.emitToolCallAdded(st)
+	}
 	st.closed = true
 	args := st.args.String()
 	if strings.TrimSpace(args) == "" {
@@ -440,7 +487,7 @@ func (e *ResponsesStreamEncoder) closeToolCall(st *respToolCallState) []string {
 			"input":   rawInput,
 		}
 		e.completedItems = append(e.completedItems, completed)
-		var frames []string
+		frames := append([]string(nil), prefix...)
 		if rawInput != "" {
 			frames = append(frames, e.sseFrame("response.custom_tool_call_input.delta", map[string]any{
 				"item_id":      st.itemID,
@@ -472,7 +519,7 @@ func (e *ResponsesStreamEncoder) closeToolCall(st *respToolCallState) []string {
 	}
 	e.completedItems = append(e.completedItems, completed)
 
-	return []string{
+	return append(prefix,
 		e.sseFrame("response.function_call_arguments.done", map[string]any{
 			"item_id":      st.itemID,
 			"output_index": st.outputIndex,
@@ -483,7 +530,7 @@ func (e *ResponsesStreamEncoder) closeToolCall(st *respToolCallState) []string {
 			"output_index": st.outputIndex,
 			"item":         completed,
 		}),
-	}
+	)
 }
 
 func extractCustomToolInputText(argsJSON string) string {

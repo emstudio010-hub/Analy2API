@@ -633,15 +633,27 @@ func TranslateV1InternalSSEToOpenAISSE(ctx context.Context, src io.ReadCloser, m
 	created := time.Now().Unix()
 
 	go func() {
+		doneCh := make(chan struct{})
+		defer close(doneCh)
+		if ctx != nil {
+			go func() {
+				select {
+				case <-ctx.Done():
+					_ = src.Close()
+				case <-doneCh:
+				}
+			}()
+		}
 		defer src.Close()
 		defer pw.Close()
 
 		scanner := bufio.NewScanner(src)
-		scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+		scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
 		toolIndex := 0
 		hasToolCall := false
 		sentRole := false
+		sawPayload := false
 
 		writeChunk := func(delta map[string]any, finishReason any, usage map[string]any) bool {
 			if !sentRole && delta != nil {
@@ -695,12 +707,23 @@ func TranslateV1InternalSSEToOpenAISSE(ctx context.Context, src io.ReadCloser, m
 				continue
 			}
 
+			if errObj, hasErr := raw["error"]; hasErr && errObj != nil {
+				_, _ = fmt.Fprintf(pw, "data: %s\n\n", data)
+				return
+			}
+
 			respObj, _ := raw["response"].(map[string]any)
 			if respObj == nil {
 				respObj = raw
 			}
+			if errObj, hasErr := respObj["error"]; hasErr && errObj != nil {
+				b, _ := json.Marshal(map[string]any{"error": errObj})
+				_, _ = fmt.Fprintf(pw, "data: %s\n\n", b)
+				return
+			}
 
 			if um, ok := respObj["usageMetadata"].(map[string]any); ok && um != nil {
+				sawPayload = true
 				promptTokens := int(firstInt64(um, "promptTokenCount"))
 				cachedTokens := int(firstInt64(um, "cachedContentTokenCount"))
 				candTokens := int(firstInt64(um, "candidatesTokenCount"))
@@ -725,6 +748,7 @@ func TranslateV1InternalSSEToOpenAISSE(ctx context.Context, src io.ReadCloser, m
 			if len(cands) == 0 {
 				continue
 			}
+			sawPayload = true
 			cand, _ := cands[0].(map[string]any)
 			if cand == nil {
 				continue
@@ -786,6 +810,19 @@ func TranslateV1InternalSSEToOpenAISSE(ctx context.Context, src io.ReadCloser, m
 			if fr, ok := cand["finishReason"].(string); ok && fr != "" {
 				finalFinish = mapGeminiFinishReason(fr, hasToolCall)
 			}
+		}
+
+		if scanErr := scanner.Err(); scanErr != nil {
+			if ctx == nil || ctx.Err() == nil {
+				_ = pw.CloseWithError(scanErr)
+			}
+			return
+		}
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		if !sawPayload && !sentRole && !hasToolCall && finalFinish == "" {
+			return
 		}
 
 		if finalFinish == "" {
