@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 
 import { accountsApi, cronJobsApi, groupsApi } from '@/api/endpoints'
 import { toMessage } from '@/api/client'
@@ -331,9 +331,16 @@ async function runPreview(): Promise<void> {
 watch(
   () => [form.cron_expr, form.timezone, formOpen.value] as const,
   ([, , isOpen]) => {
-    if (!isOpen) return
+    if (!isOpen) {
+      if (previewTimer) {
+        clearTimeout(previewTimer)
+        previewTimer = null
+      }
+      return
+    }
     if (previewTimer) clearTimeout(previewTimer)
     previewTimer = setTimeout(() => {
+      previewTimer = null
       void runPreview()
     }, 280)
   },
@@ -497,6 +504,13 @@ const historyRows = computed<CronJobRunRecord[]>(() => detailJob.value?.run_hist
 onMounted(() => {
   void load()
 })
+
+onBeforeUnmount(() => {
+  if (previewTimer) {
+    clearTimeout(previewTimer)
+    previewTimer = null
+  }
+})
 </script>
 
 <template>
@@ -509,6 +523,7 @@ onMounted(() => {
         :hint="`启用 ${stats.enabled} · 执行中 ${stats.running}`"
         icon="clock"
         tone="accent"
+        :loading="loading && items.length === 0"
       />
       <MetricTile
         label="最近下一次排期触发"
@@ -520,6 +535,7 @@ onMounted(() => {
         "
         icon="zap"
         tone="info"
+        :loading="loading && items.length === 0"
       />
 
       <div class="card flex flex-col justify-between p-3.5">
@@ -835,7 +851,8 @@ onMounted(() => {
             <span class="text-xs font-medium text-fg">未来 5 次执行时刻预览（{{ form.timezone }}）</span>
             <Badge v-if="previewLoading" tone="info">校验中…</Badge>
             <Badge v-else-if="previewData?.valid" tone="success">Cron 语法有效</Badge>
-            <Badge v-else tone="danger">语法错误</Badge>
+            <Badge v-else-if="previewData" tone="danger">语法错误</Badge>
+            <Badge v-else tone="neutral">待校验</Badge>
           </div>
 
           <p v-if="previewData && !previewData.valid" class="mt-1.5 text-xs text-danger">
@@ -900,7 +917,7 @@ onMounted(() => {
               <span class="flex items-center gap-2">
                 <input
                   type="checkbox"
-                  class="h-3.5 w-3.5 rounded border-line-strong bg-surface accent-blue-600"
+                  class="h-3.5 w-3.5 rounded border-line-strong bg-surface accent-[rgb(var(--c-accent))]"
                   :checked="form.account_ids.includes(acc.id)"
                   @change="toggleAccountSelection(acc.id)"
                 />

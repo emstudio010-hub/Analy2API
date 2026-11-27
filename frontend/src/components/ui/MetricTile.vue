@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import Icon from './Icon.vue'
+import Skeleton from './Skeleton.vue'
 import type { IconName } from './icons'
 
 type Tone = 'neutral' | 'accent' | 'success' | 'warning' | 'danger' | 'info'
@@ -12,8 +13,9 @@ withDefaults(
     icon?: IconName
     tone?: Tone
     mono?: boolean
+    loading?: boolean
   }>(),
-  { hint: '', tone: 'neutral', mono: false },
+  { hint: '', tone: 'neutral', mono: false, loading: false },
 )
 
 const dotTones: Record<Tone, string> = {
@@ -42,13 +44,18 @@ const iconTones: Record<Tone, string> = {
         <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="dotTones[tone]" />
         <span class="truncate">{{ label }}</span>
       </div>
+
+      <Skeleton v-if="loading" class="mt-2 h-6 w-24" />
       <p
+        v-else
         class="tnum mt-1.5 truncate text-lg font-semibold leading-6 text-fg"
         :class="mono ? 'font-mono text-base' : ''"
       >
         {{ value }}
       </p>
-      <p v-if="hint || $slots.hint" class="mt-0.5 truncate text-2xs text-subtle">
+
+      <Skeleton v-if="loading" class="mt-1.5 h-3 w-36" />
+      <p v-else-if="hint || $slots.hint" class="mt-0.5 truncate text-2xs text-subtle">
         <slot name="hint">{{ hint }}</slot>
       </p>
     </div>

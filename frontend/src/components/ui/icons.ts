@@ -7,6 +7,7 @@ export type IconName =
   | 'activity'
   | 'alert'
   | 'alertCircle'
+  | 'arrowUpRight'
   | 'box'
   | 'check'
   | 'checkCircle'
@@ -29,8 +30,11 @@ export type IconName =
   | 'fileText'
   | 'filter'
   | 'folder'
+  | 'gauge'
   | 'gift'
   | 'globe'
+  | 'helpCircle'
+  | 'inbox'
   | 'info'
   | 'key'
   | 'layers'
@@ -39,6 +43,7 @@ export type IconName =
   | 'logout'
   | 'menu'
   | 'moon'
+  | 'network'
   | 'panelLeft'
   | 'pause'
   | 'play'
@@ -60,6 +65,7 @@ export type IconName =
   | 'trash'
   | 'upload'
   | 'users'
+  | 'wrapText'
   | 'xCircle'
   | 'zap'
 
@@ -69,6 +75,7 @@ export const iconPaths: Record<IconName, string> = {
   alert:
     '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
   alertCircle: '<circle cx="12" cy="12" r="9"/><path d="M12 8v4.5"/><path d="M12 16.5h.01"/>',
+  arrowUpRight: '<path d="M7 17L17 7"/><path d="M8 7h9v9"/>',
   box: '<path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.3 7l8.7 5 8.7-5"/><path d="M12 22V12"/>',
   check: '<path d="M5 13l4 4L19 7"/>',
   checkCircle: '<circle cx="12" cy="12" r="9"/><path d="M8.2 12.4l2.6 2.6 5-5.2"/>',
@@ -99,9 +106,15 @@ export const iconPaths: Record<IconName, string> = {
   filter: '<path d="M3 5h18l-7 8.2V20l-4-2.2v-4.6z"/>',
   folder:
     '<path d="M3 7a2 2 0 0 1 2-2h3.6l2 2.2H19a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
+  gauge:
+    '<path d="M12 14l3.5-3.5"/><path d="M20.3 18A9 9 0 1 0 3.7 18z"/><circle cx="12" cy="14" r="1.5"/>',
   gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M12 8v13"/><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"/><path d="M7.5 8a2.5 2.5 0 0 1 0-5C9 3 12 8 12 8s3-5 4.5-5a2.5 2.5 0 0 1 0 5"/>',
   globe:
     '<circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8"/><path d="M3.6 15h16.8"/><path d="M12 3a14 14 0 0 1 0 18"/><path d="M12 3a14 14 0 0 0 0 18"/>',
+  helpCircle:
+    '<circle cx="12" cy="12" r="9"/><path d="M9.1 9a3 3 0 0 1 5.8 1c0 2-3 2.5-3 4"/><path d="M12 17.2h.01"/>',
+  inbox:
+    '<polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
   info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5.5"/><path d="M12 7.5h.01"/>',
   key: '<circle cx="7.5" cy="16.5" r="4"/><path d="M10.4 13.6 20 4"/><path d="M16.8 7.2l2.6 2.6"/>',
   layers:
@@ -112,6 +125,8 @@ export const iconPaths: Record<IconName, string> = {
     '<path d="M9.5 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4.5"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>',
   menu: '<path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/>',
   moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
+  network:
+    '<rect x="9" y="2" width="6" height="5" rx="1"/><rect x="2" y="17" width="6" height="5" rx="1"/><rect x="16" y="17" width="6" height="5" rx="1"/><path d="M12 7v5"/><path d="M5 17v-3a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2v3"/>',
   panelLeft: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>',
   pause: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
   play: '<polygon points="6 4 20 12 6 20 6 4"/>',
@@ -142,6 +157,8 @@ export const iconPaths: Record<IconName, string> = {
     '<path d="M21 15.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-3.5"/><path d="M12 3.5v13"/><path d="M7 8.5l5-5 5 5"/>',
   users:
     '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0"/><path d="M16.2 5.3a3.5 3.5 0 0 1 0 6.6"/><path d="M18 20a6.5 6.5 0 0 0-1.9-4.6"/>',
+  wrapText:
+    '<path d="M3 6h18"/><path d="M3 12h15a3 3 0 1 1 0 6h-4"/><polyline points="16 16 14 18 16 20"/><path d="M3 18h7"/>',
   xCircle: '<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6"/><path d="M9 9l6 6"/>',
   zap: '<path d="M13 2.5 4.5 14H11l-.8 7.5L19 10h-6.4z"/>',
 }

@@ -21,7 +21,7 @@ export default {
           strong: token('line-strong'),
         },
 
-        // 文字对比层级（均满足 ≥4.5:1 可读性底线）
+        // 文字对比层级（深浅双主题均满足 ≥4.5:1 可读性底线）
         fg: token('fg'),
         muted: token('muted'),
         subtle: token('subtle'),
@@ -44,6 +44,12 @@ export default {
       },
       ringColor: {
         DEFAULT: token('accent'),
+      },
+      spacing: {
+        13: '3.25rem',
+        15: '3.75rem',
+        68: '17rem',
+        76: '19rem',
       },
       fontFamily: {
         sans: [
@@ -84,7 +90,7 @@ export default {
         pop: 'var(--shadow-pop)',
       },
       transitionDuration: {
-        DEFAULT: '140ms',
+        DEFAULT: '150ms',
       },
     },
   },

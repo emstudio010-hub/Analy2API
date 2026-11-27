@@ -1,6 +1,5 @@
 <script setup lang="ts">
-// 表单行：标签 + 控件 + 说明/错误。后台里几乎每个弹窗都是这个结构，
-// 抽出来是为了让所有表单的间距和错误提示位置天然一致。
+// 表单行：标签 + 控件 + 说明/错误。让所有弹窗与页面的表单间距和内联校验提示高度一致。
 withDefaults(
   defineProps<{
     label?: string
@@ -18,15 +17,17 @@ withDefaults(
     <label
       v-if="label"
       :for="htmlFor"
-      class="flex items-center gap-1 text-xs font-medium text-muted"
+      class="flex items-center gap-1 text-xs font-medium leading-4 text-muted"
     >
-      {{ label }}
-      <span v-if="required" class="text-danger">*</span>
+      <span>{{ label }}</span>
+      <span v-if="required" class="text-danger" aria-hidden="true">*</span>
     </label>
 
     <slot />
 
-    <p v-if="error" class="text-2xs text-danger">{{ error }}</p>
-    <p v-else-if="hint" class="text-2xs text-subtle">{{ hint }}</p>
+    <p v-if="error" class="text-2xs font-medium leading-4 text-danger" role="alert">
+      {{ error }}
+    </p>
+    <p v-else-if="hint" class="text-2xs leading-4 text-subtle">{{ hint }}</p>
   </div>
 </template>

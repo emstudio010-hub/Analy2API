@@ -6,25 +6,26 @@
    工程控制台双主题令牌系统
    ------------------------------------------------------------------
    - 深色（默认，`html.dark`）：Slate/Zinc 精密暗黑工程台
-   - 浅色（`html:not(.dark)` / `html.light`）：清爽白灰工业风
-   杜绝廉价紫色霓虹渐变与重阴影，依靠表面明度阶梯与 1px 描边建立层次。
+   - 浅色（`html:not(.dark)` / `html.light`）：冷灰底布 + 纯白面板工业风
+   杜绝廉价紫色霓虹渐变与重阴影，依靠表面明度阶梯与 1px 精密描边建立层次，
+   所有正文、次级文案与占位符均满足 WCAG AA ≥ 4.5:1 对比度要求。
    ------------------------------------------------------------------ */
 @layer base {
   :root,
   html.dark {
     color-scheme: dark;
 
-    --c-canvas: 11 13 17;
-    --c-surface: 17 20 26;
-    --c-raised: 24 28 36;
-    --c-overlay: 32 38 48;
+    --c-canvas: 10 12 16;
+    --c-surface: 17 20 27;
+    --c-raised: 24 29 38;
+    --c-overlay: 33 40 52;
 
-    --c-line: 38 45 56;
-    --c-line-strong: 56 66 82;
+    --c-line: 43 51 66;
+    --c-line-strong: 66 78 99;
 
-    --c-fg: 236 240 245;
-    --c-muted: 156 166 181;
-    --c-subtle: 114 125 142;
+    --c-fg: 241 245 249;
+    --c-muted: 172 183 200;
+    --c-subtle: 134 147 167;
 
     --c-accent: 59 130 246;
     --c-accent-fg: 255 255 255;
@@ -34,25 +35,25 @@
     --c-danger: 239 68 68;
     --c-info: 14 165 233;
 
-    --shadow-panel: 0 1px 2px 0 rgb(0 0 0 / 0.28);
-    --shadow-pop: 0 16px 36px -10px rgb(0 0 0 / 0.55), 0 2px 8px -2px rgb(0 0 0 / 0.36);
+    --shadow-panel: 0 1px 2px 0 rgb(0 0 0 / 0.32), 0 1px 1px -1px rgb(0 0 0 / 0.24);
+    --shadow-pop: 0 18px 40px -10px rgb(0 0 0 / 0.62), 0 4px 12px -2px rgb(0 0 0 / 0.42);
   }
 
   html:not(.dark),
   html.light {
     color-scheme: light;
 
-    --c-canvas: 244 246 249;
+    --c-canvas: 243 246 250;
     --c-surface: 255 255 255;
-    --c-raised: 247 248 250;
-    --c-overlay: 237 240 245;
+    --c-raised: 246 248 252;
+    --c-overlay: 235 240 247;
 
-    --c-line: 222 227 235;
-    --c-line-strong: 195 203 215;
+    --c-line: 216 223 234;
+    --c-line-strong: 181 192 208;
 
-    --c-fg: 15 23 36;
-    --c-muted: 73 84 100;
-    --c-subtle: 106 117 134;
+    --c-fg: 15 23 42;
+    --c-muted: 59 71 90;
+    --c-subtle: 92 105 125;
 
     --c-accent: 37 99 235;
     --c-accent-fg: 255 255 255;
@@ -62,8 +63,8 @@
     --c-danger: 220 38 38;
     --c-info: 2 132 199;
 
-    --shadow-panel: 0 1px 2px 0 rgb(15 23 36 / 0.05);
-    --shadow-pop: 0 14px 32px -10px rgb(15 23 36 / 0.16), 0 2px 6px -1px rgb(15 23 36 / 0.08);
+    --shadow-panel: 0 1px 2px 0 rgb(15 23 42 / 0.05), 0 1px 1px -1px rgb(15 23 42 / 0.03);
+    --shadow-pop: 0 16px 36px -10px rgb(15 23 42 / 0.16), 0 4px 10px -2px rgb(15 23 42 / 0.08);
   }
 
   html,
@@ -75,8 +76,26 @@
   body {
     @apply bg-canvas font-sans text-sm text-fg antialiased;
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
     caret-color: rgb(var(--c-accent));
+  }
+
+  a {
+    text-underline-offset: 3px;
+  }
+
+  /* 原生下拉选项与日期控件深浅主题同步 */
+  select option,
+  select optgroup {
+    background-color: rgb(var(--c-surface));
+    color: rgb(var(--c-fg));
+  }
+
+  input[type='datetime-local'],
+  input[type='date'],
+  input[type='time'] {
+    color-scheme: inherit;
   }
 
   ::selection {
@@ -85,7 +104,7 @@
   }
 
   :focus-visible {
-    @apply outline-none ring-2 ring-accent ring-offset-1 ring-offset-canvas;
+    @apply outline-none ring-2 ring-accent/80 ring-offset-1 ring-offset-surface;
   }
 
   .tnum {
@@ -104,7 +123,7 @@
   }
 
   .td {
-    @apply whitespace-nowrap px-3 py-2 align-middle text-[13px] text-fg;
+    @apply whitespace-nowrap px-3 py-2.5 align-middle text-[13px] leading-5 text-fg;
   }
 
   .card {
@@ -112,20 +131,26 @@
   }
 
   .panel-inset {
-    @apply rounded-md border border-line bg-raised/60;
+    @apply rounded-md border border-line bg-raised/65;
   }
 
   /* 表单控件统一底座 */
   .field {
-    @apply w-full rounded-md border border-line bg-raised px-2.5 py-1.5 text-[13px] text-fg
+    @apply w-full rounded-md border border-line bg-raised px-2.5 py-1.5 text-[13px] leading-5 text-fg
       placeholder:text-subtle transition
       hover:border-line-strong
-      focus:border-accent focus:bg-surface focus:outline-none focus:ring-1 focus:ring-accent
+      focus:border-accent focus:bg-surface focus:outline-none focus:ring-2 focus:ring-accent/25
       disabled:cursor-not-allowed disabled:opacity-50;
+    height: 2.125rem;
+  }
+
+  textarea.field {
+    height: auto;
   }
 
   .field-sm {
-    @apply px-2 py-1 text-xs;
+    @apply px-2.5 py-1 text-xs;
+    height: 1.875rem;
   }
 
   /* 细滚动条：适配深浅双色面板 */
@@ -153,10 +178,10 @@
   }
 }
 
-/* 克制的工程台过渡效果 */
+/* 克制的工程台过渡效果（150ms–200ms 指数缓出） */
 .fade-enter-active,
 .fade-leave-active {
-  transition: opacity 120ms cubic-bezier(0.16, 1, 0.3, 1);
+  transition: opacity 140ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .fade-enter-from,
@@ -167,8 +192,8 @@
 .pop-enter-active,
 .pop-leave-active {
   transition:
-    opacity 130ms cubic-bezier(0.16, 1, 0.3, 1),
-    transform 130ms cubic-bezier(0.16, 1, 0.3, 1);
+    opacity 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    transform 150ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .pop-enter-from,
@@ -185,4 +210,27 @@
 .slide-enter-from,
 .slide-leave-to {
   transform: translateX(-100%);
+}
+
+.drawer-enter-active,
+.drawer-leave-active {
+  transition: transform 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.drawer-enter-from,
+.drawer-leave-to {
+  transform: translateX(100%);
+}
+
+@keyframes progress-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.animate-progress-bar {
+  animation: progress-slide 1.2s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }

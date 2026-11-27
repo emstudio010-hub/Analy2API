@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 
 import {
   deleteModelPrice,
@@ -49,6 +49,7 @@ const capReasoning = ref(false)
 const capTool = ref(false)
 
 const copiedModelId = ref<string | null>(null)
+let copyTimer: ReturnType<typeof setTimeout> | null = null
 
 const platformTabs = computed(() => [
   { value: 'all', label: '全部平台', badge: mergedModels.value.length },
@@ -255,7 +256,9 @@ async function copyModelId(id: string): Promise<void> {
     return
   }
   copiedModelId.value = id
-  setTimeout(() => {
+  if (copyTimer) clearTimeout(copyTimer)
+  copyTimer = setTimeout(() => {
+    copyTimer = null
     if (copiedModelId.value === id) copiedModelId.value = null
   }, 1500)
   toast.success('已复制模型 ID', id)
@@ -354,6 +357,13 @@ async function confirmRevertOfficial(row?: EnrichedModelRow | null): Promise<voi
 onMounted(() => {
   void loadData(false)
 })
+
+onBeforeUnmount(() => {
+  if (copyTimer) {
+    clearTimeout(copyTimer)
+    copyTimer = null
+  }
+})
 </script>
 
 <template>
@@ -366,6 +376,7 @@ onMounted(() => {
         :hint="refreshedAt ? `上次同步 ${formatDateTime(refreshedAt)}` : '支持四源实时探测与去重合并'"
         icon="cpu"
         tone="accent"
+        :loading="loading && catalogItems.length === 0"
       />
       <MetricTile
         label="官方标准牌价命中"
@@ -373,6 +384,7 @@ onMounted(() => {
         hint="智能兼容 vendor/ 前缀与点号/横线版本号"
         icon="checkCircle"
         tone="success"
+        :loading="loading && catalogItems.length === 0"
       />
       <MetricTile
         label="自定义覆盖改价"
@@ -380,6 +392,7 @@ onMounted(() => {
         hint="数据库热生效，支持随时一键恢复官方价"
         icon="coins"
         tone="warning"
+        :loading="loading && catalogItems.length === 0"
       />
       <MetricTile
         label="多模态与推理模型"
@@ -387,6 +400,7 @@ onMounted(() => {
         :hint="`推理 ${mergedModels.filter((m) => m.supports_reasoning).length} · 视觉 ${mergedModels.filter((m) => m.supports_images).length}`"
         icon="sparkles"
         tone="info"
+        :loading="loading && catalogItems.length === 0"
       />
     </div>
 
@@ -459,11 +473,12 @@ onMounted(() => {
         <div class="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
+            :aria-pressed="capVision"
             class="inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs font-medium transition"
             :class="
               capVision
                 ? 'border-accent bg-accent/12 text-accent'
-                : 'border-line bg-raised text-muted hover:text-fg'
+                : 'border-line bg-raised text-muted hover:border-line-strong hover:text-fg'
             "
             @click="capVision = !capVision"
           >
@@ -473,11 +488,12 @@ onMounted(() => {
 
           <button
             type="button"
+            :aria-pressed="capReasoning"
             class="inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs font-medium transition"
             :class="
               capReasoning
                 ? 'border-accent bg-accent/12 text-accent'
-                : 'border-line bg-raised text-muted hover:text-fg'
+                : 'border-line bg-raised text-muted hover:border-line-strong hover:text-fg'
             "
             @click="capReasoning = !capReasoning"
           >
@@ -487,11 +503,12 @@ onMounted(() => {
 
           <button
             type="button"
+            :aria-pressed="capTool"
             class="inline-flex h-7 items-center gap-1 rounded-md border px-2.5 text-xs font-medium transition"
             :class="
               capTool
                 ? 'border-accent bg-accent/12 text-accent'
-                : 'border-line bg-raised text-muted hover:text-fg'
+                : 'border-line bg-raised text-muted hover:border-line-strong hover:text-fg'
             "
             @click="capTool = !capTool"
           >

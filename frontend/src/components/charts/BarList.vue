@@ -3,8 +3,6 @@ import { computed } from 'vue'
 
 import type { BarItem } from './types'
 
-// 横向条形排行。用纯 div 而不是 SVG：条形只需要一个百分比宽度，
-// SVG 在这里只会多一层坐标系换算。
 const props = withDefaults(
   defineProps<{
     items: BarItem[]
@@ -23,28 +21,35 @@ const props = withDefaults(
 )
 
 const toneClass: Record<string, string> = {
-  accent: 'bg-accent/70',
-  success: 'bg-success/70',
-  warning: 'bg-warning/70',
-  info: 'bg-info/70',
+  accent: 'bg-accent/75',
+  success: 'bg-success/75',
+  warning: 'bg-warning/75',
+  info: 'bg-info/75',
+}
+
+function safeVal(v: unknown): number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 0
 }
 
 const denominator = computed(() => {
   if (props.max > 0) return props.max
-  return Math.max(...props.items.map((item) => item.value), 0)
+  return Math.max(...props.items.map((item) => safeVal(item.value)), 0)
 })
 
 function barWidth(value: number): string {
+  const clean = safeVal(value)
   const total = denominator.value
-  if (total <= 0) return '0%'
-  // 最小 2%：值为 0 附近时留一丝可见的痕迹，否则看起来像渲染失败。
-  const ratio = Math.min(Math.max(value / total, 0), 1)
-  return `${Math.max(ratio * 100, value > 0 ? 2 : 0)}%`
+  if (total <= 0 || clean <= 0) return '0%'
+  const ratio = Math.min(Math.max(clean / total, 0), 1)
+  return `${Math.max(ratio * 100, 2)}%`
 }
 </script>
 
 <template>
-  <div v-if="items.length === 0" class="py-6 text-center text-2xs text-subtle">
+  <div
+    v-if="items.length === 0"
+    class="rounded-md border border-dashed border-line bg-raised/30 py-6 text-center text-2xs text-subtle"
+  >
     {{ emptyText }}
   </div>
 
@@ -55,13 +60,13 @@ function barWidth(value: number): string {
           {{ item.label }}
         </span>
         <span class="tnum shrink-0 text-[12px] text-muted">
-          {{ formatValue(item.value) }}
+          {{ formatValue(safeVal(item.value)) }}
           <span v-if="item.secondary" class="ml-1.5 text-2xs text-subtle">{{ item.secondary }}</span>
         </span>
       </div>
       <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-raised">
         <div
-          class="h-full rounded-full transition-[width] duration-300"
+          class="h-full rounded-full transition-[width] duration-200"
           :class="toneClass[tone]"
           :style="{ width: barWidth(item.value) }"
         />
