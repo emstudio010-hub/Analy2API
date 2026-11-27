@@ -12,6 +12,7 @@ import (
 
 	"cmd2api/ent"
 	"cmd2api/ent/systemsetting"
+	"cmd2api/internal/antigravity"
 	"cmd2api/internal/config"
 	"cmd2api/internal/workbuddy"
 )
@@ -24,6 +25,7 @@ const (
 	SettingKeyEmptySystemPlaceholder = "empty_system_placeholder"
 	SettingKeyAutoHarvestEnabled     = "auto_harvest_enabled"
 	SettingKeyAutoHarvestInterval    = "auto_harvest_interval"
+	SettingKeyAgyPromptMode          = "agy_prompt_mode"
 )
 
 var runtimeSettingKeys = []string{
@@ -34,6 +36,7 @@ var runtimeSettingKeys = []string{
 	SettingKeyEmptySystemPlaceholder,
 	SettingKeyAutoHarvestEnabled,
 	SettingKeyAutoHarvestInterval,
+	SettingKeyAgyPromptMode,
 }
 
 // RuntimeSettingsInput 对齐前端 RuntimeSettingsPayload，支持按秒数或时长字符串在线热更新。
@@ -48,6 +51,7 @@ type RuntimeSettingsInput struct {
 	EmptySystemPlaceholder *bool
 	AutoHarvestEnabled     *bool
 	AutoHarvestInterval    *string
+	AgyPromptMode          *string
 	Settings               map[string]string
 }
 
@@ -184,6 +188,28 @@ func (s *RuntimeSettingsService) Update(
 		}
 	}
 
+	// 7. AntiGravity AGY CLI 提示词运行管线模式热更新
+	var rawAgyMode string
+	var agyModeProvided bool
+	if in.AgyPromptMode != nil {
+		rawAgyMode = strings.TrimSpace(*in.AgyPromptMode)
+		agyModeProvided = true
+	} else if raw, exists := in.Settings[SettingKeyAgyPromptMode]; exists {
+		rawAgyMode = strings.TrimSpace(raw)
+		agyModeProvided = true
+	}
+	if agyModeProvided {
+		if rawAgyMode != "" && !antigravity.IsValidPromptMode(rawAgyMode) {
+			return nil, fmt.Errorf("无效的 AGY 提示词模式 %q（支持 default_intercept_continue | blend_sanitized | native_only | downstream_only）", rawAgyMode)
+		}
+		normMode := ""
+		if rawAgyMode != "" {
+			normMode = antigravity.NormalizePromptMode(rawAgyMode)
+		}
+		toSave[SettingKeyAgyPromptMode] = normMode
+		antigravity.SetRuntimePromptMode(normMode)
+	}
+
 	// 持久化到 system_settings 表
 	for k, v := range toSave {
 		if err := s.upsertRuntimeKey(ctx, k, v); err != nil {
@@ -258,6 +284,11 @@ func applyRuntimeMapToConfig(cfg *config.Config, kv map[string]string) {
 	if raw, ok := kv[SettingKeyAutoHarvestInterval]; ok {
 		if dur, err := parseFlexibleDuration(raw); err == nil && dur > 0 {
 			cfg.CommandCC.AutoHarvestInterval = dur
+		}
+	}
+	if raw, ok := kv[SettingKeyAgyPromptMode]; ok && strings.TrimSpace(raw) != "" {
+		if antigravity.IsValidPromptMode(raw) {
+			antigravity.SetRuntimePromptMode(raw)
 		}
 	}
 }

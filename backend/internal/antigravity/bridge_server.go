@@ -1,6 +1,8 @@
 package antigravity
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,7 +23,7 @@ import (
 	"cmd2api/internal/netx"
 )
 
-// BridgeConfig 描述单容器独立真实 agy CLI 客户端桥接服务 (`cmdwb2api agy-bridge`) 的运行配置。
+// BridgeConfig 描述单容器独立真实 agy CLI 客户端桥接服务 (`analy2api agy-bridge`) 的运行配置。
 // 每个容器内只运行一个完整的真实 agy CLI 实例，通过本桥接对外暴露标准 OpenAI /v1 与管理 /v0/management 接口。
 type BridgeConfig struct {
 	ListenAddr       string
@@ -30,15 +33,21 @@ type BridgeConfig struct {
 	ManagementKey    string
 	ProxyURL         string
 	SessionRetention string        // "stateless"（默认，每轮请求后立即清理磁盘）| "ephemeral"（短期复用并在驱逐时清理）
-	PromptBlendMode  string        // "blend_clean"（默认，净化版 AGY 原生 + 后接下游提示词）| "verbatim_only" | "native_raw"
-	NativePrompt     string        // 可选自定义 AGY 原生底本（blend_clean 下会自动删误导段）
+	PromptBlendMode  string        // "default_intercept_continue"（默认，原生默认 -> 拦截 -> 接续）| "blend_sanitized" | "native_only" | "downstream_only"
+	NativePrompt     string        // 可选自定义 AGY 原生底本
 	SessionTTL       time.Duration // ephemeral 模式下的会话过期时间（默认 30 分钟）
 	MaxSessions      int           // ephemeral 模式下的最大会话数（默认 256）
 	Logger           *slog.Logger
 }
 
-// NewAgyBridgeHandler 构建单容器真实 agy CLI 桥接 HTTP Handler，供 `cmdwb2api agy-bridge` 与单元测试共用。
+// NewAgyBridgeHandler 构建单容器真实 agy CLI 桥接 HTTP Handler，供 `analy2api agy-bridge` 与单元测试共用。
 func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
+	return NewAgyBridgeHandlerWithContext(nil, cfg)
+}
+
+// NewAgyBridgeHandlerWithContext 构建绑定生命周期 Context 的 agy CLI 桥接 Handler（当 ctx 结束时自动停止后台磁盘巡检协程）。
+// 当传入 ctx 为 nil（如单测构造临时 Handler）时，仍执行启动期孤儿清理，但不启动无界后台 Ticker 防止泄漏。
+func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConfig) http.Handler {
 	logger := cfg.Logger
 	if logger == nil {
 		logger = slog.Default()
@@ -52,16 +61,19 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 
 	promptBlendMode := strings.TrimSpace(cfg.PromptBlendMode)
 	if promptBlendMode == "" {
-		promptBlendMode = os.Getenv(AgyPromptBlendModeEnv)
+		promptBlendMode = firstNonEmptyStr(os.Getenv(AgyPromptModeEnv), os.Getenv(AgyPromptBlendModeEnv))
 	}
-	promptBlendMode = NormalizePromptBlendMode(promptBlendMode)
+	if promptBlendMode != "" {
+		promptBlendMode = NormalizePromptMode(promptBlendMode)
+	}
 
 	nativePrompt := strings.TrimSpace(cfg.NativePrompt)
 	if nativePrompt == "" {
 		nativePrompt = strings.TrimSpace(os.Getenv(AgyNativePromptEnv))
 	}
 
-	spec := NodeSpec{
+	var specMu sync.RWMutex
+	baseSpec := NodeSpec{
 		Mode:             ModeLocalCLI,
 		CLIBinary:        strings.TrimSpace(cfg.CLIBinary),
 		AuthDir:          authDir,
@@ -72,7 +84,13 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 		PromptBlendMode:  promptBlendMode,
 		NativePrompt:     nativePrompt,
 	}
-	homeDir := ResolveAgyHomeDir(spec)
+	getBaseSpec := func() NodeSpec {
+		specMu.RLock()
+		defer specMu.RUnlock()
+		return baseSpec
+	}
+
+	homeDir := ResolveAgyHomeDir(baseSpec)
 
 	var (
 		bridgeCleanedCount atomic.Int64
@@ -94,10 +112,10 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 	})
 
 	// 仅在隔离容器/节点专属 AuthDir 下：
-	//  1. 自动写入系统级反代规范 <authDir>/.gemini/GEMINI.md（使真实 agy CLI 从系统级 <user_rules> 屏蔽 IDE 误导段并优先遵循下游提示词）
+	//  1. 自动写入系统级反代拦截规范（.gemini/GEMINI.md、.gemini/config/GEMINI.md 与 workspace/GEMINI.md）
 	//  2. 启动孤儿磁盘清理（启动清一次 + 每 10 分钟巡检，彻底防止异常崩溃残留撑爆磁盘）
 	if authDir != "" {
-		EnsureIsolatedAgyProxyRules(authDir, promptBlendMode, nativePrompt)
+		EnsureIsolatedAgyProxyRules(authDir, ResolvePromptBlendMode(baseSpec), nativePrompt)
 		go func() {
 			minAge := 2 * time.Minute
 			if retention == SessionRetentionStateless {
@@ -108,14 +126,22 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 				bridgeFreedBytes.Add(freed)
 				logger.Info("启动时已清理孤儿 agy 会话磁盘文件", "conversations", n, "freed_bytes", freed)
 			}
+			if lifecycleCtx == nil {
+				return
+			}
 			ticker := time.NewTicker(10 * time.Minute)
 			defer ticker.Stop()
-			for range ticker.C {
-				sessStore.SweepExpired()
-				if n, freed := SweepOrphanedConversationDiskArtifacts(homeDir, sessStore.ActiveConversationIDs(), 5*time.Minute); n > 0 {
-					bridgeCleanedCount.Add(int64(n))
-					bridgeFreedBytes.Add(freed)
-					logger.Info("定时巡检已清理孤儿 agy 会话磁盘文件", "conversations", n, "freed_bytes", freed)
+			for {
+				select {
+				case <-lifecycleCtx.Done():
+					return
+				case <-ticker.C:
+					sessStore.SweepExpired()
+					if n, freed := SweepOrphanedConversationDiskArtifacts(homeDir, sessStore.ActiveConversationIDs(), 5*time.Minute); n > 0 {
+						bridgeCleanedCount.Add(int64(n))
+						bridgeFreedBytes.Add(freed)
+						logger.Info("定时巡检已清理孤儿 agy 会话磁盘文件", "conversations", n, "freed_bytes", freed)
+					}
 				}
 			}
 		}()
@@ -138,7 +164,9 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		bin, err := ResolveAgyCLIBinary(spec.CLIBinary)
+		curSpec := getBaseSpec()
+		effMode := ResolvePromptBlendMode(curSpec)
+		bin, err := ResolveAgyCLIBinary(curSpec.CLIBinary)
 		globalCleaned, globalFreed := GlobalDiskCleanupStats()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -149,7 +177,8 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 			"cli_binary":            bin,
 			"cli_ready":             err == nil,
 			"session_retention":     retention,
-			"prompt_blend_mode":     promptBlendMode,
+			"prompt_mode":           effMode,
+			"prompt_blend_mode":     effMode,
 			"prompt_passthrough":    "verbatim",
 			"adaptive_tools":        true,
 			"active_sessions":       len(sessStore.List()),
@@ -160,7 +189,8 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 	})
 
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		if !checkAuth(r, spec.APIKey, "") {
+		curSpec := getBaseSpec()
+		if !checkAuth(r, curSpec.APIKey, "") {
 			http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 			return
 		}
@@ -174,7 +204,6 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 
 		if len(models) == 0 {
 			modelsFetchMu.Lock()
-			// 双重检查缓存：等待期间若有并发请求已拉取成功则直接复用
 			modelsMu.Lock()
 			if !forceRefresh && len(cachedModels) > 0 && time.Since(modelsCachedAt) < 5*time.Minute {
 				models = cachedModels
@@ -182,7 +211,7 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 			modelsMu.Unlock()
 
 			if len(models) == 0 {
-				fetched, err := ListModelsViaCLI(r.Context(), spec)
+				fetched, err := ListModelsViaCLI(r.Context(), curSpec)
 				if err != nil || len(fetched) == 0 {
 					logger.Warn("agy models 调用回退内置列表", "err", err)
 					models = DefaultModels()
@@ -217,7 +246,8 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 			http.Error(w, `{"error":{"message":"method not allowed"}}`, http.StatusMethodNotAllowed)
 			return
 		}
-		if !checkAuth(r, spec.APIKey, "") {
+		curSpec := getBaseSpec()
+		if !checkAuth(r, curSpec.APIKey, "") {
 			http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 			return
 		}
@@ -226,18 +256,20 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 			http.Error(w, `{"error":{"message":"read body failed"}}`, http.StatusBadRequest)
 			return
 		}
+		wantNonStream := isExplicitNonStreamingRequest(body)
+
 		upstreamSID := firstNonEmptyStr(
 			r.Header.Get("X-Session-Id"),
 			r.Header.Get("X-Conversation-Id"),
 			r.Header.Get("Conversation-Id"),
 			r.Header.Get("X-Thread-Id"),
 		)
-		reqSpec := spec
+		reqSpec := curSpec
 		if hdrRetention := strings.TrimSpace(r.Header.Get("X-Agy-Session-Retention")); hdrRetention != "" {
 			reqSpec.SessionRetention = NormalizeSessionRetention(hdrRetention)
 		}
-		if hdrBlend := strings.TrimSpace(r.Header.Get("X-Agy-Prompt-Blend-Mode")); hdrBlend != "" {
-			reqSpec.PromptBlendMode = NormalizePromptBlendMode(hdrBlend)
+		if hdrMode := firstNonEmptyStr(r.Header.Get("X-Agy-Prompt-Mode"), r.Header.Get("X-Agy-Prompt-Blend-Mode")); hdrMode != "" {
+			reqSpec.PromptBlendMode = NormalizePromptMode(hdrMode)
 		}
 
 		resp, _, err := ChatStreamViaCLIWithSession(r.Context(), reqSpec, body, upstreamSID, sessStore)
@@ -249,8 +281,6 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 		}
 		defer resp.Body.Close()
 
-		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Agy-Driver", "real-agy-cli")
 		for _, hk := range []string{
 			"X-Agy-Retention-Mode",
@@ -261,18 +291,32 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 			"X-Agy-Tool-Count",
 			"X-Agy-Prompt-Passthrough",
 			"X-Agy-Prompt-Mode",
+			"X-Agy-Inbound-Intercepts",
 		} {
 			if v := resp.Header.Get(hk); v != "" {
 				w.Header().Set(hk, v)
 			}
 		}
+
+		if wantNonStream {
+			jsonBytes, statusCode := aggregateOpenAISSEToChatCompletionJSON(resp.Body)
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.WriteHeader(statusCode)
+			_, _ = w.Write(jsonBytes)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
 		flusher, _ := w.(http.Flusher)
 
 		buf := make([]byte, 4096)
 		for {
 			n, rErr := resp.Body.Read(buf)
 			if n > 0 {
-				_, _ = w.Write(buf[:n])
+				if _, wErr := w.Write(buf[:n]); wErr != nil {
+					break
+				}
 				if flusher != nil {
 					flusher.Flush()
 				}
@@ -283,9 +327,61 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 		}
 	})
 
+	// 查询 / 热切换单容器内的 AGY 提示词运行管线模式与预览
+	mux.HandleFunc("/v0/management/prompt-modes", func(w http.ResponseWriter, r *http.Request) {
+		curSpec := getBaseSpec()
+		if !checkAuth(r, curSpec.ManagementKey, "X-Management-Key") {
+			http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		switch r.Method {
+		case http.MethodGet:
+			qMode := strings.TrimSpace(r.URL.Query().Get("mode"))
+			if qMode == "" {
+				qMode = ResolvePromptBlendMode(curSpec)
+			}
+			ds := r.URL.Query().Get("downstream_system")
+			hasTools, _ := strconv.ParseBool(r.URL.Query().Get("has_tools"))
+			status := BuildPromptModesStatus(qMode, ds, hasTools)
+			status.ActiveMode = ResolvePromptBlendMode(curSpec)
+			_ = json.NewEncoder(w).Encode(status)
+
+		case http.MethodPut, http.MethodPost:
+			var req struct {
+				Mode             string `json:"mode"`
+				DownstreamSystem string `json:"downstream_system"`
+				HasTools         bool   `json:"has_tools"`
+			}
+			if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+				http.Error(w, `{"error":{"message":"invalid json"}}`, http.StatusBadRequest)
+				return
+			}
+			if !IsValidPromptMode(req.Mode) {
+				http.Error(w, `{"error":{"message":"invalid prompt mode"}}`, http.StatusBadRequest)
+				return
+			}
+			norm := NormalizePromptMode(req.Mode)
+			SetRuntimePromptMode(norm)
+			specMu.Lock()
+			baseSpec.PromptBlendMode = norm
+			specMu.Unlock()
+			if authDir != "" {
+				EnsureIsolatedAgyProxyRules(authDir, norm, nativePrompt)
+			}
+			status := BuildPromptModesStatus(norm, req.DownstreamSystem, req.HasTools)
+			status.ActiveMode = norm
+			_ = json.NewEncoder(w).Encode(status)
+
+		default:
+			http.Error(w, `{"error":{"message":"method not allowed"}}`, http.StatusMethodNotAllowed)
+		}
+	})
+
 	// 查询 / 重置单容器内「上游 session_id -> agy conversation_id (si)」映射与磁盘清理统计
 	mux.HandleFunc("/v0/management/sessions", func(w http.ResponseWriter, r *http.Request) {
-		if !checkAuth(r, spec.ManagementKey, "X-Management-Key") {
+		curSpec := getBaseSpec()
+		if !checkAuth(r, curSpec.ManagementKey, "X-Management-Key") {
 			http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 			return
 		}
@@ -338,7 +434,8 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 	})
 
 	mux.HandleFunc("/v0/management/auth-files", func(w http.ResponseWriter, r *http.Request) {
-		if !checkAuth(r, spec.ManagementKey, "X-Management-Key") {
+		curSpec := getBaseSpec()
+		if !checkAuth(r, curSpec.ManagementKey, "X-Management-Key") {
 			http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 			return
 		}
@@ -381,22 +478,141 @@ func NewAgyBridgeHandler(cfg BridgeConfig) http.Handler {
 	return mux
 }
 
+func isExplicitNonStreamingRequest(body []byte) bool {
+	var probe struct {
+		Stream *bool `json:"stream"`
+	}
+	if json.Unmarshal(bytes.TrimSpace(body), &probe) != nil {
+		return false
+	}
+	return probe.Stream != nil && !*probe.Stream
+}
+
+// aggregateOpenAISSEToChatCompletionJSON 将已执行出站拦截的标准 OpenAI SSE 流聚合为非流式 chat.completion JSON 对象，
+// 确保直连 agy-bridge 且显式传 stream=false 的客户端同样获得无内部标记泄漏、保留 reasoning 与 tool_calls 的标准响应。
+func aggregateOpenAISSEToChatCompletionJSON(sseReader io.Reader) ([]byte, int) {
+	scanner := bufio.NewScanner(sseReader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+
+	var (
+		id           = "chatcmpl-agy-" + randomUUIDv4()[:10]
+		model        = defaultAgyModel
+		created      = time.Now().Unix()
+		contentBuf   strings.Builder
+		reasoningBuf strings.Builder
+		toolCalls    []map[string]any
+		finishReason = "stop"
+		usage        map[string]any
+	)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var obj map[string]any
+		if json.Unmarshal([]byte(data), &obj) != nil {
+			continue
+		}
+		if errObj, hasErr := obj["error"].(map[string]any); hasErr && errObj != nil {
+			b, _ := json.Marshal(map[string]any{"error": errObj})
+			return b, http.StatusBadGateway
+		}
+		if v, ok := obj["id"].(string); ok && v != "" {
+			id = v
+		}
+		if v, ok := obj["model"].(string); ok && v != "" {
+			model = v
+		}
+		if v, ok := obj["created"].(float64); ok && v > 0 {
+			created = int64(v)
+		}
+		if u, ok := obj["usage"].(map[string]any); ok && u != nil {
+			usage = u
+		}
+		choices, _ := obj["choices"].([]any)
+		if len(choices) == 0 {
+			continue
+		}
+		ch, _ := choices[0].(map[string]any)
+		if ch == nil {
+			continue
+		}
+		if fr, ok := ch["finish_reason"].(string); ok && fr != "" {
+			finishReason = fr
+		}
+		if delta, ok := ch["delta"].(map[string]any); ok && delta != nil {
+			if c, ok := delta["content"].(string); ok {
+				contentBuf.WriteString(c)
+			}
+			if rc, ok := delta["reasoning_content"].(string); ok {
+				reasoningBuf.WriteString(rc)
+			}
+			if tcs, ok := delta["tool_calls"].([]any); ok {
+				for _, item := range tcs {
+					if tcMap, ok := item.(map[string]any); ok && tcMap != nil {
+						toolCalls = append(toolCalls, tcMap)
+					}
+				}
+			}
+		}
+	}
+
+	msg := map[string]any{
+		"role":    "assistant",
+		"content": StripOutboundBridgeMarkers(contentBuf.String()),
+	}
+	if len(toolCalls) > 0 && msg["content"] == "" {
+		msg["content"] = nil
+	}
+	if rc := StripOutboundBridgeMarkers(reasoningBuf.String()); rc != "" {
+		msg["reasoning_content"] = rc
+	}
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+		finishReason = "tool_calls"
+	}
+
+	resp := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]any{
+			{
+				"index":         0,
+				"message":       msg,
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	if usage != nil {
+		resp["usage"] = usage
+	}
+	b, _ := json.Marshal(resp)
+	return b, http.StatusOK
+}
+
 // RunAgyBridgeServer 启动单容器真实 agy CLI 桥接 HTTP 服务，支持 SIGINT / SIGTERM 优雅关闭。
 func RunAgyBridgeServer(cfg BridgeConfig) error {
 	addr := strings.TrimSpace(cfg.ListenAddr)
 	if addr == "" {
 		addr = fmt.Sprintf(":%d", DefaultContainerPort)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           NewAgyBridgeHandler(cfg),
+		Handler:           NewAgyBridgeHandlerWithContext(ctx, cfg),
 		ReadHeaderTimeout: 30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 	netx.EnableServerHTTP2(srv)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	errCh := make(chan error, 1)
 	go func() {

@@ -59,7 +59,7 @@ func ResolveSessionRetention(spec NodeSpec) string {
 }
 
 // buildIsolatedCLIEnv 为单个 agy CLI 客户端进程构造隔离环境变量：
-//   - 若指定 spec.AuthDir，则将 HOME / USERPROFILE / XDG_CONFIG_HOME 指向该单实例专属目录，实现单账号凭证隔离
+//   - 若指定 spec.AuthDir，则将 HOME / USERPROFILE / XDG_CONFIG_HOME 指向该单实例专属目录，实现单账号凭证与 GEMINI.md 规则隔离
 //   - 若指定非直连 spec.ProxyURL，则注入 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY，实现单客户端独立出口 IP
 //   - 若指定 direct，则清除宿主机残留代理变量，防止串流
 func buildIsolatedCLIEnv(spec NodeSpec) []string {
@@ -108,6 +108,12 @@ func buildIsolatedCLIEnv(spec NodeSpec) []string {
 	if fp := strings.TrimSpace(spec.Fingerprint.FingerprintID); fp != "" {
 		filtered = append(filtered, "AGY_FINGERPRINT_ID="+fp)
 	}
+	// 抑制无头反代子进程触发后台自动更新检查，防止派生孤儿更新器锁住磁盘目录
+	filtered = append(filtered,
+		"AGY_DISABLE_AUTO_UPDATE=1",
+		"DISABLE_AUTOUPDATER=1",
+		"NO_UPDATE_NOTIFIER=1",
+	)
 	// 强制 agy CLI Go 运行时始终启用 HTTP/2 客户端连接 Google（移除宿主机可能残留的 http2client=0）
 	return netx.EnsureGODEBUGHTTP2(filtered)
 }
@@ -125,6 +131,7 @@ func ListModelsViaCLI(ctx context.Context, spec NodeSpec) ([]ModelItem, error) {
 	}
 
 	cmd := exec.CommandContext(ctx, bin, "models")
+	cmd.WaitDelay = 3 * time.Second
 	cmd.Env = buildIsolatedCLIEnv(spec)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -177,21 +184,42 @@ func ParseAgyModelsOutput(raw string) []ModelItem {
 }
 
 type agyPromptBuildResult struct {
-	Model           string
-	Effort          string
-	Prompt          string
-	PromptBlendMode string
-	ToolsSpec       AdaptedToolsSpec
-	TotalNonSysMsgs int
+	Model                string
+	Effort               string
+	Prompt               string
+	PromptBlendMode      string
+	InboundInterceptHits []string
+	ToolsSpec            AdaptedToolsSpec
+	TotalNonSysMsgs      int
 }
 
-// buildAgyCLIPrompt 使用默认净化混合模式（blend_clean：净化版 AGY 原生在前 + 下游提示词紧接在后）组装 agy CLI 输入文本。
+func extractPayloadPromptModeOverride(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	for _, k := range []string{"agy_prompt_mode", "prompt_mode", "agy_mode"} {
+		if v, ok := payload[k].(string); ok && IsValidPromptMode(v) {
+			return NormalizePromptMode(v)
+		}
+	}
+	if meta, ok := payload["metadata"].(map[string]any); ok && meta != nil {
+		for _, k := range []string{"agy_prompt_mode", "prompt_mode", "agy_mode"} {
+			if v, ok := meta[k].(string); ok && IsValidPromptMode(v) {
+				return NormalizePromptMode(v)
+			}
+		}
+	}
+	return ""
+}
+
+// buildAgyCLIPrompt 使用当前生效的提示词管线模式（默认 default_intercept_continue：原生默认 -> 拦截 -> 接续）组装 agy CLI 输入文本。
 func buildAgyCLIPrompt(openaiBody []byte, resumeFromIndex int) (agyPromptBuildResult, error) {
-	return buildAgyCLIPromptWithOptions(openaiBody, resumeFromIndex, PromptBlendClean, "")
+	return buildAgyCLIPromptWithOptions(openaiBody, resumeFromIndex, ActivePromptMode(), "")
 }
 
-// buildAgyCLIPromptWithOptions 将标准 OpenAI 消息数组、AGY 净化原生核心提示词、下游原始系统提示词及自适应分级工具定义组装为清晰的无头 agy CLI 输入文本：
-//   - 默认 blend_clean：净化版 AGY 原生核心底本（剔除 artifacts / slash_commands / skills / subagents / plugins / file:/// / 宿主工作区等误导段）在前，下游系统提示词紧接在后且冲突时以下游为准
+// buildAgyCLIPromptWithOptions 将标准 OpenAI 消息数组、拦截桥、下游系统提示词及自适应分级工具定义组装为无头 agy CLI 输入文本：
+//   - 默认 default_intercept_continue：保留真实 agy CLI 内置默认提示词，经入站冲突拦截 + <agy_intercept_bridge> 隔离后，在 <downstream_continuation> 内权威接续下游提示词与 <AGY_TOOL_CALL> 外部工具
+//   - 可选支持 blend_sanitized / native_only / downstream_only（通过请求 metadata、NodeSpec、运行态配置或 AGY_PROMPT_MODE 环境变量切换）
 //   - 自动根据工具数量与 Schema 体积选择 full / compact / signature / none 自适应层级
 //   - 当 resumeFromIndex > 0（ephemeral 模式同一上游 session_id 续接已有 agy si）时，仅发送增量新增轮次
 func buildAgyCLIPromptWithOptions(openaiBody []byte, resumeFromIndex int, blendMode, nativePrompt string) (agyPromptBuildResult, error) {
@@ -200,9 +228,14 @@ func buildAgyCLIPromptWithOptions(openaiBody []byte, resumeFromIndex int, blendM
 		return agyPromptBuildResult{}, fmt.Errorf("解析请求体失败: %w", err)
 	}
 
-	normBlendMode := NormalizePromptBlendMode(blendMode)
+	normBlendMode := NormalizePromptMode(blendMode)
+	if reqMode := extractPayloadPromptModeOverride(payload); reqMode != "" {
+		normBlendMode = reqMode
+	}
+
 	res := agyPromptBuildResult{
-		PromptBlendMode: normBlendMode,
+		PromptBlendMode:      normBlendMode,
+		InboundInterceptHits: []string{},
 	}
 	res.Model, _ = payload["model"].(string)
 	res.Model = strings.TrimSpace(res.Model)
@@ -217,7 +250,7 @@ func buildAgyCLIPromptWithOptions(openaiBody []byte, resumeFromIndex int, blendM
 		}
 	}
 
-	// 1. 拆分系统提示词（严格保留原文，不做改写或剥离）与非系统消息
+	// 1. 拆分系统提示词与非系统消息
 	var sysBlocks []string
 	var nonSysMsgs []map[string]any
 	toolIDToName := make(map[string]string)
@@ -235,7 +268,6 @@ func buildAgyCLIPromptWithOptions(openaiBody []byte, resumeFromIndex int, blendM
 				}
 				continue
 			}
-			// 提前记录历史 assistant tool_calls 的 id -> name，方便后续 tool 消息展示清晰的工具名
 			if role == "assistant" {
 				if tcs, ok := m["tool_calls"].([]any); ok {
 					for _, tcItem := range tcs {
@@ -270,23 +302,29 @@ func buildAgyCLIPromptWithOptions(openaiBody []byte, resumeFromIndex int, blendM
 
 	var b strings.Builder
 
-	// 3. 混合「净化版 AGY 原生提示词（去除误导段）」+「下游用户系统提示词紧接在后」（仅首轮或无状态反代写入）
+	// 3. 按选定管线模式组装拦截桥与下游接续包络（仅首轮或无状态反代写入）
 	if !isResumeDelta {
-		blendedSys := BlendAgyNativeAndDownstreamPrompt(nativePrompt, sysBlocks, normBlendMode, true)
-		if blendedSys != "" {
-			b.WriteString(blendedSys)
+		assembledSys, inboundHits := AssembleAgyPromptEnvelope(
+			nativePrompt,
+			sysBlocks,
+			res.ToolsSpec.PromptBlock,
+			res.ToolsSpec.HasTools(),
+			normBlendMode,
+			true,
+		)
+		res.InboundInterceptHits = inboundHits
+		if assembledSys != "" {
+			b.WriteString(assembledSys)
 			b.WriteString("\n\n")
-		}
-		if !res.ToolsSpec.HasTools() {
-			b.WriteString("Answer directly in plain text/markdown without calling any tools.\n\n")
-		}
-		if res.ToolsSpec.HasTools() && res.ToolsSpec.PromptBlock != "" {
-			b.WriteString(res.ToolsSpec.PromptBlock)
-			b.WriteByte('\n')
 		}
 	}
 
-	// 4. 对话消息历史
+	// 4. 对话消息历史（历史工具调用标签与当前管线模式严格对齐）
+	histToolTag := "tool_call"
+	if normBlendMode == PromptModeDefaultInterceptContinue {
+		histToolTag = AgyToolCallTag
+	}
+
 	var convoBlocks []string
 	for _, m := range nonSysMsgs[startIdx:] {
 		role := strings.ToLower(strings.TrimSpace(fmt.Sprint(m["role"])))
@@ -310,7 +348,7 @@ func buildAgyCLIPromptWithOptions(openaiBody []byte, resumeFromIndex int, blendM
 						if sub.Len() > 0 {
 							sub.WriteString("\n")
 						}
-						sub.WriteString(fmt.Sprintf("<tool_call>{\"name\":%q,\"arguments\":%s}</tool_call>", name, normalizeJSONArgsString(args)))
+						sub.WriteString(fmt.Sprintf("<%s>{\"name\":%q,\"arguments\":%s}</%s>", histToolTag, name, normalizeJSONArgsString(args), histToolTag))
 					}
 				}
 			}
@@ -375,7 +413,6 @@ func extractUpstreamSessionFromBody(openaiBody []byte) string {
 }
 
 // buildAgyStreamInputLine 构造真实 `agy --input-format stream-json` 标准 stdin NDJSON 用户输入行。
-// 通过 stdin 管道投递提示词彻底突破 Windows 32KB / Linux ARG_MAX 命令行参数长度限制，并避免命令行泄露上下文。
 func buildAgyStreamInputLine(prompt string) ([]byte, error) {
 	payload := map[string]any{
 		"event": "user",
@@ -398,9 +435,7 @@ func ChatStreamViaCLI(ctx context.Context, spec NodeSpec, openaiBody []byte) (*h
 	return ChatStreamViaCLIWithSession(ctx, spec, openaiBody, "", defaultLocalCLISessions)
 }
 
-// ChatStreamViaCLIWithSession 驱动真实 agy CLI 完成一次反代推理，支持两种磁盘保留模式：
-//   - stateless（默认，推荐反代模式）：不保留 agy 磁盘会话，原样透传下游提示词与完整对话，请求结束后立即删除本轮 agy 产生的 .db / brain 目录，零磁盘膨胀；
-//   - ephemeral（可选短期会话复用）：跟随上游 session_id 绑定/续接 agy conversation_id (si)，当会话重置、过期、驱逐或删除时自动清理对应磁盘产物。
+// ChatStreamViaCLIWithSession 驱动真实 agy CLI 完成一次反代推理，默认采用 `default_intercept_continue`（默认提示词 -> 拦截 -> 接续）。
 func ChatStreamViaCLIWithSession(
 	ctx context.Context,
 	spec NodeSpec,
@@ -442,7 +477,6 @@ func ChatStreamViaCLIWithSession(
 		unlockSession = func() {}
 	}
 
-	// 判断是否复用已有 agy si（仅 ephemeral 模式且有上游 session_id 时启用）
 	var (
 		resumeConvID    string
 		resumeFromIndex int
@@ -457,7 +491,6 @@ func ChatStreamViaCLIWithSession(
 				resumeFromIndex = existing.LastMessageCount
 				sessionMode = "resumed"
 			} else {
-				// 下游开启了新轮次/重置了消息历史 -> 删除旧绑定（并经 onEvict 自动清理旧磁盘文件）
 				sessStore.Delete(resolvedUpstreamSID)
 			}
 		}
@@ -465,12 +498,13 @@ func ChatStreamViaCLIWithSession(
 
 	blendMode := ResolvePromptBlendMode(spec)
 	nativePrompt := ResolveNativePromptTemplate(spec)
-	EnsureIsolatedAgyProxyRules(spec.AuthDir, blendMode, nativePrompt)
 	built, err := buildAgyCLIPromptWithOptions(preparedBody, resumeFromIndex, blendMode, nativePrompt)
 	if err != nil {
 		unlockSession()
 		return nil, preparedBody, err
 	}
+	// 使用最终解析出的生效模式写入隔离目录 GEMINI.md 拦截规则
+	EnsureIsolatedAgyProxyRules(spec.AuthDir, built.PromptBlendMode, nativePrompt)
 
 	stdinPayload, err := buildAgyStreamInputLine(built.Prompt)
 	if err != nil {
@@ -500,30 +534,40 @@ func ChatStreamViaCLIWithSession(
 		_ = os.MkdirAll(wsDir, 0o755)
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	runCtx, cancelRun := context.WithCancel(ctx)
 	pr, pw := io.Pipe()
+	bodyCloser := &cancelOnCloseReadCloser{
+		ReadCloser: pr,
+		cancel:     cancelRun,
+	}
 	reqID := "chatcmpl-agy-" + randomUUIDv4()[:10]
 	created := time.Now().Unix()
 
 	const maxTransientRetries = 2
 	go func() {
+		defer cancelRun()
 		defer unlockSession()
 		defer pw.Close()
 
 		var finalConvID string
 		for attempt := 0; attempt <= maxTransientRetries; attempt++ {
-			if ctx != nil && ctx.Err() != nil {
+			if runCtx.Err() != nil {
 				return
 			}
 			if attempt > 0 {
 				backoff := time.Duration(800*attempt) * time.Millisecond
 				select {
-				case <-ctx.Done():
+				case <-runCtx.Done():
 					return
 				case <-time.After(backoff):
 				}
 			}
 
-			cmd := exec.CommandContext(ctx, bin, args...)
+			cmd := exec.CommandContext(runCtx, bin, args...)
+			cmd.WaitDelay = 3 * time.Second
 			cmd.Env = isolatedEnv
 			cmd.Stdin = bytes.NewReader(stdinPayload)
 			if wsDir != "" {
@@ -544,7 +588,7 @@ func ChatStreamViaCLIWithSession(
 
 			canRetry := attempt < maxTransientRetries
 			capturedConvID, emittedAny, deferredErr := streamAgyNDJSONToOpenAISSEAttempt(
-				ctx, stdoutPipe, pw, built.Model, reqID, created, built.ToolsSpec, canRetry,
+				runCtx, stdoutPipe, pw, built.Model, reqID, created, built.ToolsSpec, canRetry,
 			)
 			waitErr := cmd.Wait()
 
@@ -573,9 +617,6 @@ func ChatStreamViaCLIWithSession(
 			break
 		}
 
-		// 根据磁盘保留策略处理本轮 agy 会话持久化产物：
-		//   - stateless（默认）或无上游 session_id：请求一结束立即彻底清理本轮 .db / brain 目录，零磁盘占用
-		//   - ephemeral（显式启用会话复用）：登记映射到 sessStore，留待驱逐/过期/删除时由 onEvict 自动清理
 		if retentionMode == SessionRetentionStateless || isEphemeralCaller {
 			if finalConvID != "" {
 				CleanupConversationDiskArtifacts(homeDir, finalConvID)
@@ -600,8 +641,9 @@ func ChatStreamViaCLIWithSession(
 			"X-Agy-Tool-Count":         []string{strconv.Itoa(len(built.ToolsSpec.Tools))},
 			"X-Agy-Prompt-Passthrough": []string{"verbatim"},
 			"X-Agy-Prompt-Mode":        []string{built.PromptBlendMode},
+			"X-Agy-Inbound-Intercepts": []string{strconv.Itoa(len(built.InboundInterceptHits))},
 		},
-		Body: pr,
+		Body: bodyCloser,
 	}
 	if resumeConvID != "" {
 		resp.Header.Set("X-Agy-Conversation-Id", resumeConvID)
@@ -650,7 +692,7 @@ func writeAgySSEErrorAndDone(dst io.Writer, msg string) {
 }
 
 // streamAgyNDJSONToOpenAISSE 解析真实 `agy --output-format stream-json` 的每一行 NDJSON，
-// 输出标准 OpenAI `chat.completion.chunk` SSE 事件流，并返回 agy 分配的 conversation_id (si)。
+// 经出站拦截器剥离任何意外泄漏的内部桥接标记后，输出标准 OpenAI `chat.completion.chunk` SSE 事件流。
 func streamAgyNDJSONToOpenAISSE(
 	ctx context.Context,
 	src io.Reader,
@@ -676,7 +718,7 @@ func streamAgyNDJSONToOpenAISSEAttempt(
 ) (capturedConvID string, emittedAny bool, deferredErr string) {
 	hasTools := toolsSpec.HasTools()
 	scanner := bufio.NewScanner(src)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
 
 	sentRole := false
 	writeChunk := func(delta map[string]any, finishReason any, usage map[string]any) bool {
@@ -709,9 +751,10 @@ func streamAgyNDJSONToOpenAISSEAttempt(
 	}
 
 	var (
-		fullText    strings.Builder
-		lastUsage   map[string]any
-		hadToolCall bool
+		fullText       strings.Builder
+		outInterceptor OutboundStreamInterceptor
+		lastUsage      map[string]any
+		hadToolCall    bool
 	)
 
 	toOpenAIUsage := func(u *agyUsage) map[string]any {
@@ -761,17 +804,22 @@ func streamAgyNDJSONToOpenAISSEAttempt(
 				lastUsage = toOpenAIUsage(ev.StepUpdate.Usage)
 			}
 			if ev.StepUpdate.ThinkingDelta != "" {
-				emittedAny = true
-				if !writeChunk(map[string]any{"reasoning_content": ev.StepUpdate.ThinkingDelta}, nil, nil) {
-					return capturedConvID, emittedAny, ""
+				cleanThinking := StripOutboundBridgeMarkers(ev.StepUpdate.ThinkingDelta)
+				if cleanThinking != "" {
+					emittedAny = true
+					if !writeChunk(map[string]any{"reasoning_content": cleanThinking}, nil, nil) {
+						return capturedConvID, emittedAny, ""
+					}
 				}
 			}
 			if ev.StepUpdate.TextDelta != "" {
 				fullText.WriteString(ev.StepUpdate.TextDelta)
 				if !hasTools {
-					emittedAny = true
-					if !writeChunk(map[string]any{"content": ev.StepUpdate.TextDelta}, nil, nil) {
-						return capturedConvID, emittedAny, ""
+					if cleanDelta := outInterceptor.Push(ev.StepUpdate.TextDelta); cleanDelta != "" {
+						emittedAny = true
+						if !writeChunk(map[string]any{"content": cleanDelta}, nil, nil) {
+							return capturedConvID, emittedAny, ""
+						}
 					}
 				}
 			}
@@ -796,17 +844,39 @@ func streamAgyNDJSONToOpenAISSEAttempt(
 			if fullText.Len() == 0 && ev.Result.Response != "" {
 				fullText.WriteString(ev.Result.Response)
 				if !hasTools {
-					emittedAny = true
-					_ = writeChunk(map[string]any{"content": ev.Result.Response}, nil, nil)
+					if cleanResp := StripOutboundBridgeMarkers(ev.Result.Response); cleanResp != "" {
+						emittedAny = true
+						_ = writeChunk(map[string]any{"content": cleanResp}, nil, nil)
+					}
 				}
 			}
 		}
 	}
 
-	// 若带有外部工具声明：支持混合正文 + 并行多工具调用，并按 DeclaredTools 校验防止漏发 agy 内置工具幻觉。
+	if scanErr := scanner.Err(); scanErr != nil {
+		if ctx != nil && ctx.Err() != nil {
+			return capturedConvID, emittedAny, ""
+		}
+		errMsg := fmt.Sprintf("读取 agy CLI 流式输出失败: %v", scanErr)
+		if deferTransientError && !emittedAny && netx.IsTransientNetworkErrorMessage(errMsg) {
+			return capturedConvID, false, errMsg
+		}
+		writeAgySSEErrorAndDone(dst, errMsg)
+		return capturedConvID, true, ""
+	}
+
+	if !hasTools {
+		if tail := outInterceptor.Flush(); tail != "" {
+			emittedAny = true
+			_ = writeChunk(map[string]any{"content": tail}, nil, nil)
+		}
+	}
+
+	// 若带有外部工具声明：支持 <AGY_TOOL_CALL> 与 <tool_call> 双格式混合正文 + 并行多工具提取，
+	// 同步剥离内部桥接标记，并按 DeclaredTools 白名单拦截未声明的宿主内置工具幻觉。
 	if hasTools {
 		rawText := fullText.String()
-		prose, calls := ExtractToolCallsFromModelText(rawText, toolsSpec)
+		prose, calls := ExtractInterceptionAwareToolCalls(rawText, toolsSpec)
 		if prose != "" {
 			emittedAny = true
 			_ = writeChunk(map[string]any{"content": prose}, nil, nil)
@@ -854,6 +924,20 @@ func firstNonEmptyStr(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// cancelOnCloseReadCloser 在调用方关闭 HTTP 响应 Body 时立即取消底层子进程 Context，
+// 防止客户端断连或空闲超时关闭流后 agy 子进程继续在后台缓冲或持有会话锁。
+type cancelOnCloseReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnCloseReadCloser) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	return c.ReadCloser.Close()
 }
 
 // limitedBuffer 将子进程 stderr 捕获上限限制在固定字节数内，防止异常刷屏导致内存膨胀。
