@@ -77,6 +77,7 @@ type StreamDeltaNormalizer struct {
 
 type pendingObfTool struct {
 	name string
+	args string
 	id   string
 	typ  string
 }
@@ -604,32 +605,20 @@ func (n *StreamDeltaNormalizer) restoreToolCallsInDelta(delta map[string]any) {
 
 		prev := n.pendingTools[idx]
 		combined := rawName
+		combinedArgs := rawArgs
 		if prev != nil {
 			combined = prev.name + rawName
+			combinedArgs = prev.args + rawArgs
 		}
 
 		if combined != "" {
+			isProperPrefix := n.toolSession.IsObfuscatedPrefix(combined)
 			restored := n.toolSession.Restore(combined)
-			if restored != combined {
-				if prev != nil {
-					if id == "" && prev.id != "" {
-						mCopy["id"] = prev.id
-					}
-					if typ == "" && prev.typ != "" {
-						mCopy["type"] = prev.typ
-					}
-					delete(n.pendingTools, idx)
-				}
-				if fnCopy == nil {
-					fnCopy = map[string]any{}
-				}
-				fnCopy["name"] = restored
-				mCopy["function"] = fnCopy
-				kept = append(kept, mCopy)
-				continue
-			}
 
-			if n.toolSession.IsObfuscatedPrefix(combined) && rawArgs == "" {
+			// 1) 若 combined 仍是某个更长混淆名的严格真前缀：
+			//    - 当尚无参数到达（combinedArgs == ""）时，即使 combined 本身也是短混淆名（如 exec_task vs exec_task_2），也必须暂存以等待下一片消歧；
+			//    - 当 combined 尚未命中完整混淆名（restored == combined）时，即便同片已携带部分参数也继续暂存，防止半截混淆名泄漏。
+			if isProperPrefix && (combinedArgs == "" || restored == combined) {
 				if n.pendingTools == nil {
 					n.pendingTools = make(map[int]*pendingObfTool)
 				}
@@ -645,6 +634,7 @@ func (n *StreamDeltaNormalizer) restoreToolCallsInDelta(delta map[string]any) {
 				}
 				n.pendingTools[idx] = &pendingObfTool{
 					name: combined,
+					args: combinedArgs,
 					id:   heldID,
 					typ:  heldTyp,
 				}
@@ -664,6 +654,9 @@ func (n *StreamDeltaNormalizer) restoreToolCallsInDelta(delta map[string]any) {
 				fnCopy = map[string]any{}
 			}
 			fnCopy["name"] = restored
+			if prev != nil && prev.args != "" {
+				fnCopy["arguments"] = combinedArgs
+			}
 			mCopy["function"] = fnCopy
 			kept = append(kept, mCopy)
 			continue
@@ -680,6 +673,7 @@ func (n *StreamDeltaNormalizer) restoreToolCallsInDelta(delta map[string]any) {
 				fnCopy = map[string]any{}
 			}
 			fnCopy["name"] = n.toolSession.Restore(prev.name)
+			fnCopy["arguments"] = combinedArgs
 			mCopy["function"] = fnCopy
 			delete(n.pendingTools, idx)
 		}
@@ -713,11 +707,15 @@ func (n *StreamDeltaNormalizer) flushPendingToolsIntoDelta(delta map[string]any)
 		if p == nil || p.name == "" {
 			continue
 		}
+		fnMap := map[string]any{
+			"name": n.toolSession.Restore(p.name),
+		}
+		if p.args != "" {
+			fnMap["arguments"] = p.args
+		}
 		entry := map[string]any{
-			"index": idx,
-			"function": map[string]any{
-				"name": n.toolSession.Restore(p.name),
-			},
+			"index":    idx,
+			"function": fnMap,
 		}
 		if p.id != "" {
 			entry["id"] = p.id

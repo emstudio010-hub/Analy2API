@@ -392,8 +392,34 @@ func (h *Handler) DeleteGroup(c *gin.Context) {
 		return
 	}
 
+	now := time.Now()
+	current, err := h.client.Group.Query().
+		Where(group.IDEQ(id), group.DeletedAtIsNil()).
+		Only(ctx)
+	if err != nil {
+		if isNotFound(err) {
+			fail(c, http.StatusNotFound, "分组不存在")
+			return
+		}
+		h.failInternal(c, "查询分组失败", err)
+		return
+	}
+
+	// groups.name 有全局唯一约束，软删除时追加删除后缀释放原名称，避免同名重建或远程补号撞唯一索引。
+	suffix := "__deleted_" + time.Now().UTC().Format("20060102150405.000000000")
+	baseName := current.Name
+	if len(baseName)+len(suffix) > 100 {
+		keep := 100 - len(suffix)
+		if keep < 1 {
+			keep = 1
+		}
+		baseName = baseName[:keep]
+	}
+	archivedName := baseName + suffix
+
 	if err := h.client.Group.UpdateOneID(id).
-		SetDeletedAt(time.Now()).
+		SetName(archivedName).
+		SetDeletedAt(now).
 		Exec(ctx); err != nil {
 		if isNotFound(err) {
 			fail(c, http.StatusNotFound, "分组不存在")

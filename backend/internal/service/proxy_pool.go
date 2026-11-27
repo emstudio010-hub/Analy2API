@@ -375,9 +375,45 @@ func (s *ProxyPoolService) UpdateConfig(ctx context.Context, next ProxyPoolConfi
 		s.mu.Unlock()
 		return nil, err
 	}
-	// 保留已有的 KeyPolicies（除非调用方显式传入）
-	if next.KeyPolicies == nil && len(s.cfg.KeyPolicies) > 0 {
+	// 保留已有的 KeyPolicies（前端保存全局 IP 池时 key_policies 为空 map 或 nil，不应清空已绑定的 Key 策略）；
+	// 若显式传入条目且带 *** 脱敏密码，自动合并并还原原密码。
+	if len(next.KeyPolicies) == 0 && len(s.cfg.KeyPolicies) > 0 {
 		next.KeyPolicies = cloneKeyPolicies(s.cfg.KeyPolicies)
+	} else if len(next.KeyPolicies) > 0 && len(s.cfg.KeyPolicies) > 0 {
+		mergedKP := cloneKeyPolicies(s.cfg.KeyPolicies)
+		for id, kp := range next.KeyPolicies {
+			if oldKP, ok := s.cfg.KeyPolicies[id]; ok && (strings.Contains(kp.FixedProxyURL, "***") || strings.Contains(strings.ToUpper(kp.FixedProxyURL), "%2A%2A%2A")) {
+				kp.FixedProxyURL = workbuddy.PreserveRedactedProxyPassword(kp.FixedProxyURL, oldKP.FixedProxyURL)
+			}
+			mergedKP[id] = kp
+		}
+		next.KeyPolicies = mergedKP
+	}
+	// 若前端回传了脱敏后的远程拉取默认密码 "***"，保留原密码
+	if next.Fetch.Password == "***" && s.cfg.Fetch.Password != "" {
+		next.Fetch.Password = s.cfg.Fetch.Password
+	}
+	// 若前端回传了脱敏后的池条目 URL（如 http://user:***@ip:port），按 ID 或脱敏值匹配保留真实密码
+	if len(next.Entries) > 0 && len(s.cfg.Entries) > 0 {
+		oldByID := make(map[string]string, len(s.cfg.Entries))
+		oldByMasked := make(map[string]string, len(s.cfg.Entries))
+		for _, oldEntry := range s.cfg.Entries {
+			if oldEntry.ID != "" {
+				oldByID[oldEntry.ID] = oldEntry.URL
+			}
+			oldByMasked[MaskProxyURL(oldEntry.URL)] = oldEntry.URL
+		}
+		for i := range next.Entries {
+			u := strings.TrimSpace(next.Entries[i].URL)
+			if !strings.Contains(u, "***") {
+				continue
+			}
+			if oldURL, ok := oldByID[next.Entries[i].ID]; ok {
+				next.Entries[i].URL = workbuddy.PreserveRedactedProxyPassword(u, oldURL)
+			} else if oldURL, ok := oldByMasked[u]; ok {
+				next.Entries[i].URL = workbuddy.PreserveRedactedProxyPassword(u, oldURL)
+			}
+		}
 	}
 	// 保留最近一次拉取状态统计
 	if next.Fetch.LastFetchedAt == "" {
@@ -501,6 +537,7 @@ func (s *ProxyPoolService) GetKeyPolicy(ctx context.Context, adminKeyID int64) A
 	kp = normalizeAdminKeyProxyPolicy(kp)
 	if kp.FixedProxyURL != "" {
 		kp.FixedProxyMasked = MaskProxyURL(kp.FixedProxyURL)
+		kp.FixedProxyURL = kp.FixedProxyMasked
 	}
 	return kp
 }
@@ -517,6 +554,7 @@ func (s *ProxyPoolService) GetAllKeyPolicies(ctx context.Context) map[int64]Admi
 		norm := normalizeAdminKeyProxyPolicy(kp)
 		if norm.FixedProxyURL != "" {
 			norm.FixedProxyMasked = MaskProxyURL(norm.FixedProxyURL)
+			norm.FixedProxyURL = norm.FixedProxyMasked
 		}
 		out[id] = norm
 	}
@@ -532,23 +570,28 @@ func (s *ProxyPoolService) SetKeyPolicy(ctx context.Context, adminKeyID int64, p
 	if adminKeyID <= 0 {
 		return defaultAdminKeyProxyPolicy(), errors.New("无效的管理密钥 ID")
 	}
+
+	s.mu.Lock()
+	if err := s.ensureLoadedLocked(ctx); err != nil {
+		s.mu.Unlock()
+		return defaultAdminKeyProxyPolicy(), err
+	}
 	norm := normalizeAdminKeyProxyPolicy(policy)
+	if existing, ok := s.cfg.KeyPolicies[adminKeyID]; ok && (strings.Contains(norm.FixedProxyURL, "***") || strings.Contains(strings.ToUpper(norm.FixedProxyURL), "%2A%2A%2A")) {
+		norm.FixedProxyURL = workbuddy.PreserveRedactedProxyPassword(norm.FixedProxyURL, existing.FixedProxyURL)
+	}
 	if norm.FixedProxyURL != "" {
 		normalized, err := NormalizeProxyAddress(norm.FixedProxyURL, "http", "", "")
 		if err != nil {
+			s.mu.Unlock()
 			return norm, fmt.Errorf("固定代理地址格式不合法: %w", err)
 		}
 		norm.FixedProxyURL = normalized
 		norm.FixedProxyMasked = MaskProxyURL(normalized)
 	}
 	if norm.Mode == KeyProxyModeFixed && norm.FixedProxyURL == "" {
-		return norm, errors.New("选择固定代理模式 (fixed) 时必须填写 fixed_proxy_url")
-	}
-
-	s.mu.Lock()
-	if err := s.ensureLoadedLocked(ctx); err != nil {
 		s.mu.Unlock()
-		return norm, err
+		return norm, errors.New("选择固定代理模式 (fixed) 时必须填写 fixed_proxy_url")
 	}
 	if s.cfg.KeyPolicies == nil {
 		s.cfg.KeyPolicies = make(map[int64]AdminKeyProxyPolicy)
@@ -559,7 +602,12 @@ func (s *ProxyPoolService) SetKeyPolicy(ctx context.Context, adminKeyID int64, p
 		return norm, fmt.Errorf("保存管理密钥代理策略失败: %w", err)
 	}
 	s.mu.Unlock()
-	return norm, nil
+
+	ret := norm
+	if ret.FixedProxyMasked != "" {
+		ret.FixedProxyURL = ret.FixedProxyMasked
+	}
+	return ret, nil
 }
 
 // DeleteKeyPolicy 清理已吊销管理密钥对应的策略记录。
@@ -899,9 +947,11 @@ func (s *ProxyPoolService) pickFromPool(
 	maxPerIP := s.cfg.MaxAccountsPerIP
 	autoFetchEnabled := allowAutoFetch && s.cfg.Fetch.AutoFetchOnEmpty && (s.cfg.Fetch.Enabled || strings.TrimSpace(fetchURLOverride) != "") && (strings.TrimSpace(fetchURLOverride) != "" || strings.TrimSpace(s.cfg.Fetch.URL) != "")
 
+	prevCursor := s.cfg.Cursor
 	chosenIdx, needFetch := selectEntryIndexLocked(s.cfg.Entries, &s.cfg.Cursor, tag, strategy, maxPerIP, boundCounts)
 	if chosenIdx < 0 || (needFetch && autoFetchEnabled) {
 		if autoFetchEnabled {
+			s.cfg.Cursor = prevCursor
 			s.mu.Unlock()
 			if _, fErr := s.FetchFromRemote(ctx, fetchURLOverride, false); fErr == nil {
 				// 拉取完成后重新选池（不再二次递归拉取）
@@ -1156,6 +1206,7 @@ func (s *ProxyPoolService) decorateView(ctx context.Context, snap ProxyPoolConfi
 	for i := range snap.Entries {
 		snap.Entries[i].MaskedURL = MaskProxyURL(snap.Entries[i].URL)
 		c := bound[snap.Entries[i].URL]
+		snap.Entries[i].URL = snap.Entries[i].MaskedURL
 		snap.Entries[i].BoundAccounts = c
 		stats.BoundTotal += c
 		if snap.Entries[i].Enabled {
@@ -1170,9 +1221,13 @@ func (s *ProxyPoolService) decorateView(ctx context.Context, snap ProxyPoolConfi
 			tagSet[t] = struct{}{}
 		}
 	}
+	if snap.Fetch.Password != "" {
+		snap.Fetch.Password = "***"
+	}
 	for k, kp := range snap.KeyPolicies {
 		if kp.FixedProxyURL != "" {
 			kp.FixedProxyMasked = MaskProxyURL(kp.FixedProxyURL)
+			kp.FixedProxyURL = kp.FixedProxyMasked
 			snap.KeyPolicies[k] = kp
 		}
 	}

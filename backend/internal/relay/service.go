@@ -184,6 +184,8 @@ type Service struct {
 	wbClient       *workbuddy.Client
 	agClient       *antigravity.Client
 	tokenUpdater   TokenUpdater
+	wbRefreshLocks sync.Map // map[int64]*sync.Mutex
+	wbRefreshCache sync.Map // map[int64]wbCachedRefresh
 
 	firstTokenOverride    time.Duration
 	streamIdleOverride    time.Duration
@@ -1232,6 +1234,9 @@ func (s *Service) readNDJSONWithTimeouts(
 
 	sawVisible := false
 	for scanner.Scan() {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if sawVisible {
 			watchdog.Reset(idleTimeout)
 		} else {

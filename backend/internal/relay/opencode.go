@@ -106,7 +106,7 @@ func (c *Client) openCodeProbeWithProxy(ctx context.Context, baseURL, apiKey, ac
 	}
 	defer resp.Body.Close()
 
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 	if resp.StatusCode != http.StatusOK {
 		mapped := mapOpenCodeError(resp.StatusCode, raw)
 		mapped.Message = fmt.Sprintf("%s（探活模型：%s）", mapped.Message, model)
@@ -244,6 +244,9 @@ func (c *Client) readOpenAISSEWithTimeouts(
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 
 	for scanner.Scan() {
+		if ctx != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if hasVisible != nil && hasVisible() {
 			watchdog.Reset(idleTimeout)
 		} else {
