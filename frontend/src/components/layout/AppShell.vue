@@ -36,10 +36,17 @@ function logout(): void {
 
 <template>
   <div class="min-h-screen bg-canvas">
+    <a
+      href="#main-workspace"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[90] focus:rounded-md focus:bg-accent focus:px-3 focus:py-1.5 focus:text-xs focus:font-medium focus:text-accent-fg focus:shadow-pop"
+    >
+      跳转到主工作区
+    </a>
+
     <AppSidebar v-model:open="sidebarOpen" />
 
     <div
-      class="flex min-h-screen flex-col transition-[padding-left] duration-150"
+      class="flex min-h-screen min-w-0 flex-col transition-[padding-left] duration-150"
       :class="theme.sidebarCollapsed ? 'nav:pl-16' : 'nav:pl-60'"
     >
       <TopBar
@@ -49,8 +56,8 @@ function logout(): void {
         @logout="logout"
       />
 
-      <main class="flex-1 px-3 py-4 sm:px-5 sm:py-4">
-        <div class="mx-auto w-full max-w-[1600px]">
+      <main id="main-workspace" class="flex-1 min-w-0 px-3 py-4 sm:px-5 sm:py-5">
+        <div class="mx-auto w-full max-w-[1640px]">
           <RouterView v-slot="{ Component }">
             <Transition name="fade" mode="out-in">
               <component :is="Component" />

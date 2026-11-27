@@ -18,7 +18,15 @@ const props = withDefaults(
     icon?: boolean
     title?: string
   }>(),
-  { variant: 'secondary', size: 'sm', type: 'button', loading: false, disabled: false, block: false, icon: false },
+  {
+    variant: 'secondary',
+    size: 'sm',
+    type: 'button',
+    loading: false,
+    disabled: false,
+    block: false,
+    icon: false,
+  },
 )
 
 const variants: Record<Variant, string> = {
@@ -27,7 +35,7 @@ const variants: Record<Variant, string> = {
   secondary:
     'bg-raised text-fg border border-line hover:border-line-strong hover:bg-overlay active:bg-raised',
   ghost: 'bg-transparent text-muted border border-transparent hover:bg-raised hover:text-fg',
-  subtle: 'bg-accent/10 text-accent border border-transparent hover:bg-accent/15',
+  subtle: 'bg-accent/10 text-accent border border-accent/20 hover:bg-accent/15 hover:border-accent/30',
   danger:
     'bg-danger/10 text-danger border border-danger/30 hover:bg-danger/20 hover:border-danger/50 active:bg-danger/25',
 }
@@ -45,7 +53,7 @@ const iconSizes: Record<Size, string> = {
 }
 
 const classes = computed(() => [
-  'inline-flex items-center justify-center font-medium transition select-none',
+  'inline-flex shrink-0 items-center justify-center whitespace-nowrap font-medium transition select-none',
   'disabled:cursor-not-allowed disabled:opacity-45',
   props.icon ? iconSizes[props.size] : sizes[props.size],
   variants[props.variant],
@@ -61,7 +69,11 @@ const classes = computed(() => [
     :title="title"
     :aria-busy="loading || undefined"
   >
-    <Spinner v-if="loading" :size="size === 'md' ? 14 : 12" />
+    <Spinner
+      v-if="loading"
+      :size="size === 'md' ? 14 : 12"
+      :invert="variant === 'primary'"
+    />
     <slot v-else name="leading" />
     <slot />
     <slot name="trailing" />

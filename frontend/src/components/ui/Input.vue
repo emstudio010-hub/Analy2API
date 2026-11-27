@@ -33,9 +33,6 @@ const props = withDefaults(
   },
 )
 
-// 双向绑定的值一律是字符串——这就是 DOM 里真实存的东西。
-// type="number" 只影响浏览器的输入体验，数字转换交给提交时的
-// Number()，省掉「空输入到底是 '' 还是 NaN」这类边界判断。
 const model = defineModel<string>({ default: '' })
 
 const attrs = useAttrs()
@@ -43,7 +40,8 @@ const attrs = useAttrs()
 const classes = computed(() => [
   props.size === 'sm' ? 'field field-sm' : 'field',
   props.mono ? 'font-mono' : '',
-  props.invalid ? 'border-danger focus:border-danger focus:ring-danger' : '',
+  props.readonly ? 'bg-raised/45 text-muted' : '',
+  props.invalid ? 'border-danger focus:border-danger focus:ring-danger/25' : '',
   attrs.class,
 ])
 </script>
@@ -61,6 +59,7 @@ const classes = computed(() => [
     :step="step"
     :autocomplete="autocomplete"
     :spellcheck="spellcheck"
+    :aria-invalid="invalid || undefined"
     :class="classes"
     v-bind="{ ...attrs, class: undefined }"
     @input="model = ($event.target as HTMLInputElement).value"

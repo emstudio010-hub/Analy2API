@@ -287,16 +287,17 @@ onMounted(() => {
             >
               <Input v-model="runtimeForm.firstTokenSeconds" type="number" min="5" step="10" mono />
             </Field>
-            <div class="flex gap-1">
+            <div class="flex gap-1.5">
               <button
                 v-for="preset in ['120', '300', '600']"
                 :key="preset"
                 type="button"
-                class="rounded border px-2 py-0.5 font-mono text-2xs transition"
+                :aria-pressed="runtimeForm.firstTokenSeconds === preset"
+                class="rounded border px-2 py-0.5 font-mono text-2xs font-medium transition"
                 :class="
                   runtimeForm.firstTokenSeconds === preset
-                    ? 'border-accent bg-accent/10 text-accent'
-                    : 'border-line bg-surface text-subtle hover:text-fg'
+                    ? 'border-accent bg-accent/12 text-accent'
+                    : 'border-line bg-surface text-subtle hover:border-line-strong hover:text-fg'
                 "
                 @click="runtimeForm.firstTokenSeconds = preset"
               >
@@ -312,16 +313,17 @@ onMounted(() => {
             >
               <Input v-model="runtimeForm.streamIdleSeconds" type="number" min="5" step="10" mono />
             </Field>
-            <div class="flex gap-1">
+            <div class="flex gap-1.5">
               <button
                 v-for="preset in ['60', '180', '300']"
                 :key="preset"
                 type="button"
-                class="rounded border px-2 py-0.5 font-mono text-2xs transition"
+                :aria-pressed="runtimeForm.streamIdleSeconds === preset"
+                class="rounded border px-2 py-0.5 font-mono text-2xs font-medium transition"
                 :class="
                   runtimeForm.streamIdleSeconds === preset
-                    ? 'border-accent bg-accent/10 text-accent'
-                    : 'border-line bg-surface text-subtle hover:text-fg'
+                    ? 'border-accent bg-accent/12 text-accent'
+                    : 'border-line bg-surface text-subtle hover:border-line-strong hover:text-fg'
                 "
                 @click="runtimeForm.streamIdleSeconds = preset"
               >
@@ -343,16 +345,17 @@ onMounted(() => {
                 mono
               />
             </Field>
-            <div class="flex gap-1">
+            <div class="flex gap-1.5">
               <button
                 v-for="preset in ['180', '600', '900']"
                 :key="preset"
                 type="button"
-                class="rounded border px-2 py-0.5 font-mono text-2xs transition"
+                :aria-pressed="runtimeForm.nonstreamIdleSeconds === preset"
+                class="rounded border px-2 py-0.5 font-mono text-2xs font-medium transition"
                 :class="
                   runtimeForm.nonstreamIdleSeconds === preset
-                    ? 'border-accent bg-accent/10 text-accent'
-                    : 'border-line bg-surface text-subtle hover:text-fg'
+                    ? 'border-accent bg-accent/12 text-accent'
+                    : 'border-line bg-surface text-subtle hover:border-line-strong hover:text-fg'
                 "
                 @click="runtimeForm.nonstreamIdleSeconds = preset"
               >

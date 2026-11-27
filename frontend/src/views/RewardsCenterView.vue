@@ -22,6 +22,7 @@ import Icon from '@/components/ui/Icon.vue'
 import MetricTile from '@/components/ui/MetricTile.vue'
 import PlatformBadge from '@/components/ui/PlatformBadge.vue'
 import SegmentedTabs from '@/components/ui/SegmentedTabs.vue'
+import Skeleton from '@/components/ui/Skeleton.vue'
 import StatusPill from '@/components/ui/StatusPill.vue'
 import { useToastStore } from '@/stores/toast'
 import {
@@ -243,6 +244,7 @@ onMounted(() => {
         :hint="`今日已签 ${wbStats.checkedToday} · 未签 ${wbStats.uncheckedToday} · 最高连签 ${wbStats.maxStreak} 天`"
         icon="gift"
         tone="accent"
+        :loading="loading && allAccounts.length === 0"
       />
       <MetricTile
         label="Command Code · 额度与会话窗口"
@@ -250,6 +252,7 @@ onMounted(() => {
         :hint="`启用 ${ccStats.active}/${ccStats.total} · 窗口超限 ${ccStats.windowExceeded} 个`"
         icon="terminal"
         :tone="ccStats.windowExceeded > 0 ? 'warning' : 'info'"
+        :loading="loading && allAccounts.length === 0"
       />
       <MetricTile
         label="AntiGravity · 容器 OAuth 凭证"
@@ -257,6 +260,7 @@ onMounted(() => {
         :hint="agyStats.errored > 0 ? `${agyStats.errored} 个凭证异常待刷新` : '支持容器与本地 JSON OAuth 巡检'"
         icon="server"
         :tone="agyStats.errored > 0 ? 'danger' : 'success'"
+        :loading="loading && allAccounts.length === 0"
       />
       <MetricTile
         label="OpenCode · Zen / Go 保活池"
@@ -264,6 +268,7 @@ onMounted(() => {
         :hint="`Zen 按量 ${ocStats.zenCount} · Go 订阅 ${ocStats.goCount}`"
         icon="code"
         tone="warning"
+        :loading="loading && allAccounts.length === 0"
       />
     </div>
 
@@ -771,7 +776,11 @@ onMounted(() => {
           </div>
         </template>
 
-        <div v-if="agyAccounts.length === 0" class="rounded-md border border-dashed border-line bg-raised/30 p-4 text-center text-2xs text-subtle">
+        <div v-if="loading && allAccounts.length === 0" class="space-y-2 rounded-md border border-line bg-raised/30 p-3">
+          <Skeleton v-for="i in 3" :key="i" class="h-8 w-full" />
+        </div>
+
+        <div v-else-if="agyAccounts.length === 0" class="rounded-md border border-dashed border-line bg-raised/30 p-4 text-center text-2xs text-subtle">
           当前账号池暂无已同步的 AntiGravity 账号，可前往「AntiGravity 容器池」上传 OAuth JSON 并同步至调度池，或直接点击上方按钮触发节点巡检。
         </div>
 
@@ -831,7 +840,11 @@ onMounted(() => {
           </div>
         </template>
 
-        <div v-if="ocAccounts.length === 0" class="rounded-md border border-dashed border-line bg-raised/30 p-4 text-center text-2xs text-subtle">
+        <div v-if="loading && allAccounts.length === 0" class="space-y-2 rounded-md border border-line bg-raised/30 p-3">
+          <Skeleton v-for="i in 3" :key="i" class="h-8 w-full" />
+        </div>
+
+        <div v-else-if="ocAccounts.length === 0" class="rounded-md border border-dashed border-line bg-raised/30 p-4 text-center text-2xs text-subtle">
           当前暂无 OpenCode 账号。可在「OpenCode 池」导入 Zen / Go 密钥，并通过 Cron 定时任务设置无人值守探活。
         </div>
 

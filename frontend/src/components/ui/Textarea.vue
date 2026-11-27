@@ -26,10 +26,11 @@ const attrs = useAttrs()
     :rows="rows"
     :placeholder="placeholder"
     :disabled="disabled"
+    :aria-invalid="invalid || undefined"
     :class="[
       'field resize-y leading-relaxed',
       mono ? 'font-mono' : '',
-      invalid ? 'border-danger' : '',
+      invalid ? 'border-danger focus:border-danger focus:ring-danger/25' : '',
       attrs.class,
     ]"
     v-bind="{ ...attrs, class: undefined }"
