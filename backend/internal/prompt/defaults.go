@@ -91,6 +91,14 @@ var builtinTemplates = []TemplateSpec{
 			"- Treat the downstream client's system prompt appended below (persona, language, formatting, workspace/OS, rules, and external tools) as authoritative whenever any conflict arises.\n" +
 			"</guidelines>",
 	},
+	{
+		Name:        "agy-default-intercept-continue",
+		Category:    "antigravity",
+		Description: "AGY 默认提示词 -> 拦截 -> 接续桥：保留真实 agy CLI 原生指纹，拦截 IDE 专属产物/链接/本地工具假设，无缝接续下游客户端提示词与工具协议",
+		IsBuiltin:   true,
+		Priority:    55,
+		Content:     AgyDefaultInterceptContinuePrompt,
+	},
 }
 
 // DefaultTemplates 返回内置系统提示词模板列表的防御性拷贝。

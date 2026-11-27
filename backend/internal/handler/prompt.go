@@ -3,12 +3,16 @@ package handler
 import (
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"cmd2api/ent"
 	"cmd2api/ent/account"
 	"cmd2api/ent/apikey"
 	"cmd2api/ent/group"
+	"cmd2api/ent/prompttemplate"
+	"cmd2api/internal/domain"
+	"cmd2api/internal/prompt"
 	"cmd2api/internal/service"
 
 	"github.com/gin-gonic/gin"
@@ -392,4 +396,244 @@ func (h *Handler) PreviewPromptInjection(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, res)
+}
+
+// GetPromptCatalog 返回主流编程平台系统提示词图鉴库（GET /api/prompts/catalog）。
+func (h *Handler) GetPromptCatalog(c *gin.Context) {
+	platform := strings.TrimSpace(c.Query("platform"))
+	category := strings.TrimSpace(c.Query("category"))
+	keyword := strings.TrimSpace(c.Query("keyword"))
+	if keyword == "" {
+		keyword = strings.TrimSpace(c.Query("q"))
+	}
+	if keyword == "" {
+		keyword = strings.TrimSpace(c.Query("search"))
+	}
+
+	items, platforms := prompt.FilterCatalog(prompt.CatalogFilter{
+		Platform: platform,
+		Category: category,
+		Keyword:  keyword,
+	})
+	c.JSON(http.StatusOK, gin.H{
+		"items":     items,
+		"total":     len(items),
+		"platforms": platforms,
+	})
+}
+
+type applyPromptCatalogRequest struct {
+	CatalogID  string `json:"catalog_id"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Category   string `json:"category"`
+	GroupID    *int64 `json:"group_id"`
+	Platform   string `json:"platform"`
+	InjectMode string `json:"inject_mode"`
+	Enabled    *bool  `json:"enabled"`
+	Priority   *int   `json:"priority"`
+}
+
+// ApplyPromptCatalogItem 从平台提示词图鉴一键创建或更新模板，并支持绑定指定分组或平台分组（POST /api/prompts/catalog/apply）。
+func (h *Handler) ApplyPromptCatalogItem(c *gin.Context) {
+	svc := h.promptSvc()
+	if svc == nil || h.client == nil {
+		fail(c, http.StatusServiceUnavailable, "提示词注入服务未初始化")
+		return
+	}
+
+	var req applyPromptCatalogRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+
+	catalogID := strings.TrimSpace(req.CatalogID)
+	if catalogID == "" {
+		catalogID = strings.TrimSpace(req.ID)
+	}
+	if catalogID == "" {
+		fail(c, http.StatusBadRequest, "catalog_id 不能为空")
+		return
+	}
+
+	item, ok := prompt.LookupCatalogItem(catalogID)
+	if !ok {
+		fail(c, http.StatusNotFound, "未找到指定的平台提示词图鉴条目: "+catalogID)
+		return
+	}
+
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+
+	effectiveInjectMode := domain.PromptModeOverrideGlobal
+	if item.RecommendedInjectMode != "" && domain.IsValidPromptInjectMode(domain.NormalizePromptInjectMode(item.RecommendedInjectMode)) {
+		effectiveInjectMode = domain.NormalizePromptInjectMode(item.RecommendedInjectMode)
+	}
+	if strings.TrimSpace(req.InjectMode) != "" {
+		normMode := domain.NormalizePromptInjectMode(req.InjectMode)
+		if !domain.IsValidPromptInjectMode(normMode) {
+			fail(c, http.StatusBadRequest, service.ErrInvalidPromptInjectMode.Error())
+			return
+		}
+		effectiveInjectMode = normMode
+	}
+	if !enabled {
+		effectiveInjectMode = domain.PromptModeOff
+	}
+
+	tplName := strings.TrimSpace(req.Name)
+	if tplName == "" {
+		tplName = item.Name
+	}
+	if len(tplName) > 120 {
+		tplName = tplName[:120]
+	}
+
+	tplCategory := strings.TrimSpace(req.Category)
+	if tplCategory == "" {
+		tplCategory = item.Platform
+	}
+	if len(tplCategory) > 64 {
+		tplCategory = tplCategory[:64]
+	}
+
+	tplPriority := item.Priority
+	if tplPriority <= 0 {
+		tplPriority = 50
+	}
+	if req.Priority != nil && *req.Priority > 0 {
+		tplPriority = *req.Priority
+	}
+
+	tplDesc := strings.TrimSpace(item.Description)
+	if len(tplDesc) > 500 {
+		tplDesc = tplDesc[:500]
+	}
+
+	ctx := c.Request.Context()
+	if req.GroupID != nil && *req.GroupID > 0 {
+		grpExists, gErr := h.client.Group.Query().
+			Where(group.IDEQ(*req.GroupID), group.DeletedAtIsNil()).
+			Exist(ctx)
+		if gErr != nil {
+			h.failInternal(c, "校验目标分组失败", gErr)
+			return
+		}
+		if !grpExists {
+			fail(c, http.StatusNotFound, service.ErrGroupNotFound.Error())
+			return
+		}
+	}
+
+	existingTpl, qErr := h.client.PromptTemplate.Query().
+		Where(prompttemplate.NameEQ(tplName)).
+		First(ctx)
+	var (
+		tplRow  *ent.PromptTemplate
+		created bool
+	)
+	if qErr != nil {
+		if !ent.IsNotFound(qErr) {
+			h.failInternal(c, "查询现有提示词模板失败", qErr)
+			return
+		}
+		var cErr error
+		tplRow, cErr = h.client.PromptTemplate.Create().
+			SetName(tplName).
+			SetCategory(tplCategory).
+			SetContent(item.Content).
+			SetDescription(tplDesc).
+			SetIsBuiltin(false).
+			SetPriority(tplPriority).
+			Save(ctx)
+		if cErr != nil {
+			h.failInternal(c, "从图鉴创建提示词模板失败", cErr)
+			return
+		}
+		created = true
+	} else {
+		var uErr error
+		tplRow, uErr = existingTpl.Update().
+			SetCategory(tplCategory).
+			SetContent(item.Content).
+			SetDescription(tplDesc).
+			SetPriority(tplPriority).
+			Save(ctx)
+		if uErr != nil {
+			h.failInternal(c, "更新图鉴提示词模板失败", uErr)
+			return
+		}
+		created = false
+	}
+
+	boundGroups := make([]groupDTO, 0)
+	if req.GroupID != nil && *req.GroupID > 0 {
+		updatedGrp, bErr := svc.UpdateGroupPrompt(ctx, *req.GroupID, effectiveInjectMode, "", &tplRow.ID)
+		if bErr != nil {
+			if errors.Is(bErr, service.ErrGroupNotFound) {
+				fail(c, http.StatusNotFound, bErr.Error())
+				return
+			}
+			fail(c, http.StatusBadRequest, bErr.Error())
+			return
+		}
+		dto, dErr := h.buildGroupDTOWithCounts(ctx, updatedGrp)
+		if dErr != nil {
+			dto = h.attachToolObfToGroupDTO(toGroupDTO(updatedGrp, 0, 0))
+		}
+		boundGroups = append(boundGroups, dto)
+	} else if rawPlat := strings.TrimSpace(req.Platform); rawPlat != "" {
+		normPlat := domain.NormalizePlatform(rawPlat)
+		if domain.IsValidPlatform(normPlat) {
+			platGroups, gErr := h.client.Group.Query().
+				Where(group.PlatformEQ(normPlat), group.DeletedAtIsNil()).
+				Order(ent.Asc(group.FieldID)).
+				All(ctx)
+			if gErr == nil {
+				for _, pg := range platGroups {
+					updatedGrp, bErr := svc.UpdateGroupPrompt(ctx, pg.ID, effectiveInjectMode, "", &tplRow.ID)
+					if bErr != nil {
+						continue
+					}
+					dto, dErr := h.buildGroupDTOWithCounts(ctx, updatedGrp)
+					if dErr != nil {
+						dto = h.attachToolObfToGroupDTO(toGroupDTO(updatedGrp, 0, 0))
+					}
+					boundGroups = append(boundGroups, dto)
+				}
+			}
+		}
+	}
+
+	if err := svc.ReloadEngine(ctx); err != nil {
+		h.failInternal(c, "刷新提示词内存引擎失败", err)
+		return
+	}
+
+	var primaryGroup any
+	if len(boundGroups) > 0 {
+		primaryGroup = boundGroups[0]
+	}
+
+	msg := "已从平台提示词图鉴导入到模板库并热生效"
+	if !created {
+		msg = "已同步更新图鉴提示词模板并热生效"
+	}
+	if len(boundGroups) > 0 {
+		msg = "已导入平台提示词模板并绑定目标分组生效"
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":           true,
+		"created":      created,
+		"catalog_id":   item.ID,
+		"template":     toPromptTemplateDTO(tplRow),
+		"group":        primaryGroup,
+		"bound_groups": boundGroups,
+		"enabled":      enabled,
+		"inject_mode":  effectiveInjectMode,
+		"message":      msg,
+	})
 }

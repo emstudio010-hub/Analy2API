@@ -275,3 +275,92 @@ func TestEngineConcurrentReloadAndResolve(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestPlatformPromptCatalog_CoversAll11PlatformsAndFilters(t *testing.T) {
+	items := Catalog()
+	if len(items) < 13 {
+		t.Fatalf("Catalog() 应包含至少 13 条跨平台图鉴提示词，得到 %d", len(items))
+	}
+
+	requiredPlatforms := []string{
+		"antigravity",
+		"claude_code",
+		"codex_cli",
+		"dsh",
+		"cursor",
+		"windsurf",
+		"cline",
+		"gemini_cli",
+		"opencode",
+		"commandcode",
+		"workbuddy",
+	}
+	seenPlat := make(map[string]int, len(requiredPlatforms))
+	seenID := make(map[string]bool, len(items))
+
+	for _, it := range items {
+		if it.ID == "" || seenID[it.ID] {
+			t.Fatalf("图鉴条目 ID 为空或重复: %q", it.ID)
+		}
+		seenID[it.ID] = true
+		seenPlat[it.Platform]++
+
+		if strings.Contains(it.Content, "\u200b") || strings.Contains(it.Description, "\u200b") {
+			t.Fatalf("图鉴条目 %q 严禁包含零宽字符", it.ID)
+		}
+		if it.PlatformLabel == "" || it.Category == "" || it.ScenarioTag == "" ||
+			it.Name == "" || it.Description == "" || it.Role == "" ||
+			it.RecommendedAgyMode == "" || strings.TrimSpace(it.Content) == "" {
+			t.Fatalf("图鉴条目 %q 缺少必填元数据: %+v", it.ID, it)
+		}
+		if len(it.Name) > 120 {
+			t.Errorf("图鉴条目 %q Name 超过 PromptTemplate.name 120 字符上限 (%d)", it.ID, len(it.Name))
+		}
+		if len(it.Description) > 500 {
+			t.Errorf("图鉴条目 %q Description 超过 PromptTemplate.description 500 字符上限 (%d)", it.ID, len(it.Description))
+		}
+		if len(it.Tags) == 0 || len(it.Highlights) == 0 {
+			t.Errorf("图鉴条目 %q 应包含 tags 与 highlights", it.ID)
+		}
+	}
+
+	for _, p := range requiredPlatforms {
+		if seenPlat[p] == 0 {
+			t.Errorf("平台提示词图鉴缺少平台 %q", p)
+		}
+	}
+	if seenPlat["antigravity"] < 3 {
+		t.Errorf("antigravity 平台应至少提供原生核心、拦截接续桥、纯透传中和 3 套模板，实际 %d", seenPlat["antigravity"])
+	}
+
+	// 验证防御性深拷贝
+	items[0].Tags[0] = "mutated-tag"
+	fresh, ok := LookupCatalogItem(items[0].ID)
+	if !ok || fresh.Tags[0] == "mutated-tag" {
+		t.Fatalf("Catalog()/LookupCatalogItem() 应返回深拷贝: ok=%v tags=%v", ok, fresh.Tags)
+	}
+
+	// 验证按平台别名、分类标签与关键词过滤
+	agyItems, plats := FilterCatalog(CatalogFilter{Platform: "agy"})
+	if len(agyItems) < 3 {
+		t.Fatalf("FilterCatalog(agy) 应返回 >=3 条，得到 %d", len(agyItems))
+	}
+	if len(plats) != len(requiredPlatforms) {
+		t.Fatalf("CatalogPlatforms 数量=%d, want %d", len(plats), len(requiredPlatforms))
+	}
+
+	rooItems, _ := FilterCatalog(CatalogFilter{Platform: "roo_code"})
+	if len(rooItems) < 2 {
+		t.Fatalf("FilterCatalog(roo_code -> cline) 应返回 >=2 条，得到 %d", len(rooItems))
+	}
+
+	kwItems, _ := FilterCatalog(CatalogFilter{Keyword: "apply_patch"})
+	if len(kwItems) == 0 || kwItems[0].Platform != "codex_cli" {
+		t.Fatalf("FilterCatalog(keyword=apply_patch) 未命中 codex_cli: %+v", kwItems)
+	}
+
+	bridgeItems, _ := FilterCatalog(CatalogFilter{Category: "拦截接续桥"})
+	if len(bridgeItems) == 0 || bridgeItems[0].ID != "agy-default-intercept-continue" {
+		t.Fatalf("FilterCatalog(category=拦截接续桥) 未命中预期条目: %+v", bridgeItems)
+	}
+}
