@@ -16,7 +16,7 @@ export STATIC_DIR="${STATIC_DIR:-./web}"
 export DATA_DIR="${DATA_DIR:-./data}"
 export GIN_MODE="${GIN_MODE:-release}"
 export AGY_SESSION_RETENTION="${AGY_SESSION_RETENTION:-stateless}"
-export AGY_PROMPT_BLEND_MODE="${AGY_PROMPT_BLEND_MODE:-blend_clean}"
+export AGY_PROMPT_MODE="${AGY_PROMPT_MODE:-default_intercept_continue}"
 
 if [[ "${1:-}" == "-d" || "${1:-}" == "--daemon" ]]; then
   nohup ./analy2api > ./data/analy2api.log 2>&1 &

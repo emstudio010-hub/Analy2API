@@ -10,7 +10,7 @@
 [![Vue 3](https://img.shields.io/badge/Vue-3%20%2B%20TypeScript-4FC08D?style=flat-square&logo=vue.js&logoColor=white)](https://vuejs.org/)
 [![License: LGPL-3.0](https://img.shields.io/badge/License-LGPL--3.0-ff69b4?style=flat-square)](LICENSE)
 [![Co-Creators](https://img.shields.io/badge/Co--Creators-%E5%B0%8F%E5%96%B5%20%C2%B7%20ChatGPT%20%C2%B7%20Gemini--4-ffb6c1?style=flat-square)](#-共创团队--co-creators)
-[![Release](https://img.shields.io/badge/Release-v1.1.1-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
+[![Release](https://img.shields.io/badge/Release-v1.2.0-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
 
 </div>
 
@@ -115,13 +115,18 @@ flowchart LR
 
 ---
 
-### 3. 净化版 AGY 原生提示词 + 下游原样拼接
+### 3. AGY 原生默认提示词直走 + 双向拦截 + 下游无缝接续 & 10 格式转号 & 11 平台提示词图鉴
 
-为了让上游既稳又听话、同时绝不被原生 IDE 提示词带偏，Analy2API 设计了 **`blend_clean`（默认）净化混合策略** 🫧：
+为了让上游保持 100% 官方客户端真实指纹、同时绝不被本地 IDE 专属假设带偏，Analy2API 在 `v1.2.0` 默认升级为 **`default_intercept_continue`（原生默认 → 双向拦截 → 下游无缝接续）** 三段式管线 🫧：
 
-- 自动剔除 AGY 原生提示词中容易引发下游错乱的误导性片段：`<artifacts>`、`<slash_commands>`、`<skills>`、`<subagents>`、`<featured_plugins>`、`<user_information>` 宿主机系统/路径声明、`file:///` 本地文件链接规则等。
-- 在每个隔离容器的 `<authDir>/.gemini/GEMINI.md` 中自动写入系统级代理规范，并紧接在净化底本之后**一字不差地原样拼接下游客户端传来的系统提示词**。
-- 支持通过 `AGY_PROMPT_BLEND_MODE` 或后台模板在 `blend_clean`（净化混合）/ `verbatim_only`（纯透传）/ `native_raw`（原生混合）之间一键切换。
+- **三段式无损接续（`AGY_PROMPT_MODE=default_intercept_continue`）**：
+  1. **原生默认提示词直走**：完整保留 `agy` CLI 内置系统提示词直通上游，守护真实官方指纹；
+  2. **双向冲突拦截与脱敏**：入站自动剥离计费头、重复身份块与 `.system_generated` / `<artifacts>` 等本地 GUI 假设，同时在隔离沙盒 `.gemini/GEMINI.md` 注入接续桥；出站流式/非流式双模态零延迟剥离内部桥接标记；
+  3. **下游提示词与工具无缝接续**：紧接桥接层完整承接下游系统指令与任意自定义/随机工具调用（`<AGY_TOOL_CALL>`）；支持一键切换 `default_intercept_continue` / `blend_sanitized` / `native_only` / `downstream_only` 并实时预览。
+- **10 种多账号凭证格式全自动转 `agy` CLI 标准格式**：
+  - 后台工作台与 `/api/antigravity/accounts/convert`（以及远程补号接口）支持一键拖入/粘贴 **Google Cloud ADC、`Gemini CLI (oauth_creds.json)`、`CLIProxyAPI / Sub2API / OneAPI`、AGY 原生 JSON、JSON 数组 / `.jsonl`、CSV/TSV、`email----password----refresh_token` / `email:refresh_token` / `1//` 裸 Token、Base64 及 `.zip` 压缩包**，自动嗅探去重并生成 `agy` CLI 原生可识别的 `.gemini/oauth_creds.json`、`google_accounts.json` 与 `auth.json` 标准凭证包！
+- **11 大主流平台真实提示词图鉴馆 & 三栏拦截沙盒**：
+  - 内置 **AntiGravity `agy`、Claude Code、Codex CLI、DSH、Cursor、Windsurf Cascade、Cline / Roo Code、Gemini CLI、OpenCode、Command Code、WorkBuddy** 共 14 套高质量提示词模板，支持一键导入绑定分组，并提供三栏实时「客户端包裹块剥离 + 风控规则过滤 + AGY 接续终态」沙盒测试器 ✨
 
 ---
 

@@ -19,7 +19,7 @@ if not defined DATA_DIR set "DATA_DIR=%ROOT_DIR%\data"
 if not defined DB_DRIVER set "DB_DRIVER=sqlite"
 if not defined DB_SQLITE_PATH set "DB_SQLITE_PATH=%DATA_DIR%\analy2api.db"
 if not defined AGY_SESSION_RETENTION set "AGY_SESSION_RETENTION=stateless"
-if not defined AGY_PROMPT_BLEND_MODE set "AGY_PROMPT_BLEND_MODE=blend_clean"
+if not defined AGY_PROMPT_MODE set "AGY_PROMPT_MODE=default_intercept_continue"
 
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 
