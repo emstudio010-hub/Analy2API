@@ -1,17 +1,16 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 
+import { toMessage } from '@/api/client'
+import { filterRulesApi } from '@/api/endpoints'
+import type { FilterRule, FilterRuleKind, FilterRulePayload } from '@/api/types'
 import Button from '@/components/ui/Button.vue'
 import Checkbox from '@/components/ui/Checkbox.vue'
 import Field from '@/components/ui/Field.vue'
 import Icon from '@/components/ui/Icon.vue'
 import Input from '@/components/ui/Input.vue'
 import Modal from '@/components/ui/Modal.vue'
-import Select from '@/components/ui/Select.vue'
 import Textarea from '@/components/ui/Textarea.vue'
-import { filterRulesApi } from '@/api/endpoints'
-import { toMessage } from '@/api/client'
-import type { FilterRule, FilterRuleKind, FilterRulePayload } from '@/api/types'
 import { useToastStore } from '@/stores/toast'
 
 const props = defineProps<{
@@ -35,7 +34,8 @@ const replacement = ref('')
 const isRegex = ref(false)
 const caseSensitive = ref(false)
 const wordBoundary = ref(true)
-const scope = ref('all_injected')
+const allInjectedScope = ref(true)
+const subScopes = ref<string[]>(['system', 'tool', 'user'])
 const priority = ref('100')
 const enabled = ref(true)
 const description = ref('')
@@ -48,21 +48,54 @@ const kindOptions: Array<{
   label: string
   hint: string
 }> = [
-  { value: 'prune', label: 'Prune 删减', hint: '直接移除冗余或高危特征片段（通常替换为空）' },
-  { value: 'rewrite', label: 'Rewrite 重写', hint: '整句/标识模板重写为 WorkBuddy 语境' },
-  { value: 'replace', label: 'Replace 同义词替换', hint: '高危安全词汇替换为中性工程词汇' },
+  { value: 'prune', label: 'Prune 删减', hint: '直接移除冗余计费头或敏感客户端签名（通常替换为空）' },
+  { value: 'rewrite', label: 'Rewrite 重写', hint: '整句/标识模板平滑改写为通用工程语境' },
+  { value: 'replace', label: 'Replace 同义替换', hint: '高危风控敏感词替换为中性工程词（零 \\u200b）' },
 ]
 
-const scopeOptions = [
-  { label: '全部注入上下文 (all_injected)', value: 'all_injected' },
-  { label: '仅系统提示词 (system)', value: 'system' },
-  { label: '仅工具 Schema 描述 (tool)', value: 'tool' },
-  { label: '仅用户 Harness 注入块 (user)', value: 'user' },
+const subScopeItems = [
+  { value: 'system', label: 'System / Instructions', desc: '系统与开发者指令层' },
+  { value: 'tool', label: 'Tools Schema', desc: '工具定义与参数描述' },
+  { value: 'user', label: 'User Harness 注入块', desc: '仅包裹块，绝不改纯用户提问' },
 ]
 
-const effectiveScopeOptions = computed(() => {
-  if (!scope.value || scopeOptions.some((o) => o.value === scope.value)) return scopeOptions
-  return [...scopeOptions, { label: scope.value, value: scope.value }]
+function hydrateScope(raw?: string | null): void {
+  const s = (raw ?? 'all_injected').trim().toLowerCase()
+  if (!s || s === 'all' || s === 'all_injected') {
+    allInjectedScope.value = true
+    subScopes.value = ['system', 'tool', 'user']
+    return
+  }
+  const parts = s
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean)
+    .map((p) => (p === 'user_harness' ? 'user' : p === 'tools' ? 'tool' : p))
+  if (parts.includes('all_injected') || parts.includes('all') || parts.length === 0) {
+    allInjectedScope.value = true
+    subScopes.value = ['system', 'tool', 'user']
+  } else {
+    allInjectedScope.value = false
+    subScopes.value = Array.from(new Set(parts))
+  }
+}
+
+function toggleSubScope(target: string): void {
+  const idx = subScopes.value.indexOf(target)
+  if (idx >= 0) {
+    if (subScopes.value.length > 1) {
+      subScopes.value.splice(idx, 1)
+    }
+  } else {
+    subScopes.value.push(target)
+  }
+}
+
+const serializedScope = computed(() => {
+  if (allInjectedScope.value || subScopes.value.length >= 3) {
+    return 'all_injected'
+  }
+  return subScopes.value.join(',')
 })
 
 const errors = computed(() => {
@@ -73,7 +106,6 @@ const errors = computed(() => {
     try {
       new RegExp(pattern.value)
     } catch {
-      // Go regexp 与 JS RegExp 语法略有差异（如 (?i) 内联修饰），提示但不强行拦住 Go 正则
       if (!pattern.value.startsWith('(?')) {
         out.pattern = '正则表达式语法似乎有误，请检查括号与转义'
       }
@@ -82,8 +114,10 @@ const errors = computed(() => {
   if (replacement.value.includes('\u200b')) {
     out.replacement = '严禁在替换文本中使用 \\u200b 零宽字符'
   }
-  const prio = Number(priority.value)
-  if (!Number.isFinite(prio)) out.priority = '优先级必须是数字'
+  const rawPrio = String(priority.value).trim()
+  if (rawPrio === '' || !Number.isFinite(Number(rawPrio))) {
+    out.priority = '优先级必须是有效整数（支持 0）'
+  }
   return out
 })
 
@@ -101,8 +135,7 @@ watch(
     isRegex.value = r?.is_regex ?? false
     caseSensitive.value = r?.case_sensitive ?? false
     wordBoundary.value = r?.word_boundary ?? true
-    const rawScope = r?.scope || 'all_injected'
-    scope.value = rawScope === 'user_harness' ? 'user' : rawScope
+    hydrateScope(r?.scope)
     priority.value = String(r?.priority ?? 100)
     enabled.value = r?.enabled ?? true
     description.value = r?.description ?? ''
@@ -127,6 +160,7 @@ async function submit(): Promise<void> {
   submitting.value = true
   serverError.value = ''
   try {
+    const parsedPriority = Math.trunc(Number(String(priority.value).trim()))
     const payload: FilterRulePayload = {
       name: name.value.trim(),
       kind: kind.value,
@@ -135,8 +169,8 @@ async function submit(): Promise<void> {
       is_regex: isRegex.value,
       case_sensitive: caseSensitive.value,
       word_boundary: wordBoundary.value,
-      scope: scope.value || 'all_injected',
-      priority: Number(priority.value) || 100,
+      scope: serializedScope.value,
+      priority: parsedPriority,
       enabled: enabled.value,
       description: description.value.trim(),
     }
@@ -161,8 +195,8 @@ async function submit(): Promise<void> {
 <template>
   <Modal
     :open="open"
-    :title="isEdit ? '编辑风控规则' : '新建风控规则'"
-    subtitle="所有规则对全部下游客户端默认强制生效，严禁包含 \\u200b 零宽字符"
+    :title="isEdit ? '编辑风控拦截规则' : '新建风控拦截规则'"
+    subtitle="所有规则按 Prune → Rewrite → Replace 顺序热生效，严禁包含 \\u200b 零宽字符"
     size="lg"
     @update:open="emit('update:open', $event)"
   >
@@ -204,10 +238,10 @@ async function submit(): Promise<void> {
       <div class="grid gap-3.5 sm:grid-cols-3">
         <div class="sm:col-span-2">
           <Field label="规则名称" required :error="errors.name">
-            <Input v-model="name" placeholder="例如：屏蔽 Claude Code 标识" maxlength="120" />
+            <Input v-model="name" placeholder="例如：prune-claude-billing-header" maxlength="120" />
           </Field>
         </div>
-        <Field label="优先级" :error="errors.priority" hint="数值越小越先匹配执行">
+        <Field label="优先级" :error="errors.priority" hint="越小越先执行（支持 0）">
           <Input v-model="priority" type="number" step="1" />
         </Field>
       </div>
@@ -230,7 +264,7 @@ async function submit(): Promise<void> {
       <Field
         label="替换为 (replacement)"
         :error="errors.replacement"
-        hint="Prune 类型留空表示直接删除；禁止包含 \\u200b 零宽字符"
+        hint="Prune 类型留空表示直接物理删空；禁止包含 \\u200b 零宽字符"
       >
         <Textarea
           v-model="replacement"
@@ -241,20 +275,51 @@ async function submit(): Promise<void> {
         />
       </Field>
 
-      <div class="grid gap-3.5 sm:grid-cols-2">
-        <Field label="作用域 (scope)" hint="默认仅清洗注入上下文，绝不改纯用户提问">
-          <Select v-model="scope" :options="effectiveScopeOptions" />
-        </Field>
-        <Field label="说明" hint="选填，备注这条规则应对的风控场景">
-          <Input v-model="description" placeholder="例如：防止上游 code=11128 拦截" maxlength="500" />
-        </Field>
-      </div>
+      <!-- 精细化多选作用域 -->
+      <Field label="生效作用域 (scope)" hint="仅清洗客户端注入上下文与容器标签，绝不篡改纯用户提问与代码块">
+        <div class="space-y-2 rounded-md border border-line bg-raised/35 p-2.5">
+          <Checkbox
+            v-model="allInjectedScope"
+            label="全部注入上下文 (all_injected)"
+            description="同时覆盖 System 指令、Tools 描述与客户端 User Harness 包裹块"
+          />
+          <div v-if="!allInjectedScope" class="grid gap-2 pt-1 sm:grid-cols-3">
+            <button
+              v-for="sc in subScopeItems"
+              :key="sc.value"
+              type="button"
+              class="rounded border px-2.5 py-1.5 text-left transition"
+              :class="
+                subScopes.includes(sc.value)
+                  ? 'border-accent/60 bg-accent/10 text-fg'
+                  : 'border-line bg-surface text-muted hover:border-line-strong'
+              "
+              @click="toggleSubScope(sc.value)"
+            >
+              <div class="flex items-center justify-between text-xs font-medium">
+                <span>{{ sc.label }}</span>
+                <Icon
+                  v-if="subScopes.includes(sc.value)"
+                  name="check"
+                  :size="12"
+                  class="text-accent"
+                />
+              </div>
+              <div class="mt-0.5 text-2xs text-subtle">{{ sc.desc }}</div>
+            </button>
+          </div>
+        </div>
+      </Field>
+
+      <Field label="规则说明" hint="选填，备注该条规则拦截的客户端特征或误报场景">
+        <Input v-model="description" placeholder="例如：剥离客户端自动注入的仓库反馈链接与计费头" maxlength="500" />
+      </Field>
 
       <div class="grid gap-2.5 rounded-md border border-line bg-raised/40 p-3 sm:grid-cols-2">
         <Checkbox
           v-model="isRegex"
           label="启用正则表达式 (is_regex)"
-          description="按正则引擎解析 pattern"
+          description="按 Go RE2 正则引擎编译匹配"
         />
         <Checkbox
           v-model="caseSensitive"
@@ -264,12 +329,12 @@ async function submit(): Promise<void> {
         <Checkbox
           v-model="wordBoundary"
           label="全词边界匹配 (word_boundary)"
-          description="避免误伤长单词内部子串（非正则时生效）"
+          description="避免如 kill 误伤 skill / killed 等正常单词（非正则时生效）"
         />
         <Checkbox
           v-model="enabled"
-          label="立即启用规则"
-          description="关闭后保留词条但不参与清洗"
+          label="保存后立即启用"
+          description="关闭后保留词条但不参与热清洗"
         />
       </div>
     </form>

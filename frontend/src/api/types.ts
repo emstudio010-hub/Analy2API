@@ -1690,3 +1690,185 @@ export interface SessionGuardResponse {
   paused_count: number
   log_files_count: number
 }
+
+// === Platform Prompt Catalog & Pipeline Preview ===
+
+/** 主流编程智能体与上游平台标识（提示词图鉴库筛选用）。 */
+export type CatalogPlatformKey =
+  | 'antigravity'
+  | 'claude_code'
+  | 'codex_cli'
+  | 'dsh'
+  | 'cursor'
+  | 'windsurf'
+  | 'cline'
+  | 'gemini_cli'
+  | 'opencode'
+  | 'commandcode'
+  | 'workbuddy'
+  | string
+
+/** 提示词图鉴卡片场景分类标签。 */
+export type CatalogScenarioTag = '原生身份' | '拦截接续桥' | '工具协议' | '极简终端' | string
+
+/** AGY CLI 提示词运行管线模式。 */
+export type AgyPromptMode =
+  | 'default_intercept_continue'
+  | 'blend_sanitized'
+  | 'native_only'
+  | 'downstream_only'
+  | string
+
+/** 各平台系统提示词图鉴单条元数据（GET /api/prompts/catalog）。 */
+export interface PromptCatalogItem {
+  id: string
+  platform: CatalogPlatformKey
+  platform_label?: string
+  category: string
+  scenario_tag?: CatalogScenarioTag
+  scenario?: CatalogScenarioTag
+  name: string
+  title?: string
+  description: string
+  role?: string
+  recommended_agy_mode?: AgyPromptMode
+  recommended_inject_mode?: PromptInjectMode
+  tags?: string[]
+  highlights?: string[]
+  content: string
+  priority?: number
+  is_builtin?: boolean
+  template_id?: number | null
+  already_imported?: boolean
+}
+
+export interface PromptCatalogPlatformSummary {
+  platform: string
+  label?: string
+  platform_label?: string
+  count: number
+}
+
+export interface PromptCatalogQuery {
+  platform?: string
+  q?: string
+  keyword?: string
+  search?: string
+  category?: string
+  role?: string
+}
+
+export interface PromptCatalogResponse {
+  items: PromptCatalogItem[]
+  total?: number
+  platforms?: PromptCatalogPlatformSummary[] | Record<string, number>
+  categories?: string[]
+}
+
+/** 一键将图鉴条目导入模板库并可选绑定到分组（POST /api/prompts/catalog/apply）。 */
+export interface ApplyPromptCatalogPayload {
+  catalog_id: string
+  id?: string
+  group_id?: number | null
+  platform?: string
+  enabled?: boolean
+  inject_mode?: PromptInjectMode
+  name?: string
+  category?: string
+  priority?: number
+}
+
+export interface ApplyPromptCatalogResponse {
+  ok?: boolean
+  created?: boolean
+  updated?: boolean
+  catalog_id?: string
+  template: PromptTemplate
+  group?: Group | null
+  bound_groups?: Group[]
+  enabled?: boolean
+  inject_mode?: PromptInjectMode | string
+  message?: string
+}
+
+/** 识别出的客户端 Harness 包裹标签条目。 */
+export interface DetectedHarnessItem {
+  tag: string
+  platform?: string
+  scope?: string
+  action?: string
+  preview?: string
+}
+
+/** 拦截与接续分步管线阶段快照。 */
+export interface FilterPipelineStage {
+  stage?: string
+  key?: string
+  name?: string
+  title?: string
+  label?: string
+  description?: string
+  system_prompt?: string
+  user_message?: string
+  content?: string
+  output?: string
+  changed?: boolean
+}
+
+/** 实时清洗与 AGY 默认提示词拦截接续统一预览载荷（POST /api/filter-rules/preview）。 */
+export interface FilterPipelinePreviewPayload {
+  /** 兼容传统单文本 / JSON 载荷预览模式。 */
+  input?: string
+  mode?: FilterPreviewMode | string
+  protocol?: FilterPreviewProtocol | string
+  /** 拦截与接续实时沙盒双输入参数。 */
+  system_prompt?: string
+  user_message?: string
+  agy_mode?: AgyPromptMode
+  has_tools?: boolean
+  group_id?: number | null
+}
+
+/** 实时清洗与 AGY 拦截接续预览响应（同时兼容旧版单字段与新版全链路管线字段）。 */
+export interface FilterPipelinePreviewResponse {
+  input?: string
+  output?: string
+  mode?: string
+  protocol?: string
+  changed?: boolean
+  hits?: FilterRuleHit[]
+  matched_rules?: FilterRuleHit[]
+  stats?: {
+    prune_hits: number
+    rewrite_hits: number
+    replace_hits: number
+    harness_spans?: number
+    fields_touched?: number
+    hits?: FilterRuleHit[]
+  }
+  agy_mode?: AgyPromptMode
+  has_tools?: boolean
+  original_system?: string
+  system_prompt?: string
+  original_user?: string
+  user_message?: string
+  harness_stripped_system?: string
+  harness_stripped_user?: string
+  detected_harnesses?: Array<DetectedHarnessItem | string>
+  stripped_harnesses?: Array<DetectedHarnessItem | string>
+  harness_tags?: string[]
+  sanitized_system?: string
+  filtered_system?: string
+  sanitized_user?: string
+  filtered_user?: string
+  agy_native_prompt?: string
+  intercept_bridge?: string
+  interception_bridge?: string
+  agy_continuation_preview?: string
+  agy_final_prompt?: string
+  final_prompt?: string
+  final_user?: string
+  final_system?: string
+  stages?: FilterPipelineStage[]
+}
+
