@@ -11,6 +11,7 @@ import (
 	"cmd2api/ent"
 	"cmd2api/ent/account"
 	"cmd2api/ent/group"
+	"cmd2api/internal/antigravity"
 	"cmd2api/internal/domain"
 	"cmd2api/internal/workbuddy"
 )
@@ -145,19 +146,21 @@ func (s *AccountService) GetRemotePushInfo(ctx context.Context) (*RemotePushInfo
 	}, nil
 }
 
-// PushAccounts 执行统一远程补号入池（支持四平台单条/批量、幂等 upsert、按组名自动建组、AntiGravity 自动分配独立容器与凭证落盘）。
+// PushAccounts 执行统一远程补号入池（支持四平台单条/批量、AntiGravity 全格式自动识别转换、幂等 upsert、按组名自动建组、独立容器与凭证落盘）。
 func (s *AccountService) PushAccounts(ctx context.Context, in RemotePushAccountsInput) (*RemotePushAccountsResult, error) {
 	if len(in.Items) == 0 {
 		return nil, errors.New("未提供任何待推送的账号条目")
 	}
 
+	expandedItems := expandAntigravityPushItems(in.Items, in.DefaultPlatform)
+
 	res := &RemotePushAccountsResult{
-		Total:   len(in.Items),
-		Results: make([]RemotePushAccountItemResult, 0, len(in.Items)),
+		Total:   len(expandedItems),
+		Results: make([]RemotePushAccountItemResult, 0, len(expandedItems)),
 	}
 	inFlightBindings := make(map[string]int)
 
-	for idx, item := range in.Items {
+	for idx, item := range expandedItems {
 		itemRes := s.pushSingleAccount(ctx, idx, item, in, inFlightBindings)
 		res.Results = append(res.Results, itemRes)
 		switch itemRes.Action {
@@ -247,6 +250,50 @@ func (s *AccountService) pushSingleAccount(
 			OK:     false,
 			Action: "failed",
 			Error:  fmt.Sprintf("不支持的平台 %q", rawPlatform),
+		}
+	}
+
+	// 2.5 AntiGravity 推送载荷全格式自动转换（支持 Google ADC / Gemini CLI oauth_creds / CPA / email----refresh_token / 1// / Base64 等）
+	if platform == domain.PlatformAntigravity {
+		var convSource []byte
+		switch {
+		case len(rawAuthBytes) > 0:
+			convSource = rawAuthBytes
+		case shouldNormalizeAntigravityString(apiKey):
+			convSource = []byte(apiKey)
+		case shouldNormalizeAntigravityString(refreshToken):
+			convSource = []byte(refreshToken)
+		}
+		if len(convSource) > 0 {
+			if normAcc, convErr := antigravity.NormalizeSingleCredential(item.AuthFilename, convSource, itemProxyRaw); convErr == nil && normAcc.Valid {
+				if email == "" && normAcc.Email != "" {
+					email = normAcc.Email
+				}
+				if refreshToken == "" && normAcc.RefreshToken != "" {
+					refreshToken = normAcc.RefreshToken
+				}
+				if normAcc.AccessToken != "" && (apiKey == "" || shouldNormalizeAntigravityString(apiKey)) {
+					apiKey = normAcc.AccessToken
+				} else if shouldNormalizeAntigravityString(apiKey) && normAcc.AccessToken == "" {
+					apiKey = ""
+				}
+				if projectID == "" && normAcc.ProjectID != "" {
+					projectID = normAcc.ProjectID
+				}
+				if item.ExpiresAt == "" && normAcc.ExpiresAt != "" {
+					item.ExpiresAt = normAcc.ExpiresAt
+				}
+				if itemProxyRaw == "" && normAcc.RawProxy != "" {
+					itemProxyRaw = normAcc.RawProxy
+				}
+				if strings.TrimSpace(item.Name) == "" && normAcc.Name != "" && !strings.HasPrefix(normAcc.Name, "agy-token-") {
+					item.Name = normAcc.Name
+				}
+				if strings.TrimSpace(item.AuthFilename) == "" && normAcc.AuthFilename != "" {
+					item.AuthFilename = normAcc.AuthFilename
+				}
+				rawAuthBytes = normAcc.CanonicalAuthJSONBytes()
+			}
 		}
 	}
 
@@ -655,11 +702,22 @@ func (s *AccountService) ensureAntigravityPushContainer(
 		return 0
 	}
 	authBytes := rawAuthBytes
-	if len(authBytes) == 0 && (refreshToken != "" || accessToken != "") {
+	if len(authBytes) > 0 {
+		if normAcc, nErr := antigravity.NormalizeSingleCredential(authFilename, authBytes, proxyURL); nErr == nil && normAcc.Valid {
+			authBytes = normAcc.CanonicalAuthJSONBytes()
+			if strings.TrimSpace(authFilename) == "" {
+				authFilename = normAcc.AuthFilename
+			}
+		}
+	} else if refreshToken != "" || accessToken != "" {
+		cleanAccess := accessToken
+		if cleanAccess == "agy-oauth-json" || cleanAccess == refreshToken {
+			cleanAccess = ""
+		}
 		payload := map[string]any{
 			"type":         "antigravity",
 			"provider":     "antigravity",
-			"access_token": accessToken,
+			"access_token": cleanAccess,
 		}
 		if refreshToken != "" {
 			payload["refresh_token"] = refreshToken
@@ -728,6 +786,8 @@ func (s *AccountService) resolvePushTargetGroups(
 			}
 			return []int64{existing.ID}, nil
 		}
+		// 若存在已软删除的同名历史分组，先归档重命名以释放 groups.name 唯一约束，避免 SQLite/Postgres UNIQUE 冲突
+		s.archiveSoftDeletedPushGroup(ctx, groupName)
 		builder := s.client.Group.Create().
 			SetName(groupName).
 			SetDescription("远程补号自动创建的 " + platform + " 分组").
@@ -754,6 +814,7 @@ func (s *AccountService) resolvePushTargetGroups(
 	}
 
 	defaultName := platform
+	s.archiveSoftDeletedPushGroup(ctx, defaultName)
 	if exists, _ := s.client.Group.Query().Where(group.NameEQ(defaultName)).Exist(ctx); exists {
 		defaultName = fmt.Sprintf("%s-%d", platform, time.Now().Unix()%10000)
 	}
@@ -830,7 +891,8 @@ func detectPushPlatform(rawPlatform, apiKey, refreshToken, uid, projectID, accou
 		strings.EqualFold(accountMode, domain.AccountModeGo) {
 		return domain.PlatformOpenCode
 	}
-	if projectID != "" || hasAuthJSON || strings.HasPrefix(apiKey, "ya29.") || strings.HasPrefix(refreshToken, "1//") {
+	if projectID != "" || hasAuthJSON || strings.HasPrefix(apiKey, "ya29.") || strings.HasPrefix(refreshToken, "1//") ||
+		strings.HasPrefix(apiKey, "1//") || strings.Contains(apiKey, "----1//") || strings.Contains(apiKey, ":1//") || strings.Contains(apiKey, "|1//") {
 		return domain.PlatformAntigravity
 	}
 	if uid != "" || strings.Contains(strings.ToLower(domainVal), "codebuddy") || strings.Contains(strings.ToLower(domainVal), "workbuddy") {
@@ -901,4 +963,105 @@ func extractAccountGroupIDs(acc *ent.Account) []int64 {
 		}
 	}
 	return out
+}
+
+func (s *AccountService) archiveSoftDeletedPushGroup(ctx context.Context, groupName string) {
+	if strings.TrimSpace(groupName) == "" {
+		return
+	}
+	deletedRows, err := s.client.Group.Query().
+		Where(group.NameEQ(groupName), group.DeletedAtNotNil()).
+		All(ctx)
+	if err != nil {
+		return
+	}
+	for _, r := range deletedRows {
+		archived := fmt.Sprintf("%s__deleted_%d", r.Name, time.Now().UnixNano())
+		_, _ = r.Update().SetName(archived).Save(ctx)
+	}
+}
+
+func shouldNormalizeAntigravityString(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return false
+	}
+	if strings.Contains(trimmed, "----") || strings.Contains(trimmed, "|") ||
+		strings.HasPrefix(trimmed, "1//") || strings.Contains(trimmed, ":1//") ||
+		strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+		return true
+	}
+	// Base64 编码的 JSON 凭证探测
+	if len(trimmed) >= 24 && !strings.HasPrefix(trimmed, "ya29.") && !strings.Contains(trimmed, " ") {
+		if norm, err := antigravity.NormalizeSingleCredential("", []byte(trimmed), ""); err == nil && norm.Valid && norm.SourceFormat == antigravity.SourceFormatBase64Blob {
+			return true
+		}
+	}
+	return false
+}
+
+// expandAntigravityPushItems 当远程推送的条目中包含 CPA/Sub2API 多账号导出 JSON、JSON 数组或 NDJSON 时，自动展开为多条独立账号项。
+func expandAntigravityPushItems(items []RemotePushAccountItem, defaultPlatform string) []RemotePushAccountItem {
+	out := make([]RemotePushAccountItem, 0, len(items))
+	normDefaultPlat := domain.NormalizePlatform(defaultPlatform)
+
+	for _, item := range items {
+		effPlat := domain.NormalizePlatform(firstNonEmptyPush(item.Platform, normDefaultPlat))
+		rawBlob := firstValidJSONBytes(item.AuthJSON, item.TokenJSON)
+		if len(rawBlob) == 0 && (effPlat == domain.PlatformAntigravity || strings.Contains(item.APIKey, "\n") || strings.HasPrefix(strings.TrimSpace(item.APIKey), "[") || strings.HasPrefix(strings.TrimSpace(item.APIKey), "{")) {
+			if shouldExpandMultiAccountString(item.APIKey) {
+				rawBlob = []byte(item.APIKey)
+			}
+		}
+		if len(rawBlob) == 0 || (effPlat != "" && effPlat != domain.PlatformAntigravity) {
+			out = append(out, item)
+			continue
+		}
+
+		fFalse := false
+		batch, err := antigravity.ConvertCredentialsToAGY([]antigravity.AdapterInputFile{
+			{Filename: item.AuthFilename, Content: rawBlob},
+		}, antigravity.ConvertOptions{
+			DefaultProxy: firstNonEmptyPush(item.ProxyURL, item.Proxy, item.IP, item.ProxyIP),
+			Deduplicate:  &fFalse,
+		})
+		if err != nil || batch.ValidCount <= 1 {
+			out = append(out, item)
+			continue
+		}
+
+		for _, conv := range batch.Accounts {
+			if !conv.Valid {
+				continue
+			}
+			cloned := item
+			cloned.Platform = domain.PlatformAntigravity
+			if cloned.Email == "" {
+				cloned.Email = conv.Email
+			}
+			cloned.Name = conv.Name
+			cloned.AccessToken = conv.AccessToken
+			cloned.RefreshToken = conv.RefreshToken
+			cloned.APIKey = firstNonEmptyPush(conv.AccessToken, conv.RefreshToken)
+			if cloned.ProjectID == "" {
+				cloned.ProjectID = conv.ProjectID
+			}
+			if cloned.ExpiresAt == "" {
+				cloned.ExpiresAt = conv.ExpiresAt
+			}
+			if cloned.ProxyURL == "" && cloned.Proxy == "" && conv.RawProxy != "" {
+				cloned.ProxyURL = conv.RawProxy
+			}
+			cloned.AuthFilename = conv.AuthFilename
+			cloned.AuthJSON = json.RawMessage(conv.CanonicalAuthJSONBytes())
+			cloned.TokenJSON = nil
+			out = append(out, cloned)
+		}
+	}
+	return out
+}
+
+func shouldExpandMultiAccountString(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	return strings.HasPrefix(trimmed, "[") || strings.HasPrefix(trimmed, "{") || strings.Contains(trimmed, "\n")
 }
