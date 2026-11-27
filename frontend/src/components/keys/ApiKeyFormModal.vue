@@ -61,6 +61,18 @@ const whitelistEntries = computed(() =>
     .filter(Boolean),
 )
 
+function isValidIpOrCidr(entry: string): boolean {
+  const [ipPart, cidrPart, extra] = entry.split('/')
+  if (!ipPart || extra !== undefined) return false
+  const isV4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(ipPart) && ipPart.split('.').every((n) => Number(n) <= 255)
+  const isV6 = ipPart.includes(':') && /^[0-9a-fA-F:]{2,39}$/.test(ipPart)
+  if (!isV4 && !isV6) return false
+  if (cidrPart === undefined) return true
+  if (!/^\d{1,3}$/.test(cidrPart)) return false
+  const prefix = Number(cidrPart)
+  return isV4 ? prefix >= 0 && prefix <= 32 : prefix >= 0 && prefix <= 128
+}
+
 const errors = computed(() => {
   const out: Record<string, string> = {}
   if (!name.value.trim()) out.name = '请输入密钥名称'
@@ -72,9 +84,7 @@ const errors = computed(() => {
     out.groupId = '请选择绑定分组'
   }
 
-  const bad = whitelistEntries.value.find(
-    (entry) => !/^[0-9a-fA-F:.]{3,45}(\/\d{1,3})?$/.test(entry),
-  )
+  const bad = whitelistEntries.value.find((entry) => !isValidIpOrCidr(entry))
   if (bad) out.ip = `无法识别的 IP/CIDR 地址：${bad}`
   return out
 })
@@ -87,7 +97,11 @@ watch(
     if (!props.open) return
     const key = props.apiKey
     name.value = key?.name ?? ''
-    groupId.value = key?.group_id ? String(key.group_id) : String(props.groups[0]?.id ?? '')
+    if (key) {
+      groupId.value = key.group_id ? String(key.group_id) : ''
+    } else {
+      groupId.value = String(props.groups[0]?.id ?? '')
+    }
     quota.value = String(key?.quota ?? 0)
     ipWhitelist.value = (key?.ip_whitelist ?? []).join('\n')
     expiresAt.value = key?.expires_at ? toLocalInputValue(key.expires_at) : ''
@@ -155,6 +169,7 @@ async function submit(): Promise<void> {
     :title="isEdit ? '编辑下游调用密钥' : '签发下游调用密钥'"
     :subtitle="isEdit ? '可调整绑定分组、额度上限、IP 白名单与状态' : '创建成功后即可复制完整密钥并一键生成三协议接入代码'"
     size="lg"
+    :persistent="submitting"
     @update:open="emit('update:open', $event)"
   >
     <form class="space-y-4" @submit.prevent="submit">

@@ -8,6 +8,7 @@ import LoginLinkModal from '@/components/accounts/LoginLinkModal.vue'
 import PackagesModal from '@/components/accounts/PackagesModal.vue'
 import Badge from '@/components/ui/Badge.vue'
 import Button from '@/components/ui/Button.vue'
+import Checkbox from '@/components/ui/Checkbox.vue'
 import ConfirmDialog from '@/components/ui/ConfirmDialog.vue'
 import DataTable from '@/components/ui/DataTable.vue'
 import EmptyState from '@/components/ui/EmptyState.vue'
@@ -35,6 +36,7 @@ import type {
   ScanLocalResult,
 } from '@/api/types'
 import { useToastStore } from '@/stores/toast'
+import { copyText } from '@/utils/clipboard'
 import {
   formatCredits,
   formatDateTime,
@@ -151,11 +153,82 @@ const emptyDescription = computed(() =>
 )
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let suppressFilterWatch = false
+
+const selectedIds = ref<number[]>([])
+const batchOperating = ref(false)
+
+const allVisibleSelected = computed(
+  () => items.value.length > 0 && items.value.every((acc) => selectedIds.value.includes(acc.id)),
+)
+
+function toggleSelectAll(checked: boolean): void {
+  if (checked) {
+    selectedIds.value = items.value.map((acc) => acc.id)
+  } else {
+    selectedIds.value = []
+  }
+}
+
+function toggleSelectRow(id: number, checked: boolean): void {
+  if (checked) {
+    if (!selectedIds.value.includes(id)) selectedIds.value = [...selectedIds.value, id]
+  } else {
+    selectedIds.value = selectedIds.value.filter((x) => x !== id)
+  }
+}
+
+async function runBatchStatus(nextStatus: 'active' | 'disabled'): Promise<void> {
+  if (batchOperating.value || selectedIds.value.length === 0) return
+  batchOperating.value = true
+  let ok = 0
+  let fail = 0
+  try {
+    for (const id of selectedIds.value) {
+      try {
+        await accountsApi.update(id, { status: nextStatus })
+        ok += 1
+      } catch {
+        fail += 1
+      }
+    }
+    toast.success(
+      nextStatus === 'active' ? '批量启用完成' : '批量禁用完成',
+      `成功 ${ok} 个${fail > 0 ? ` · 失败 ${fail} 个` : ''}`,
+    )
+    selectedIds.value = []
+    await load()
+  } finally {
+    batchOperating.value = false
+  }
+}
+
+async function runBatchCheck(): Promise<void> {
+  if (batchOperating.value || selectedIds.value.length === 0) return
+  batchOperating.value = true
+  let ok = 0
+  let fail = 0
+  try {
+    for (const id of selectedIds.value) {
+      try {
+        const res = await accountsApi.check(id)
+        if (res.ok) ok += 1
+        else fail += 1
+      } catch {
+        fail += 1
+      }
+    }
+    toast.info('批量探活完成', `正常 ${ok} 个 · 异常 ${fail} 个`)
+    await load()
+  } finally {
+    batchOperating.value = false
+  }
+}
 
 async function loadGroups(): Promise<void> {
   try {
     const response = await groupsApi.list()
-    groups.value = response.items
+    groups.value = response.items ?? []
   } catch (err) {
     toast.error('分组列表加载失败', toMessage(err))
   }
@@ -173,17 +246,20 @@ async function load(): Promise<void> {
       keyword: keyword.value.trim() || undefined,
       group_id: groupFilter.value ? Number(groupFilter.value) : undefined,
     })
-    items.value = response.items
-    total.value = response.total
+    items.value = response.items ?? []
+    total.value = response.total ?? 0
+    const visibleSet = new Set(items.value.map((a) => a.id))
+    selectedIds.value = selectedIds.value.filter((id) => visibleSet.has(id))
     // 若资源包弹窗正开着，顺带同步最新账号引用
     if (packagesAccount.value) {
-      const updated = response.items.find((item) => item.id === packagesAccount.value?.id)
+      const updated = items.value.find((item) => item.id === packagesAccount.value?.id)
       if (updated) packagesAccount.value = updated
     }
   } catch (err) {
     error.value = toMessage(err, '加载账号列表失败')
     items.value = []
     total.value = 0
+    selectedIds.value = []
   } finally {
     loading.value = false
   }
@@ -204,19 +280,22 @@ function replaceAccountInPlace(updated: Account): void {
 }
 
 watch(keyword, () => {
+  if (suppressFilterWatch) return
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(() => {
-    page.value = 1
-    void load()
+    if (page.value !== 1) page.value = 1
+    else void load()
   }, 300)
 })
 
 watch([status, groupFilter], () => {
-  page.value = 1
-  void load()
+  if (suppressFilterWatch) return
+  if (page.value !== 1) page.value = 1
+  else void load()
 })
 
 watch([page, pageSize], () => {
+  if (suppressFilterWatch) return
   void load()
 })
 
@@ -239,11 +318,19 @@ function openEdit(account: Account): void {
 }
 
 function clearFilters(): void {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+  suppressFilterWatch = true
   keyword.value = ''
   status.value = ''
   groupFilter.value = ''
   page.value = 1
-  void load()
+  queueMicrotask(() => {
+    suppressFilterWatch = false
+    void load()
+  })
 }
 
 async function scanLocalAccounts(): Promise<void> {
@@ -592,7 +679,10 @@ const wbOAuthError = ref('')
 
 function openWbOAuthModal(): void {
   wbOAuthError.value = ''
+  wbOAuthProxyUrl.value = ''
+  wbOAuthDomain.value = 'https://www.codebuddy.cn'
   wbOAuthAccountName.value = ''
+  wbOAuthRedirectMode.value = true
   wbOAuthCallbackInput.value = ''
   wbOAuthRefreshToken.value = ''
   wbOAuthUid.value = ''
@@ -633,12 +723,9 @@ async function startWbOAuth(): Promise<void> {
 
 async function copyWbOAuthUrl(): Promise<void> {
   if (!wbOAuthSession.value?.auth_url) return
-  try {
-    await navigator.clipboard.writeText(wbOAuthSession.value.auth_url)
-    toast.success('已复制授权链接', '')
-  } catch {
-    toast.error('复制失败', '请手动复制输入框内的链接')
-  }
+  const ok = await copyText(wbOAuthSession.value.auth_url)
+  if (ok) toast.success('已复制授权链接')
+  else toast.error('复制失败', '请手动复制输入框内的链接')
 }
 
 async function completeWbOAuth(): Promise<void> {
@@ -824,15 +911,46 @@ async function completeWbOAuth(): Promise<void> {
       <Button variant="ghost" size="xs" class="ml-auto" @click="reload">重试</Button>
     </p>
 
+    <!-- 批量选中操作条 -->
+    <div
+      v-if="selectedIds.length > 0"
+      class="flex flex-wrap items-center justify-between gap-2 rounded-panel border border-accent/35 bg-accent/10 px-3.5 py-2 text-xs"
+    >
+      <div class="flex items-center gap-2 text-fg">
+        <Badge tone="accent" dot>已选 {{ selectedIds.length }} 个账号</Badge>
+        <span class="text-2xs text-muted">可一键批量探活或启停选中账号</span>
+      </div>
+      <div class="flex flex-wrap items-center gap-1.5">
+        <Button variant="secondary" size="xs" :loading="batchOperating" @click="runBatchCheck">
+          <template #leading><Icon name="zap" :size="12" /></template>
+          批量探活
+        </Button>
+        <Button variant="secondary" size="xs" :loading="batchOperating" @click="runBatchStatus('active')">
+          <template #leading><Icon name="checkCircle" :size="12" /></template>
+          批量启用
+        </Button>
+        <Button variant="secondary" size="xs" :loading="batchOperating" @click="runBatchStatus('disabled')">
+          <template #leading><Icon name="lock" :size="12" /></template>
+          批量禁用
+        </Button>
+        <Button variant="ghost" size="xs" :disabled="batchOperating" @click="selectedIds = []">
+          取消选择
+        </Button>
+      </div>
+    </div>
+
     <DataTable
-      :columns="9"
+      :columns="10"
       :loading="loading"
       :empty="items.length === 0"
       :skeleton-rows="8"
-      min-width="1560px"
+      min-width="1580px"
       hoverable
     >
       <template #head>
+        <th class="th w-9">
+          <Checkbox :model-value="allVisibleSelected" @update:model-value="toggleSelectAll" />
+        </th>
         <th class="th">账号</th>
         <th class="th">状态 / 健康</th>
         <th class="th">分组</th>
@@ -871,7 +989,17 @@ async function completeWbOAuth(): Promise<void> {
       </template>
 
       <template #body>
-        <tr v-for="account in items" :key="account.id">
+        <tr
+          v-for="account in items"
+          :key="account.id"
+          :class="selectedIds.includes(account.id) ? 'bg-accent/5' : ''"
+        >
+          <td class="td w-9">
+            <Checkbox
+              :model-value="selectedIds.includes(account.id)"
+              @update:model-value="toggleSelectRow(account.id, $event)"
+            />
+          </td>
           <!-- 账号 -->
           <td class="td max-w-[17rem]">
             <div class="flex flex-col gap-0.5">
@@ -950,16 +1078,16 @@ async function completeWbOAuth(): Promise<void> {
 
           <!-- 分组 -->
           <td class="td max-w-[10rem]">
-            <div v-if="account.group_ids.length" class="flex flex-wrap gap-1">
+            <div v-if="(account.group_ids ?? []).length" class="flex flex-wrap gap-1">
               <Badge
-                v-for="groupId in account.group_ids.slice(0, 2)"
+                v-for="groupId in (account.group_ids ?? []).slice(0, 2)"
                 :key="groupId"
                 tone="neutral"
               >
                 {{ groupNameById.get(groupId) ?? `#${groupId}` }}
               </Badge>
-              <Badge v-if="account.group_ids.length > 2" tone="neutral">
-                +{{ account.group_ids.length - 2 }}
+              <Badge v-if="(account.group_ids ?? []).length > 2" tone="neutral">
+                +{{ (account.group_ids ?? []).length - 2 }}
               </Badge>
             </div>
             <span v-else class="text-2xs text-warning">未绑定分组</span>
@@ -1277,14 +1405,16 @@ async function completeWbOAuth(): Promise<void> {
       title="WorkBuddy OAuth 统一授权入池"
       subtitle="创建带独立代理与成对设备指纹的 WorkBuddy OAuth 会话，支持浏览器回调、AccessToken 或 Token JSON 入池"
       size="lg"
-      @close="wbOAuthOpen = false"
+      :persistent="wbOAuthCreating || wbOAuthSubmitting"
+      @update:open="wbOAuthOpen = $event"
     >
       <div class="space-y-4">
         <div
           v-if="wbOAuthError"
-          class="rounded-[var(--radius-md)] border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger"
+          class="flex items-start gap-2 rounded-md border border-danger/35 bg-danger/10 px-3 py-2 text-2xs text-danger"
         >
-          {{ wbOAuthError }}
+          <Icon name="alertCircle" :size="14" class="mt-px shrink-0" />
+          <span>{{ wbOAuthError }}</span>
         </div>
 
         <div class="grid gap-3 md:grid-cols-2">
@@ -1292,6 +1422,7 @@ async function completeWbOAuth(): Promise<void> {
             <Input
               v-model="wbOAuthProxyUrl"
               size="sm"
+              mono
               placeholder="http://user:pass@ip:port 或 socks5://..."
             />
           </Field>
@@ -1306,28 +1437,28 @@ async function completeWbOAuth(): Promise<void> {
 
         <div class="grid gap-3 md:grid-cols-2">
           <Field label="WorkBuddy 站点域名（可选）">
-            <Input v-model="wbOAuthDomain" size="sm" placeholder="https://www.codebuddy.cn" />
+            <Input v-model="wbOAuthDomain" size="sm" mono placeholder="https://www.codebuddy.cn" />
           </Field>
           <div class="flex items-end">
-            <div class="flex w-full items-center justify-between gap-2 rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-subtle)] px-3 py-2 text-xs">
+            <div class="panel-inset flex w-full items-center justify-between gap-2 px-3 py-2 text-xs text-fg">
               <span>自动回传网关回调 (/api/oauth/callback)</span>
-              <Switch v-model="wbOAuthRedirectMode" />
+              <Switch v-model="wbOAuthRedirectMode" size="sm" />
             </div>
           </div>
         </div>
 
-        <div v-if="workbuddyGroups.length > 0">
-          <div class="mb-1.5 text-xs font-medium text-subtle">授权后自动绑定分组</div>
+        <div v-if="workbuddyGroups.length > 0" class="panel-inset space-y-2 p-3">
+          <div class="text-xs font-medium text-fg">授权后自动绑定分组</div>
           <div class="flex flex-wrap gap-2">
             <button
               v-for="g in workbuddyGroups"
               :key="g.id"
               type="button"
-              class="rounded-[var(--radius-md)] border px-2.5 py-1 text-xs transition"
+              class="rounded-md border px-2.5 py-1 text-2xs font-medium transition"
               :class="
                 wbOAuthGroupIds.includes(g.id)
-                  ? 'border-accent bg-accent/10 text-accent'
-                  : 'border-[var(--border-default)] bg-[var(--bg-surface)] text-subtle'
+                  ? 'border-accent bg-accent/12 text-accent'
+                  : 'border-line bg-surface text-muted hover:text-fg'
               "
               @click="toggleWbOAuthGroup(g.id)"
             >
@@ -1345,17 +1476,28 @@ async function completeWbOAuth(): Promise<void> {
 
         <div
           v-if="wbOAuthSession"
-          class="space-y-3 rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-subtle)] p-3"
+          class="panel-inset space-y-3 p-3.5"
         >
           <div class="flex items-center justify-between gap-2">
             <div class="text-xs font-medium text-fg">
-              会话 ID：<span class="font-mono">{{ wbOAuthSession.session_id }}</span>
+              会话 ID：<span class="font-mono text-muted">{{ wbOAuthSession.session_id }}</span>
             </div>
-            <Badge variant="info">{{ wbOAuthSession.status }}</Badge>
+            <Badge
+              :tone="
+                wbOAuthSession.status === 'completed'
+                  ? 'success'
+                  : wbOAuthSession.status === 'failed'
+                    ? 'danger'
+                    : 'info'
+              "
+              dot
+            >
+              {{ wbOAuthSession.status }}
+            </Badge>
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
-            <Input :model-value="wbOAuthSession.auth_url" size="sm" readonly class="flex-1 font-mono text-xs" />
+            <Input :model-value="wbOAuthSession.auth_url" size="sm" readonly mono class="flex-1 text-xs" />
             <Button variant="secondary" size="sm" @click="copyWbOAuthUrl">
               <template #leading><Icon name="copy" :size="12" /></template>
               复制
@@ -1364,7 +1506,7 @@ async function completeWbOAuth(): Promise<void> {
               :href="wbOAuthSession.auth_url"
               target="_blank"
               rel="noopener noreferrer"
-              class="inline-flex h-8 items-center gap-1 rounded-[var(--radius-md)] bg-accent px-3 text-xs font-medium text-white hover:opacity-90"
+              class="inline-flex h-8 items-center gap-1.5 rounded-md bg-accent px-3 text-xs font-medium text-accent-fg shadow-panel transition hover:bg-accent/90"
             >
               <Icon name="external" :size="12" />
               打开登录页
@@ -1392,7 +1534,7 @@ async function completeWbOAuth(): Promise<void> {
       </div>
 
       <template #footer>
-        <Button variant="secondary" size="sm" @click="wbOAuthOpen = false">取消</Button>
+        <Button variant="ghost" size="sm" :disabled="wbOAuthSubmitting" @click="wbOAuthOpen = false">取消</Button>
         <Button
           variant="primary"
           size="sm"

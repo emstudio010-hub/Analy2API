@@ -67,6 +67,9 @@ const poolAllocating = ref(false)
 const poolBatchText = ref('')
 const poolBatchTag = ref('')
 const poolFetchFeedback = ref('')
+const poolKeyword = ref('')
+const poolTagFilter = ref('all')
+const togglingEntryId = ref<string | null>(null)
 
 const poolStats = ref<ProxyPoolStats>({
   total_entries: 0,
@@ -224,7 +227,7 @@ const pushCurlSnippet = computed(() => {
   const pushUrl = effectivePushUrl.value
   const pushProxyUrl = effectivePushProxyUrl.value
   const k = demoKeyText.value
-  return `# 1. 自动走 IP 池轮询分配代理（不传 proxy_url，自动按轮询/最少占用/池空远程拉取分配）
+  return `# 1. 自动走 IP 池轮询分配代理（支持 AGY 全格式自动转换：ADC / Gemini CLI / CPA / email----refresh_token）
 curl -sS -X POST "${pushUrl}" \\
   -H "X-Push-Key: ${k}" \\
   -H "Content-Type: application/json" \\
@@ -236,7 +239,18 @@ curl -sS -X POST "${pushUrl}" \\
     "group_name": "antigravity"
   }'
 
-# 2. 推号时直接传 IP 或批量 proxy_list（支持 ip:port / ip:port:user:pass / socks5://...）
+# 2. 批量推送任意混合格式 AGY 账号（raw_text 自动嗅探 ADC / CSV / JSONL / email----1//... 并生成 agy CLI 原生凭证）
+curl -sS -X POST "${pushUrl}" \\
+  -H "X-Push-Key: ${k}" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "platform": "antigravity",
+    "raw_text": "dev1@gmail.com----1//0g_token_1\\ndev2@gmail.com----1//0g_token_2",
+    "proxy_mode": "pool",
+    "group_name": "antigravity"
+  }'
+
+# 3. 推号时直接传 IP 或批量 proxy_list（支持 ip:port / ip:port:user:pass / socks5://...）
 curl -sS -X POST "${pushUrl}" \\
   -H "X-Push-Key: ${k}" \\
   -H "Content-Type: application/json" \\
@@ -249,7 +263,7 @@ curl -sS -X POST "${pushUrl}" \\
     ]
   }'
 
-# 3. 用补号 Key 自助调整自身默认代理 IP（或传 account_id 给已有账号换 IP / 轮换池内新 IP）
+# 4. 用补号 Key 自助调整自身默认代理 IP（或传 account_id 给已有账号换 IP / 轮换池内新 IP）
 curl -sS -X PUT "${pushProxyUrl}" \\
   -H "X-Push-Key: ${k}" \\
   -H "Content-Type: application/json" \\
@@ -456,9 +470,54 @@ async function importBatchProxies(): Promise<void> {
   }
 }
 
+const filteredPoolEntries = computed(() => {
+  const q = poolKeyword.value.trim().toLowerCase()
+  return poolConfig.entries.filter((e) => {
+    if (poolTagFilter.value === '__ok' && e.last_check_ok !== true) return false
+    if (poolTagFilter.value === '__fail' && e.last_check_ok !== false) return false
+    if (
+      poolTagFilter.value !== 'all' &&
+      poolTagFilter.value !== '__ok' &&
+      poolTagFilter.value !== '__fail' &&
+      (e.tag || '') !== poolTagFilter.value
+    ) {
+      return false
+    }
+    if (!q) return true
+    return (
+      (e.masked_url || e.url || '').toLowerCase().includes(q) ||
+      (e.tag || '').toLowerCase().includes(q) ||
+      (e.last_exit_ip || '').toLowerCase().includes(q)
+    )
+  })
+})
+
 async function toggleEntryEnabled(entry: ProxyPoolEntry): Promise<void> {
-  entry.enabled = !entry.enabled
-  await saveProxyPool()
+  if (togglingEntryId.value !== null || poolSaving.value) return
+  const prev = entry.enabled
+  entry.enabled = !prev
+  togglingEntryId.value = entry.id
+  try {
+    const view = await updateProxyPool({
+      enabled: poolConfig.enabled,
+      strategy: poolConfig.strategy,
+      max_accounts_per_ip: Math.max(0, Number(poolConfig.max_accounts_per_ip) || 0),
+      apply_platforms: [...(poolConfig.apply_platforms ?? [])],
+      entries: poolConfig.entries.map((e) => ({ ...e })),
+      fetch: {
+        ...poolConfig.fetch,
+        interval_minutes: Math.max(0, Number(poolConfig.fetch.interval_minutes) || 0),
+        timeout_seconds: Math.max(3, Math.min(60, Number(poolConfig.fetch.timeout_seconds) || 15)),
+      },
+      cursor: poolConfig.cursor,
+    })
+    applyPoolView(view)
+  } catch (err) {
+    entry.enabled = prev
+    toast.error('切换代理状态失败', toMessage(err))
+  } finally {
+    togglingEntryId.value = null
+  }
 }
 
 async function removeEntry(entry: ProxyPoolEntry): Promise<void> {
@@ -598,13 +657,25 @@ function openEdit(item: AdminKey): void {
   formOpen.value = true
 }
 
+function isValidIpOrCidr(entry: string): boolean {
+  const [ipPart, cidrPart, extra] = entry.split('/')
+  if (!ipPart || extra !== undefined) return false
+  const isV4 = /^(\d{1,3}\.){3}\d{1,3}$/.test(ipPart) && ipPart.split('.').every((n) => Number(n) <= 255)
+  const isV6 = ipPart.includes(':') && /^[0-9a-fA-F:]{2,39}$/.test(ipPart)
+  if (!isV4 && !isV6) return false
+  if (cidrPart === undefined) return true
+  if (!/^\d{1,3}$/.test(cidrPart)) return false
+  const prefix = Number(cidrPart)
+  return isV4 ? prefix >= 0 && prefix <= 32 : prefix >= 0 && prefix <= 128
+}
+
 async function submitForm(): Promise<void> {
   if (!form.name.trim()) {
     formError.value = '请输入管理密钥名称'
     return
   }
   const ips = splitAllowedIps(form.allowed_ips)
-  const invalidIp = ips.find((entry) => !/^[0-9a-fA-F:.]{3,45}(\/\d{1,3})?$/.test(entry))
+  const invalidIp = ips.find((entry) => !isValidIpOrCidr(entry))
   if (invalidIp) {
     formError.value = `IP 或 CIDR 格式不合法：${invalidIp}`
     return
@@ -1031,11 +1102,74 @@ onMounted(() => {
         </div>
       </div>
 
+      <!-- 代理池筛选条 -->
+      <div
+        v-if="poolConfig.entries.length > 0"
+        class="flex flex-wrap items-center justify-between gap-2 pt-1"
+      >
+        <div class="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            class="rounded-md border px-2 py-0.5 text-2xs font-medium transition"
+            :class="
+              poolTagFilter === 'all'
+                ? 'border-accent bg-accent/12 text-accent'
+                : 'border-line bg-raised text-subtle hover:text-fg'
+            "
+            @click="poolTagFilter = 'all'"
+          >
+            全部 ({{ poolConfig.entries.length }})
+          </button>
+          <button
+            type="button"
+            class="rounded-md border px-2 py-0.5 text-2xs font-medium transition"
+            :class="
+              poolTagFilter === '__ok'
+                ? 'border-success bg-success/12 text-success'
+                : 'border-line bg-raised text-subtle hover:text-fg'
+            "
+            @click="poolTagFilter = '__ok'"
+          >
+            探测可用 ({{ poolConfig.entries.filter((e) => e.last_check_ok === true).length }})
+          </button>
+          <button
+            type="button"
+            class="rounded-md border px-2 py-0.5 text-2xs font-medium transition"
+            :class="
+              poolTagFilter === '__fail'
+                ? 'border-danger bg-danger/12 text-danger'
+                : 'border-line bg-raised text-subtle hover:text-fg'
+            "
+            @click="poolTagFilter = '__fail'"
+          >
+            探测异常 ({{ poolConfig.entries.filter((e) => e.last_check_ok === false).length }})
+          </button>
+          <button
+            v-for="tag in poolStats.tags ?? []"
+            :key="tag"
+            type="button"
+            class="rounded-md border px-2 py-0.5 font-mono text-2xs font-medium transition"
+            :class="
+              poolTagFilter === tag
+                ? 'border-accent bg-accent/12 text-accent'
+                : 'border-line bg-raised text-subtle hover:text-fg'
+            "
+            @click="poolTagFilter = tag"
+          >
+            #{{ tag }}
+          </button>
+        </div>
+
+        <div class="w-56">
+          <Input v-model="poolKeyword" size="sm" placeholder="搜索代理 IP / 出口 / 标签…" />
+        </div>
+      </div>
+
       <!-- 代理池条目明细表 -->
       <DataTable
         :columns="7"
         :loading="poolLoading"
-        :empty="poolConfig.entries.length === 0"
+        :empty="filteredPoolEntries.length === 0"
         min-width="920px"
         hoverable
       >
@@ -1052,15 +1186,34 @@ onMounted(() => {
         <template #empty>
           <EmptyState
             icon="globe"
-            title="代理 IP 池为空"
-            description="在上方手动粘贴代理列表，或填写远程代理商提取 API 点击「立即拉取 IP」即可建立可自动轮询的出口 IP 池。"
+            :title="poolConfig.entries.length > 0 ? '没有匹配的代理条目' : '代理 IP 池为空'"
+            :description="
+              poolConfig.entries.length > 0
+                ? '可清空上方标签或搜索词查看全部代理条目。'
+                : '在上方手动粘贴代理列表，或填写远程代理商提取 API 点击「立即拉取 IP」即可建立可自动轮询的出口 IP 池。'
+            "
           />
         </template>
 
         <template #body>
-          <tr v-for="entry in poolConfig.entries" :key="entry.id">
-            <td class="td">
-              <code class="font-mono text-2xs text-fg">{{ entry.masked_url || entry.url }}</code>
+          <tr v-for="entry in filteredPoolEntries" :key="entry.id">
+            <td class="td max-w-[18rem]">
+              <div class="flex items-center gap-1.5">
+                <code
+                  class="block max-w-[15rem] truncate font-mono text-2xs text-fg"
+                  :title="entry.masked_url || entry.url"
+                >
+                  {{ entry.masked_url || entry.url }}
+                </code>
+                <button
+                  type="button"
+                  class="shrink-0 rounded p-0.5 text-subtle transition hover:text-fg"
+                  title="复制脱敏代理地址"
+                  @click="copyEndpoint(entry.masked_url || entry.url, '代理地址')"
+                >
+                  <Icon name="copy" :size="12" />
+                </button>
+              </div>
             </td>
             <td class="td">
               <div class="flex flex-wrap items-center gap-1">
@@ -1092,6 +1245,7 @@ onMounted(() => {
               <Switch
                 size="sm"
                 :model-value="entry.enabled"
+                :disabled="togglingEntryId === entry.id || poolSaving"
                 @update:model-value="toggleEntryEnabled(entry)"
               />
             </td>
@@ -1206,7 +1360,12 @@ onMounted(() => {
           </td>
 
           <td class="td max-w-[16rem]">
-            <Badge :tone="keyPolicySummary(item.proxy_policy).tone" mono>
+            <Badge
+              :tone="keyPolicySummary(item.proxy_policy).tone"
+              mono
+              class="max-w-[14rem] truncate"
+              :title="keyPolicySummary(item.proxy_policy).label"
+            >
               {{ keyPolicySummary(item.proxy_policy).label }}
             </Badge>
           </td>
@@ -1284,6 +1443,7 @@ onMounted(() => {
     <Modal
       :open="formOpen"
       size="lg"
+      :persistent="saving"
       :title="editing ? `编辑密钥与代理策略 · ${editing.name}` : '签发远程补号 / 管理密钥'"
       subtitle="支持为每把密钥独立指定固定代理 IP、IP 池标签子池、实时拉取源或是否允许请求体覆盖代理"
       @update:open="formOpen = $event"

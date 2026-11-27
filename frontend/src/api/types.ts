@@ -1690,3 +1690,159 @@ export interface SessionGuardResponse {
   paused_count: number
   log_files_count: number
 }
+
+// === Antigravity Format Adapter & Prompt Mode ===
+
+export type AgyAccountSourceFormat =
+  | 'agy_native'
+  | 'gcloud_adc'
+  | 'gemini_cli'
+  | 'cpa_export'
+  | 'json_array'
+  | 'ndjson'
+  | 'csv_tsv'
+  | 'delimited_text'
+  | 'base64_blob'
+  | 'zip_archive'
+  | string
+
+export interface ConvertedAGYAccount {
+  index: number
+  source_format: AgyAccountSourceFormat
+  inner_format?: AgyAccountSourceFormat
+  source_file?: string
+  email: string
+  name: string
+  client_id?: string
+  has_client_secret?: boolean
+  project_id?: string
+  masked_refresh_token?: string
+  masked_access_token?: string
+  has_refresh_token?: boolean
+  has_access_token?: boolean
+  expires_at?: string
+  expiry_date_ms?: number
+  expired?: boolean
+  proxy?: string
+  valid: boolean
+  duplicate?: boolean
+  error?: string
+  warnings?: string[]
+  auth_filename?: string
+  agy_cli_files?: Record<string, string>
+}
+
+export interface AntigravityConvertSummary {
+  total: number
+  valid_count: number
+  invalid_count: number
+  duplicate_count: number
+  detected_formats?: string[]
+}
+
+export interface AntigravityConvertImportResult {
+  imported: number
+  created: number
+  updated: number
+  failed: number
+  node_id?: number
+  group_ids?: number[]
+  accounts?: Account[]
+  errors?: string[]
+}
+
+export interface AntigravityConvertAccountsPayload {
+  raw_text?: string
+  filename?: string
+  files?: Array<{ filename: string; content: string }>
+  auto_import?: boolean
+  node_id?: number
+  group_ids?: number[]
+  proxy_url?: string
+  auto_provision?: boolean
+  deduplicate?: boolean
+}
+
+export interface AntigravityConvertAccountsResponse {
+  ok: boolean
+  total: number
+  valid_count: number
+  invalid_count: number
+  duplicate_count: number
+  detected_formats?: string[]
+  summary?: AntigravityConvertSummary
+  accounts: ConvertedAGYAccount[]
+  items?: ConvertedAGYAccount[]
+  bundle_filename?: string
+  bundle_zip_base64?: string
+  bundle_json?: Record<string, unknown> | string
+  import_result?: AntigravityConvertImportResult | null
+}
+
+export type AgyPromptMode =
+  | 'default_intercept_continue'
+  | 'blend_sanitized'
+  | 'native_only'
+  | 'downstream_only'
+  | string
+
+export interface AgyPromptStageMeta {
+  step?: number
+  id?: string
+  key?: string
+  title: string
+  summary?: string
+  description?: string
+  content?: string
+}
+
+export interface AgyPromptModeOption {
+  mode: AgyPromptMode
+  name?: string
+  label?: string
+  description: string
+  recommended?: boolean
+  aliases?: string[]
+  stages?: Array<string | AgyPromptStageMeta>
+}
+
+export interface AgyInterceptContinuePreview {
+  ok?: boolean
+  mode: AgyPromptMode
+  has_tools?: boolean
+  tool_tag?: string
+  original_downstream?: string
+  sanitized_downstream?: string
+  inbound_intercept_hits?: string[]
+  native_stage?: string
+  intercept_stage?: string
+  continue_stage?: string
+  gemini_md?: string
+  final_prompt?: string
+  outbound_filter_rules?: string[]
+  stages?: AgyPromptStageMeta[]
+}
+
+export interface AgyPromptModesResponse {
+  ok?: boolean
+  active_mode: AgyPromptMode
+  default_mode: AgyPromptMode
+  runtime_override?: string
+  env_override?: string
+  modes: AgyPromptModeOption[]
+  pipeline_stages?: AgyPromptStageMeta[]
+  preview?: AgyInterceptContinuePreview
+}
+
+export interface UpdateAgyPromptModePayload {
+  mode: AgyPromptMode
+  downstream_system?: string
+  has_tools?: boolean
+}
+
+export interface PreviewAgyPromptModePayload {
+  mode?: AgyPromptMode
+  downstream_system: string
+  user_message?: string
+  has_tools?: boolean
+}

@@ -32,6 +32,7 @@ import StatusPill from '@/components/ui/StatusPill.vue'
 import Switch from '@/components/ui/Switch.vue'
 import Textarea from '@/components/ui/Textarea.vue'
 import { useToastStore } from '@/stores/toast'
+import { copyText } from '@/utils/clipboard'
 import {
   formatDate,
   formatDateTime,
@@ -143,11 +144,12 @@ const poolStats = computed(() => {
 })
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let suppressFilterWatch = false
 
 async function loadGroups(): Promise<void> {
   try {
     const res = await groupsApi.list()
-    groups.value = res.items
+    groups.value = res.items ?? []
   } catch (err) {
     toast.error('分组加载失败', toMessage(err))
   }
@@ -165,8 +167,8 @@ async function load(): Promise<void> {
       keyword: keyword.value.trim() || undefined,
       group_id: groupFilter.value ? Number(groupFilter.value) : undefined,
     })
-    items.value = res.items
-    total.value = res.total
+    items.value = res.items ?? []
+    total.value = res.total ?? 0
   } catch (err) {
     error.value = toMessage(err, '加载 Command Code 账号池失败')
     items.value = []
@@ -177,19 +179,22 @@ async function load(): Promise<void> {
 }
 
 watch(keyword, () => {
+  if (suppressFilterWatch) return
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(() => {
-    page.value = 1
-    void load()
+    if (page.value !== 1) page.value = 1
+    else void load()
   }, 300)
 })
 
 watch([status, groupFilter], () => {
-  page.value = 1
-  void load()
+  if (suppressFilterWatch) return
+  if (page.value !== 1) page.value = 1
+  else void load()
 })
 
 watch([page, pageSize], () => {
+  if (suppressFilterWatch) return
   void load()
 })
 
@@ -202,11 +207,19 @@ onBeforeUnmount(() => {
 })
 
 function clearFilters(): void {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+  suppressFilterWatch = true
   keyword.value = ''
   status.value = ''
   groupFilter.value = ''
   page.value = 1
-  void load()
+  queueMicrotask(() => {
+    suppressFilterWatch = false
+    void load()
+  })
 }
 
 function replaceAccountInPlace(updated: Account): void {
@@ -371,7 +384,8 @@ async function confirmDelete(): Promise<void> {
     await accountsApi.remove(deleteTarget.value.id)
     toast.success('账号已删除', deleteTarget.value.name)
     deleteTarget.value = null
-    await load()
+    if (items.value.length === 1 && page.value > 1) page.value -= 1
+    else await load()
   } catch (err) {
     toast.error('删除失败', toMessage(err))
   } finally {
@@ -409,7 +423,7 @@ function openEdit(acc: Account): void {
   formStatus.value = acc.status || 'active'
   formSchedulable.value = acc.schedulable ?? true
   formNotes.value = acc.notes || ''
-  formGroupIds.value = [...acc.group_ids]
+  formGroupIds.value = [...(acc.group_ids ?? [])]
   formError.value = ''
   formOpen.value = true
 }
@@ -556,7 +570,9 @@ const oauthError = ref('')
 
 function openOAuthModal(): void {
   oauthError.value = ''
+  oauthProxyUrl.value = ''
   oauthAccountName.value = ''
+  oauthRedirectMode.value = true
   oauthCallbackInput.value = ''
   oauthSession.value = null
   oauthGroupIds.value = ccGroups.value.slice(0, 1).map((g) => g.id)
@@ -595,12 +611,9 @@ async function startCcOAuth(): Promise<void> {
 
 async function copyOAuthUrl(): Promise<void> {
   if (!oauthSession.value?.auth_url) return
-  try {
-    await navigator.clipboard.writeText(oauthSession.value.auth_url)
-    toast.success('已复制授权链接', '')
-  } catch {
-    toast.error('复制失败', '请手动复制输入框内的链接')
-  }
+  const ok = await copyText(oauthSession.value.auth_url)
+  if (ok) toast.success('已复制授权链接')
+  else toast.error('复制失败', '请手动复制输入框内的链接')
 }
 
 async function completeCcOAuth(): Promise<void> {
@@ -807,8 +820,8 @@ async function completeCcOAuth(): Promise<void> {
 
           <!-- 3. 分组 -->
           <td class="td max-w-[9rem]">
-            <div v-if="acc.group_ids.length" class="flex flex-wrap gap-1">
-              <Badge v-for="gid in acc.group_ids" :key="gid" tone="neutral">
+            <div v-if="(acc.group_ids ?? []).length" class="flex flex-wrap gap-1">
+              <Badge v-for="gid in acc.group_ids ?? []" :key="gid" tone="neutral">
                 {{ groupNameById.get(gid) ?? `#${gid}` }}
               </Badge>
             </div>
@@ -971,7 +984,8 @@ async function completeCcOAuth(): Promise<void> {
                 :disabled="togglingId !== null"
                 @click="toggleStatus(acc)"
               >
-                <Icon :name="acc.status === 'active' ? 'lock' : 'checkCircle'" :size="13" />
+                <Spinner v-if="togglingId === acc.id" :size="11" />
+                <Icon v-else :name="acc.status === 'active' ? 'lock' : 'checkCircle'" :size="13" />
               </Button>
 
               <Button variant="ghost" size="xs" icon title="编辑账号" @click="openEdit(acc)">
@@ -1208,14 +1222,16 @@ async function completeCcOAuth(): Promise<void> {
       title="Command Code Studio OAuth 统一授权入池"
       subtitle="创建带固定出口代理的 OAuth 会话，自动完成 Whoami 校验、Token 加密与账号池同步"
       size="lg"
-      @close="oauthOpen = false"
+      :persistent="oauthCreating || oauthSubmitting"
+      @update:open="oauthOpen = $event"
     >
       <div class="space-y-4">
         <div
           v-if="oauthError"
-          class="rounded-[var(--radius-md)] border border-[var(--danger)]/40 bg-[var(--danger-subtle)] px-3 py-2 text-xs text-[var(--danger)]"
+          class="flex items-start gap-2 rounded-md border border-danger/35 bg-danger/10 px-3 py-2 text-2xs text-danger"
         >
-          {{ oauthError }}
+          <Icon name="alertCircle" :size="14" class="mt-px shrink-0" />
+          <span>{{ oauthError }}</span>
         </div>
 
         <div class="grid gap-3 md:grid-cols-2">
@@ -1223,6 +1239,7 @@ async function completeCcOAuth(): Promise<void> {
             <Input
               v-model="oauthProxyUrl"
               size="sm"
+              mono
               placeholder="http://user:pass@ip:port 或 socks5://..."
             />
           </Field>
@@ -1235,23 +1252,23 @@ async function completeCcOAuth(): Promise<void> {
           </Field>
         </div>
 
-        <div class="flex flex-wrap items-center justify-between gap-2 rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-subtle)] px-3 py-2 text-xs">
+        <div class="panel-inset flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-xs text-fg">
           <span>自动绑定网关回调路由 (/api/oauth/callback)</span>
-          <Switch v-model="oauthRedirectMode" />
+          <Switch v-model="oauthRedirectMode" size="sm" />
         </div>
 
-        <div v-if="ccGroups.length > 0">
-          <div class="mb-1.5 text-xs font-medium text-[var(--text-secondary)]">授权后自动绑定分组</div>
+        <div v-if="ccGroups.length > 0" class="panel-inset space-y-2 p-3">
+          <div class="text-xs font-medium text-fg">授权后自动绑定分组</div>
           <div class="flex flex-wrap gap-2">
             <button
               v-for="g in ccGroups"
               :key="g.id"
               type="button"
-              class="rounded-[var(--radius-md)] border px-2.5 py-1 text-xs transition"
+              class="rounded-md border px-2.5 py-1 text-2xs font-medium transition"
               :class="
                 oauthGroupIds.includes(g.id)
-                  ? 'border-[var(--accent)] bg-[var(--accent-subtle)] text-[var(--accent)]'
-                  : 'border-[var(--border-default)] bg-[var(--bg-surface)] text-[var(--text-secondary)]'
+                  ? 'border-accent bg-accent/12 text-accent'
+                  : 'border-line bg-surface text-muted hover:text-fg'
               "
               @click="toggleOAuthGroup(g.id)"
             >
@@ -1269,17 +1286,28 @@ async function completeCcOAuth(): Promise<void> {
 
         <div
           v-if="oauthSession"
-          class="space-y-3 rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-subtle)] p-3"
+          class="panel-inset space-y-3 p-3.5"
         >
           <div class="flex items-center justify-between gap-2">
-            <div class="text-xs font-medium text-[var(--text-primary)]">
-              会话 ID：<span class="font-mono">{{ oauthSession.session_id }}</span>
+            <div class="text-xs font-medium text-fg">
+              会话 ID：<span class="font-mono text-muted">{{ oauthSession.session_id }}</span>
             </div>
-            <Badge variant="info">{{ oauthSession.status }}</Badge>
+            <Badge
+              :tone="
+                oauthSession.status === 'completed'
+                  ? 'success'
+                  : oauthSession.status === 'failed'
+                    ? 'danger'
+                    : 'info'
+              "
+              dot
+            >
+              {{ oauthSession.status }}
+            </Badge>
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
-            <Input :model-value="oauthSession.auth_url" size="sm" readonly class="flex-1 font-mono text-xs" />
+            <Input :model-value="oauthSession.auth_url" size="sm" readonly mono class="flex-1 text-xs" />
             <Button variant="secondary" size="sm" @click="copyOAuthUrl">
               <template #leading><Icon name="copy" :size="12" /></template>
               复制
@@ -1288,7 +1316,7 @@ async function completeCcOAuth(): Promise<void> {
               :href="oauthSession.auth_url"
               target="_blank"
               rel="noopener noreferrer"
-              class="inline-flex h-8 items-center gap-1 rounded-[var(--radius-md)] bg-[var(--accent)] px-3 text-xs font-medium text-white hover:opacity-90"
+              class="inline-flex h-8 items-center gap-1.5 rounded-md bg-accent px-3 text-xs font-medium text-accent-fg shadow-panel transition hover:bg-accent/90"
             >
               <Icon name="external" :size="12" />
               打开 Studio 登录
@@ -1299,6 +1327,7 @@ async function completeCcOAuth(): Promise<void> {
             <Input
               v-model="oauthCallbackInput"
               size="sm"
+              mono
               placeholder="http://localhost:.../callback?token=user_xxx&state=... 或 user_xxx"
             />
           </Field>
@@ -1306,7 +1335,7 @@ async function completeCcOAuth(): Promise<void> {
       </div>
 
       <template #footer>
-        <Button variant="secondary" size="sm" @click="oauthOpen = false">取消</Button>
+        <Button variant="ghost" size="sm" :disabled="oauthSubmitting" @click="oauthOpen = false">取消</Button>
         <Button
           variant="primary"
           size="sm"

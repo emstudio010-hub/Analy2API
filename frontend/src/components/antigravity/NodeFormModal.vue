@@ -154,13 +154,21 @@ async function submit(): Promise<void> {
   submitting.value = true
   serverError.value = ''
   try {
+    const trimmedProxy = proxyUrl.value.trim()
     const payload: ContainerNodePayload = {
       name: name.value.trim(),
       mode: mode.value,
       host_ip: hostIp.value.trim(),
       host_port: Number(hostPort.value),
-      proxy_url: proxyUrl.value.trim(),
       strict_isolation: strictIsolation.value,
+    }
+    if (
+      !isEdit.value ||
+      !props.node ||
+      trimmedProxy !== (props.node.proxy_url || '').trim() ||
+      !trimmedProxy.includes('***')
+    ) {
+      payload.proxy_url = trimmedProxy
     }
 
     if (mode.value === 'local_docker') {

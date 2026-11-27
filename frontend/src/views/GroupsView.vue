@@ -16,6 +16,7 @@ import Input from '@/components/ui/Input.vue'
 import PlatformBadge from '@/components/ui/PlatformBadge.vue'
 import SegmentedTabs from '@/components/ui/SegmentedTabs.vue'
 import StatusPill from '@/components/ui/StatusPill.vue'
+import Switch from '@/components/ui/Switch.vue'
 import { useToastStore } from '@/stores/toast'
 import { formatDateTime, formatNumber } from '@/utils/format'
 import { ALL_PLATFORMS, normalizePlatform, platformMeta } from '@/utils/platforms'
@@ -33,6 +34,7 @@ const formOpen = ref(false)
 const editing = ref<Group | null>(null)
 const deleteTarget = ref<Group | null>(null)
 const deleting = ref(false)
+const togglingId = ref<number | null>(null)
 
 const platformTabs = computed(() => [
   { value: 'all', label: '全部平台', badge: items.value.length },
@@ -68,6 +70,51 @@ function injectModeBadge(group: Group): {
       return { tone: 'neutral', label: '关闭注入' }
     default:
       return { tone: 'accent', label: '叠加全局' }
+  }
+}
+
+function toolObfBadge(group: Group): {
+  tone: 'accent' | 'info' | 'success' | 'neutral'
+  label: string
+} | null {
+  if (!group.tool_obf_mode || group.tool_obf_mode === 'inherit') {
+    return group.tool_obf_effective_on ? { tone: 'info', label: '混淆·跟随' } : null
+  }
+  if (group.tool_obf_mode === 'off') {
+    return { tone: 'neutral', label: '混淆·关闭' }
+  }
+  return { tone: 'success', label: `混淆·${group.tool_obf_mode}` }
+}
+
+async function toggleGroupStatus(group: Group): Promise<void> {
+  if (togglingId.value !== null) return
+  togglingId.value = group.id
+  const next = group.status === 'active' ? 'disabled' : 'active'
+  try {
+    const updated = await groupsApi.update(group.id, {
+      name: group.name,
+      description: group.description,
+      platform: group.platform,
+      rate_multiplier: group.rate_multiplier,
+      status: next,
+      prompt_inject_mode: group.prompt_inject_mode,
+      system_prompt: group.system_prompt,
+      prompt_template_id: group.prompt_template_id ?? null,
+      tool_obf_mode: group.tool_obf_mode,
+      tool_obf_prefix: group.tool_obf_prefix,
+      tool_obf_scope: group.tool_obf_scope,
+      tool_obf_custom_map: group.tool_obf_custom_map,
+      tool_obf_exclude_tools: group.tool_obf_exclude_tools,
+      tool_obf_rewrite_refs: group.tool_obf_rewrite_refs ?? undefined,
+    })
+    const idx = items.value.findIndex((g) => g.id === group.id)
+    if (idx >= 0) items.value[idx] = updated
+    else await load()
+    toast.success(next === 'active' ? '分组已启用' : '分组已停用', group.name)
+  } catch (err) {
+    toast.error('切换分组状态失败', toMessage(err))
+  } finally {
+    togglingId.value = null
   }
 }
 
@@ -222,7 +269,7 @@ async function confirmDelete(): Promise<void> {
           </td>
 
           <td class="td">
-            <div class="flex items-center gap-1.5">
+            <div class="flex flex-wrap items-center gap-1.5">
               <Badge :tone="injectModeBadge(group).tone" dot>
                 {{ injectModeBadge(group).label }}
               </Badge>
@@ -241,6 +288,14 @@ async function confirmDelete(): Promise<void> {
               >
                 TPL#{{ group.prompt_template_id }}
               </Badge>
+              <Badge
+                v-if="toolObfBadge(group)"
+                :tone="toolObfBadge(group)!.tone"
+                mono
+                title="工具名双射混淆策略"
+              >
+                {{ toolObfBadge(group)!.label }}
+              </Badge>
             </div>
           </td>
 
@@ -253,7 +308,15 @@ async function confirmDelete(): Promise<void> {
           <td class="td tnum text-right font-mono text-fg">{{ group.rate_multiplier }}x</td>
 
           <td class="td">
-            <StatusPill :status="group.status" />
+            <div class="flex items-center gap-2">
+              <Switch
+                size="sm"
+                :model-value="group.status === 'active'"
+                :disabled="togglingId === group.id"
+                @update:model-value="toggleGroupStatus(group)"
+              />
+              <StatusPill :status="group.status" />
+            </div>
           </td>
 
           <td class="td text-right">

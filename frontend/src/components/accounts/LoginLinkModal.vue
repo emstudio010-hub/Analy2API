@@ -32,11 +32,24 @@ const copiedCode = ref(false)
 const copiedUrl = ref(false)
 
 let timer: ReturnType<typeof setInterval> | null = null
+let copyCodeTimer: ReturnType<typeof setTimeout> | null = null
+let copyUrlTimer: ReturnType<typeof setTimeout> | null = null
 
 function stopTimer(): void {
   if (timer !== null) {
     clearInterval(timer)
     timer = null
+  }
+}
+
+function clearCopyTimers(): void {
+  if (copyCodeTimer !== null) {
+    clearTimeout(copyCodeTimer)
+    copyCodeTimer = null
+  }
+  if (copyUrlTimer !== null) {
+    clearTimeout(copyUrlTimer)
+    copyUrlTimer = null
   }
 }
 
@@ -55,10 +68,22 @@ function startCountdown(seconds: number): void {
 }
 
 watch(
+  () => props.account?.id,
+  () => {
+    targetPath.value = ''
+    copiedCode.value = false
+    copiedUrl.value = false
+  },
+)
+
+watch(
   () => [props.open, props.result] as const,
   ([isOpen, res]) => {
     if (!isOpen) {
       stopTimer()
+      clearCopyTimers()
+      copiedCode.value = false
+      copiedUrl.value = false
       return
     }
     if (res) {
@@ -71,7 +96,10 @@ watch(
   { immediate: true },
 )
 
-onBeforeUnmount(stopTimer)
+onBeforeUnmount(() => {
+  stopTimer()
+  clearCopyTimers()
+})
 
 const expired = computed(() => Boolean(props.result) && remaining.value <= 0)
 const totalDuration = computed(() => Math.max(props.result?.expires_in || 300, 1))
@@ -97,7 +125,8 @@ async function copyCode(): Promise<void> {
   const ok = await copyText(props.result.device_code)
   if (ok) {
     copiedCode.value = true
-    setTimeout(() => {
+    if (copyCodeTimer) clearTimeout(copyCodeTimer)
+    copyCodeTimer = setTimeout(() => {
       copiedCode.value = false
     }, 1500)
     toast.success('已复制授权码')
@@ -111,7 +140,8 @@ async function copyUrl(): Promise<void> {
   const ok = await copyText(props.result.login_url)
   if (ok) {
     copiedUrl.value = true
-    setTimeout(() => {
+    if (copyUrlTimer) clearTimeout(copyUrlTimer)
+    copyUrlTimer = setTimeout(() => {
       copiedUrl.value = false
     }, 1500)
     toast.success('已复制免密登录链接')
