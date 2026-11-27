@@ -160,7 +160,7 @@ watch(
     upsert.value = true
     concurrency.value = '3'
     priority.value = '50'
-    groupIds.value = []
+    groupIds.value = workbuddyGroups.value[0] ? [workbuddyGroups.value[0].id] : []
     serverError.value = ''
     result.value = null
   },
@@ -252,6 +252,7 @@ function close(): void {
     title="批量导入 WorkBuddy 账号"
     subtitle="支持直接粘贴 ~/.agent-switch/accounts.json、~/.workbuddy-sdk/accounts.json、workbuddy-desktop.info 或多行凭证"
     size="lg"
+    :persistent="submitting"
     @update:open="emit('update:open', $event)"
   >
     <div class="space-y-4">
@@ -289,7 +290,7 @@ function close(): void {
         </div>
 
         <ul
-          v-if="result.failures.length > 0"
+          v-if="(result.failures?.length ?? 0) > 0"
           class="scroll-thin max-h-40 space-y-1 overflow-y-auto text-2xs"
         >
           <li

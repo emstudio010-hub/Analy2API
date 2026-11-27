@@ -34,6 +34,7 @@ import StatusPill from '@/components/ui/StatusPill.vue'
 import Switch from '@/components/ui/Switch.vue'
 import Textarea from '@/components/ui/Textarea.vue'
 import { useToastStore } from '@/stores/toast'
+import { copyText } from '@/utils/clipboard'
 import { formatRelative, redactProxyDisplay } from '@/utils/format'
 import { accountModeMeta } from '@/utils/platforms'
 
@@ -156,11 +157,12 @@ const poolStats = computed(() => {
 })
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let suppressFilterWatch = false
 
 async function loadGroups(): Promise<void> {
   try {
     const res = await groupsApi.list()
-    groups.value = res.items
+    groups.value = res.items ?? []
   } catch (err) {
     toast.error('加载分组失败', toMessage(err))
   }
@@ -178,8 +180,8 @@ async function load(): Promise<void> {
       keyword: keyword.value.trim() || undefined,
       group_id: groupFilter.value ? Number(groupFilter.value) : undefined,
     })
-    items.value = res.items
-    total.value = res.total
+    items.value = res.items ?? []
+    total.value = res.total ?? 0
   } catch (err) {
     error.value = toMessage(err, '加载 OpenCode 账号池失败')
     items.value = []
@@ -190,19 +192,22 @@ async function load(): Promise<void> {
 }
 
 watch(keyword, () => {
+  if (suppressFilterWatch) return
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(() => {
-    page.value = 1
-    void load()
+    if (page.value !== 1) page.value = 1
+    else void load()
   }, 300)
 })
 
 watch([status, groupFilter], () => {
-  page.value = 1
-  void load()
+  if (suppressFilterWatch) return
+  if (page.value !== 1) page.value = 1
+  else void load()
 })
 
 watch([page, pageSize], () => {
+  if (suppressFilterWatch) return
   void load()
 })
 
@@ -215,12 +220,20 @@ onBeforeUnmount(() => {
 })
 
 function clearFilters(): void {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+  suppressFilterWatch = true
   modeFilter.value = 'all'
   keyword.value = ''
   status.value = ''
   groupFilter.value = ''
   page.value = 1
-  void load()
+  queueMicrotask(() => {
+    suppressFilterWatch = false
+    void load()
+  })
 }
 
 // ---- 动态模型探活与代理测速 ----
@@ -326,7 +339,8 @@ async function confirmDelete(): Promise<void> {
     await accountsApi.remove(deleteTarget.value.id)
     toast.success('账号已删除', deleteTarget.value.name)
     deleteTarget.value = null
-    await load()
+    if (items.value.length === 1 && page.value > 1) page.value -= 1
+    else await load()
   } catch (err) {
     toast.error('删除失败', toMessage(err))
   } finally {
@@ -371,7 +385,7 @@ function openEdit(acc: Account): void {
   formStatus.value = acc.status || 'active'
   formSchedulable.value = acc.schedulable ?? true
   formNotes.value = acc.notes || ''
-  formGroupIds.value = [...acc.group_ids]
+  formGroupIds.value = [...(acc.group_ids ?? [])]
   formError.value = ''
   formOpen.value = true
 }
@@ -528,6 +542,7 @@ function openOcOAuthModal(): void {
   ocOAuthBaseUrl.value = ''
   ocOAuthProxyUrl.value = ''
   ocOAuthAccountName.value = ''
+  ocOAuthRedirectMode.value = true
   ocOAuthCallbackInput.value = ''
   ocOAuthSession.value = null
   ocOAuthGroupIds.value = ocGroups.value.slice(0, 1).map((g) => g.id)
@@ -567,12 +582,9 @@ async function startOcOAuth(): Promise<void> {
 
 async function copyOcOAuthUrl(): Promise<void> {
   if (!ocOAuthSession.value?.auth_url) return
-  try {
-    await navigator.clipboard.writeText(ocOAuthSession.value.auth_url)
-    toast.success('已复制授权链接', '')
-  } catch {
-    toast.error('复制失败', '请手动复制输入框内的链接')
-  }
+  const ok = await copyText(ocOAuthSession.value.auth_url)
+  if (ok) toast.success('已复制授权链接')
+  else toast.error('复制失败', '请手动复制输入框内的链接')
 }
 
 async function completeOcOAuth(): Promise<void> {
@@ -805,8 +817,8 @@ async function completeOcOAuth(): Promise<void> {
 
           <!-- 4. 分组 -->
           <td class="td max-w-[10rem]">
-            <div v-if="acc.group_ids.length" class="flex flex-wrap gap-1">
-              <Badge v-for="gid in acc.group_ids" :key="gid" tone="neutral">
+            <div v-if="(acc.group_ids ?? []).length" class="flex flex-wrap gap-1">
+              <Badge v-for="gid in acc.group_ids ?? []" :key="gid" tone="neutral">
                 {{ groupNameById.get(gid) ?? `#${gid}` }}
               </Badge>
             </div>
@@ -878,7 +890,8 @@ async function completeOcOAuth(): Promise<void> {
                 :disabled="togglingId !== null"
                 @click="toggleStatus(acc)"
               >
-                <Icon :name="acc.status === 'active' ? 'lock' : 'checkCircle'" :size="13" />
+                <Spinner v-if="togglingId === acc.id" :size="11" />
+                <Icon v-else :name="acc.status === 'active' ? 'lock' : 'checkCircle'" :size="13" />
               </Button>
 
               <Button variant="ghost" size="xs" icon title="编辑账号" @click="openEdit(acc)">
@@ -901,7 +914,18 @@ async function completeOcOAuth(): Promise<void> {
       </template>
 
       <template #footer>
-        <Pagination v-model:page="page" v-model:page-size="pageSize" :total="total" />
+        <div>
+          <div
+            v-if="modeFilter !== 'all'"
+            class="flex items-center justify-between border-t border-line bg-raised/30 px-3 py-1.5 text-2xs text-subtle"
+          >
+            <span>当前页按「{{ modeFilter.toUpperCase() }}」模式筛选出 {{ displayedItems.length }} / {{ items.length }} 条</span>
+            <button type="button" class="text-accent hover:underline" @click="modeFilter = 'all'">
+              显示全部模式
+            </button>
+          </div>
+          <Pagination v-model:page="page" v-model:page-size="pageSize" :total="total" />
+        </div>
       </template>
     </DataTable>
 
@@ -1140,14 +1164,16 @@ async function completeOcOAuth(): Promise<void> {
       title="OpenCode (Zen / Go) OAuth 统一授权入池"
       subtitle="创建带 Zen/Go 计费模式、独立代理与设备指纹的 OAuth 会话，自动完成凭证校验与入池"
       size="lg"
-      @close="ocOAuthOpen = false"
+      :persistent="ocOAuthCreating || ocOAuthSubmitting"
+      @update:open="ocOAuthOpen = $event"
     >
       <div class="space-y-4">
         <div
           v-if="ocOAuthError"
-          class="rounded-[var(--radius-md)] border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger"
+          class="flex items-start gap-2 rounded-md border border-danger/35 bg-danger/10 px-3 py-2 text-2xs text-danger"
         >
-          {{ ocOAuthError }}
+          <Icon name="alertCircle" :size="14" class="mt-px shrink-0" />
+          <span>{{ ocOAuthError }}</span>
         </div>
 
         <Field label="计费模式">
@@ -1171,9 +1197,9 @@ async function completeOcOAuth(): Promise<void> {
             <Input v-model="ocOAuthAccountName" size="sm" placeholder="留空则按邮箱或模式自动命名" />
           </Field>
           <div class="flex items-end">
-            <div class="flex w-full items-center justify-between gap-2 rounded-[var(--radius-md)] border border-[var(--border-subtle)] bg-[var(--bg-subtle)] px-3 py-2 text-xs">
+            <div class="panel-inset flex w-full items-center justify-between gap-2 px-3 py-2 text-xs text-fg">
               <span>自动绑定网关回调 (/api/oauth/callback)</span>
-              <Switch v-model="ocOAuthRedirectMode" />
+              <Switch v-model="ocOAuthRedirectMode" size="sm" />
             </div>
           </div>
         </div>
@@ -1201,17 +1227,28 @@ async function completeOcOAuth(): Promise<void> {
 
         <div
           v-if="ocOAuthSession"
-          class="space-y-3 rounded-[var(--radius-md)] border border-[var(--border-default)] bg-[var(--bg-subtle)] p-3"
+          class="panel-inset space-y-3 p-3.5"
         >
           <div class="flex items-center justify-between gap-2">
             <div class="text-xs font-medium text-fg">
-              会话 ID：<span class="font-mono">{{ ocOAuthSession.session_id }}</span>
+              会话 ID：<span class="font-mono text-muted">{{ ocOAuthSession.session_id }}</span>
             </div>
-            <Badge variant="info">{{ ocOAuthSession.status }}</Badge>
+            <Badge
+              :tone="
+                ocOAuthSession.status === 'completed'
+                  ? 'success'
+                  : ocOAuthSession.status === 'failed'
+                    ? 'danger'
+                    : 'info'
+              "
+              dot
+            >
+              {{ ocOAuthSession.status }}
+            </Badge>
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
-            <Input :model-value="ocOAuthSession.auth_url" size="sm" readonly class="flex-1 font-mono text-xs" />
+            <Input :model-value="ocOAuthSession.auth_url" size="sm" readonly mono class="flex-1 text-xs" />
             <Button variant="secondary" size="sm" @click="copyOcOAuthUrl">
               <template #leading><Icon name="copy" :size="12" /></template>
               复制
@@ -1220,7 +1257,7 @@ async function completeOcOAuth(): Promise<void> {
               :href="ocOAuthSession.auth_url"
               target="_blank"
               rel="noopener noreferrer"
-              class="inline-flex h-8 items-center gap-1 rounded-[var(--radius-md)] bg-accent px-3 text-xs font-medium text-white hover:opacity-90"
+              class="inline-flex h-8 items-center gap-1.5 rounded-md bg-accent px-3 text-xs font-medium text-accent-fg shadow-panel transition hover:bg-accent/90"
             >
               <Icon name="external" :size="12" />
               打开 OpenCode 授权
@@ -1239,7 +1276,7 @@ async function completeOcOAuth(): Promise<void> {
       </div>
 
       <template #footer>
-        <Button variant="secondary" size="sm" @click="ocOAuthOpen = false">取消</Button>
+        <Button variant="ghost" size="sm" :disabled="ocOAuthSubmitting" @click="ocOAuthOpen = false">取消</Button>
         <Button
           variant="primary"
           size="sm"

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 
 import { groupsApi, keysApi } from '@/api/endpoints'
@@ -20,6 +20,7 @@ import PlatformBadge from '@/components/ui/PlatformBadge.vue'
 import SegmentedTabs from '@/components/ui/SegmentedTabs.vue'
 import Select from '@/components/ui/Select.vue'
 import StatusPill from '@/components/ui/StatusPill.vue'
+import Switch from '@/components/ui/Switch.vue'
 import { useToastStore } from '@/stores/toast'
 import { copyText } from '@/utils/clipboard'
 import {
@@ -52,6 +53,7 @@ const resetting = ref(false)
 const deleteTarget = ref<ApiKey | null>(null)
 const deleting = ref(false)
 const copiedId = ref<number | null>(null)
+const togglingId = ref<number | null>(null)
 
 // ---- 三协议快速接入代码弹窗 & 底部面板 ----
 type ProtocolTab = 'chat' | 'messages' | 'responses'
@@ -197,6 +199,8 @@ const filtersActive = computed(
 const truncated = computed(() => total.value > items.value.length)
 
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let copyTimer: ReturnType<typeof setTimeout> | null = null
+let suppressFilterWatch = false
 
 async function load(): Promise<void> {
   loading.value = true
@@ -211,7 +215,10 @@ async function load(): Promise<void> {
     total.value = response.total ?? 0
     const ids = new Set(items.value.map((item) => item.id))
     revealed.value = revealed.value.filter((id) => ids.has(id))
-    if (!selectedGuideKeyId.value && items.value.length > 0) {
+    if (
+      (!selectedGuideKeyId.value || !items.value.some((k) => String(k.id) === selectedGuideKeyId.value)) &&
+      items.value.length > 0
+    ) {
       const active = items.value.find((k) => k.status === 'active') ?? items.value[0]
       if (active) selectedGuideKeyId.value = String(active.id)
     }
@@ -237,12 +244,19 @@ onMounted(async () => {
   await Promise.all([load(), loadGroups()])
 })
 
+onBeforeUnmount(() => {
+  if (searchTimer) clearTimeout(searchTimer)
+  if (copyTimer) clearTimeout(copyTimer)
+})
+
 watch(keyword, () => {
+  if (suppressFilterWatch) return
   if (searchTimer) clearTimeout(searchTimer)
   searchTimer = setTimeout(() => void load(), 300)
 })
 
 watch([status, groupFilter], () => {
+  if (suppressFilterWatch) return
   void load()
 })
 
@@ -264,10 +278,41 @@ function openGuideForKey(item?: ApiKey): void {
 }
 
 function clearFilters(): void {
+  if (searchTimer) {
+    clearTimeout(searchTimer)
+    searchTimer = null
+  }
+  suppressFilterWatch = true
   keyword.value = ''
   status.value = ''
   groupFilter.value = ''
-  void load()
+  queueMicrotask(() => {
+    suppressFilterWatch = false
+    void load()
+  })
+}
+
+async function toggleKeyStatus(item: ApiKey): Promise<void> {
+  if (togglingId.value !== null) return
+  togglingId.value = item.id
+  const next = item.status === 'active' ? 'disabled' : 'active'
+  try {
+    const updated = await keysApi.update(item.id, {
+      name: item.name,
+      group_id: item.group_id,
+      quota: item.quota,
+      ip_whitelist: item.ip_whitelist ?? [],
+      status: next,
+    })
+    const idx = items.value.findIndex((k) => k.id === item.id)
+    if (idx >= 0) items.value[idx] = updated
+    else await load()
+    toast.success(next === 'active' ? '密钥已启用' : '密钥已禁用', item.name)
+  } catch (err) {
+    toast.error('切换密钥状态失败', toMessage(err))
+  } finally {
+    togglingId.value = null
+  }
 }
 
 function onCreated(created: ApiKey): void {
@@ -286,7 +331,8 @@ async function copy(value: string, id: number): Promise<void> {
   const ok = await copyText(value)
   if (ok) {
     copiedId.value = id
-    setTimeout(() => {
+    if (copyTimer) clearTimeout(copyTimer)
+    copyTimer = setTimeout(() => {
       if (copiedId.value === id) copiedId.value = null
     }, 1600)
     toast.success('密钥已复制到剪贴板')
@@ -471,16 +517,29 @@ async function confirmDelete(): Promise<void> {
 
       <template #body>
         <tr v-for="item in items" :key="item.id">
-          <td class="td max-w-[12rem]">
+          <td class="td max-w-[13rem]">
             <div class="flex flex-col gap-0.5">
-              <span class="truncate font-medium text-fg">{{ item.name }}</span>
-              <span class="tnum text-2xs text-subtle">#{{ item.id }}</span>
+              <span class="truncate font-medium text-fg" :title="item.name">{{ item.name }}</span>
+              <div class="flex items-center gap-1.5">
+                <span class="tnum text-2xs text-subtle">#{{ item.id }}</span>
+                <Badge
+                  v-if="item.ip_whitelist && item.ip_whitelist.length > 0"
+                  tone="info"
+                  mono
+                  :title="`来源 IP 白名单：${item.ip_whitelist.join(', ')}`"
+                >
+                  限 {{ item.ip_whitelist.length }} IP
+                </Badge>
+              </div>
             </div>
           </td>
 
           <td class="td">
             <div class="flex items-center gap-1.5">
-              <code class="max-w-[15rem] truncate rounded border border-line bg-raised px-1.5 py-0.5 font-mono text-2xs text-muted">
+              <code
+                class="max-w-[14rem] truncate rounded border border-line bg-raised px-1.5 py-0.5 font-mono text-2xs text-muted"
+                :title="revealed.includes(item.id) ? item.key : undefined"
+              >
                 {{ revealed.includes(item.id) ? item.key : `${item.key.slice(0, 10)}••••••••` }}
               </code>
               <button
@@ -503,18 +562,30 @@ async function confirmDelete(): Promise<void> {
             </div>
           </td>
 
-          <td class="td">
+          <td class="td max-w-[13rem]">
             <div v-if="item.group_id && groupMap.get(item.group_id)" class="flex items-center gap-1.5">
               <PlatformBadge :platform="groupMap.get(item.group_id)!.platform" short />
-              <Badge tone="neutral">{{ item.group_name || groupMap.get(item.group_id)!.name }}</Badge>
+              <Badge tone="neutral" class="max-w-[9rem] truncate">
+                {{ item.group_name || groupMap.get(item.group_id)!.name }}
+              </Badge>
             </div>
-            <Badge v-else-if="item.group_name" tone="neutral">{{ item.group_name }}</Badge>
+            <Badge v-else-if="item.group_name" tone="neutral" class="max-w-[10rem] truncate">
+              {{ item.group_name }}
+            </Badge>
             <span v-else class="text-2xs text-warning">未绑定分组</span>
           </td>
 
           <td class="td">
             <div class="flex flex-col items-start gap-1">
-              <StatusPill :status="item.status" />
+              <div class="flex items-center gap-1.5">
+                <Switch
+                  size="sm"
+                  :model-value="item.status === 'active'"
+                  :disabled="togglingId === item.id"
+                  @update:model-value="toggleKeyStatus(item)"
+                />
+                <StatusPill :status="item.status" />
+              </div>
               <span
                 v-if="item.expires_at && isExpired(item.expires_at)"
                 class="text-2xs text-danger"

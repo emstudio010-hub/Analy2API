@@ -668,4 +668,44 @@ export const sessionGuardApi = {
   },
 }
 
+// === Antigravity Format Adapter & Prompt Mode ===
+
+import type {
+  AgyInterceptContinuePreview,
+  AgyPromptMode,
+  AgyPromptModesResponse,
+  AntigravityConvertAccountsPayload,
+  AntigravityConvertAccountsResponse,
+  PreviewAgyPromptModePayload,
+  UpdateAgyPromptModePayload,
+} from './types'
+
+export function convertAntigravityAccounts(payload: AntigravityConvertAccountsPayload) {
+  return postLong<AntigravityConvertAccountsResponse>('/antigravity/accounts/convert', payload)
+}
+
+export function convertAntigravityAccountsMultipart(formData: FormData) {
+  return postLong<AntigravityConvertAccountsResponse>('/antigravity/accounts/convert', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+  })
+}
+
+export function fetchAntigravityPromptModes(params?: {
+  mode?: AgyPromptMode
+  downstream_system?: string
+  has_tools?: boolean
+}) {
+  return get<AgyPromptModesResponse>('/antigravity/prompt-modes', {
+    params: params ? clean({ ...params }) : undefined,
+  })
+}
+
+export function updateAntigravityPromptMode(payload: UpdateAgyPromptModePayload) {
+  return put<AgyPromptModesResponse>('/antigravity/prompt-modes', payload)
+}
+
+export function previewAntigravityPromptMode(payload: PreviewAgyPromptModePayload) {
+  return post<AgyInterceptContinuePreview>('/antigravity/prompt-modes/preview', payload)
+}
+
 export * from './types'

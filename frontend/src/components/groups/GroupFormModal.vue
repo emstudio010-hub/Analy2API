@@ -117,6 +117,15 @@ async function submit(): Promise<void> {
       system_prompt: systemPrompt.value,
       tool_obf_mode: toolObfMode.value,
       tool_obf_prefix: toolObfPrefix.value.trim(),
+      ...(isEdit.value && props.group
+        ? {
+            prompt_template_id: props.group.prompt_template_id ?? null,
+            tool_obf_scope: props.group.tool_obf_scope,
+            tool_obf_custom_map: props.group.tool_obf_custom_map,
+            tool_obf_exclude_tools: props.group.tool_obf_exclude_tools,
+            tool_obf_rewrite_refs: props.group.tool_obf_rewrite_refs ?? undefined,
+          }
+        : {}),
     }
     let savedGroup: Group
     if (isEdit.value && props.group) {
@@ -128,7 +137,7 @@ async function submit(): Promise<void> {
     // 若后端 /groups CRUD 未内联落盘提示词字段，同步补调一次 /prompts/groups/:id 确保一致
     if (
       savedGroup.prompt_inject_mode !== promptInjectMode.value ||
-      (systemPrompt.value && savedGroup.system_prompt !== systemPrompt.value)
+      (savedGroup.system_prompt ?? '') !== systemPrompt.value
     ) {
       try {
         await updateGroupPrompt(savedGroup.id, {
@@ -158,6 +167,7 @@ async function submit(): Promise<void> {
     :title="isEdit ? '编辑路由分组' : '新建路由分组'"
     subtitle="分组隔离四大上游平台账号池、计费倍率与前置系统提示词注入策略"
     size="lg"
+    :persistent="submitting"
     @update:open="emit('update:open', $event)"
   >
     <form class="space-y-4" @submit.prevent="submit">
@@ -227,11 +237,11 @@ async function submit(): Promise<void> {
           <Select v-model="toolObfMode" :options="toolObfModeOptions" />
         </Field>
 
-        <Field label="分组工具混淆前缀（可选）" hint="留空则继承全局 Prefix（如 ess_t_）">
+        <Field label="分组工具混淆前缀（可选）" hint="在 hash / alias / prefix 模式下生效；留空继承全局前缀">
           <Input
             v-model="toolObfPrefix"
             mono
-            :disabled="toolObfMode === 'off'"
+            :disabled="toolObfMode === 'off' || toolObfMode === 'inherit'"
             placeholder="留空继承全局，例如 grp_a_"
           />
         </Field>

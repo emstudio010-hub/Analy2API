@@ -167,7 +167,11 @@ function reset(): void {
   concurrency.value = String(account?.concurrency ?? 3)
   priority.value = String(account?.priority ?? 50)
   multiplier.value = String(account?.rate_multiplier ?? 1)
-  groupIds.value = account ? [...account.group_ids] : []
+  groupIds.value = account
+    ? [...(account.group_ids ?? [])]
+    : platformGroups.value[0]
+      ? [platformGroups.value[0].id]
+      : []
   expiresAt.value = account?.expires_at ? toLocalInputValue(account.expires_at) : ''
   clearExpiry.value = false
   status.value = account?.status ?? 'active'
@@ -321,6 +325,7 @@ async function submit(): Promise<void> {
     :title="isEdit ? '编辑 WorkBuddy 账号' : '添加 WorkBuddy 账号'"
     :subtitle="subtitle"
     size="lg"
+    :persistent="submitting"
     @update:open="emit('update:open', $event)"
   >
     <form class="space-y-4" @submit.prevent="submit">

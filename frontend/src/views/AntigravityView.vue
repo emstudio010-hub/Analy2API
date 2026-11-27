@@ -4,8 +4,8 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { toMessage } from '@/api/client'
 import {
   accountsApi,
-  completeAntigravityOAuthCallback,
   checkAntigravityNodeExitIP,
+  completeAntigravityOAuthCallback,
   deleteAntigravityAuthFile,
   deleteAntigravityNode,
   fetchAntigravityEnv,
@@ -19,6 +19,7 @@ import {
 } from '@/api/endpoints'
 import type {
   Account,
+  AgyPromptMode,
   AntigravityAuthFile,
   AntigravityEnvResponse,
   AntigravityOAuthURLResponse,
@@ -26,6 +27,8 @@ import type {
   ContainerNodeAction,
   Group,
 } from '@/api/types'
+import AccountFormatConverterPanel from '@/components/antigravity/AccountFormatConverterPanel.vue'
+import AgyPromptPipelinePanel from '@/components/antigravity/AgyPromptPipelinePanel.vue'
 import AuthFileUploadModal from '@/components/antigravity/AuthFileUploadModal.vue'
 import NodeFormModal from '@/components/antigravity/NodeFormModal.vue'
 import NodeLogsModal from '@/components/antigravity/NodeLogsModal.vue'
@@ -39,6 +42,7 @@ import EmptyState from '@/components/ui/EmptyState.vue'
 import Field from '@/components/ui/Field.vue'
 import Icon from '@/components/ui/Icon.vue'
 import Input from '@/components/ui/Input.vue'
+import MetricTile from '@/components/ui/MetricTile.vue'
 import Modal from '@/components/ui/Modal.vue'
 import Select from '@/components/ui/Select.vue'
 import Spinner from '@/components/ui/Spinner.vue'
@@ -59,6 +63,7 @@ const toast = useToastStore()
 // ---- 环境与节点状态 ----
 const env = ref<AntigravityEnvResponse | null>(null)
 const envLoading = ref(true)
+const activePromptMode = ref<AgyPromptMode>('default_intercept_continue')
 
 const nodes = ref<ContainerNode[]>([])
 const nodesLoading = ref(true)
@@ -103,6 +108,7 @@ const providerOptions = [
 // 关联分组与账号池（用于映射已绑定账号 ID + 一键同步弹窗）
 const groups = ref<Group[]>([])
 const agyAccounts = ref<Account[]>([])
+const agyAccountsTotal = ref(0)
 const syncModalOpen = ref(false)
 const syncGroupIds = ref<number[]>([])
 const syncConcurrency = ref('5')
@@ -115,6 +121,14 @@ const selectedNode = computed<ContainerNode | null>(
 )
 
 const agyGroups = computed(() => groups.value.filter((g) => g.platform === 'antigravity'))
+
+const runningNodesCount = computed(
+  () => nodes.value.filter((n) => n.status === 'running' || n.status === 'online').length,
+)
+
+const activeAgyAccountsCount = computed(
+  () => agyAccounts.value.filter((a) => a.status === 'active').length,
+)
 
 /** 根据 email / filename 匹配已同步到网关的 AntiGravity 账号 ID。 */
 const linkedAccountMap = computed(() => {
@@ -136,7 +150,9 @@ function findLinkedAccountId(file: AntigravityAuthFile): number | null {
     if (hit) return hit.id
   }
   const stem = file.filename.replace(/\.json$/i, '').toLowerCase()
-  const byName = linkedAccountMap.value.byHint.get(file.filename.toLowerCase()) ?? linkedAccountMap.value.byHint.get(stem)
+  const byName =
+    linkedAccountMap.value.byHint.get(file.filename.toLowerCase()) ??
+    linkedAccountMap.value.byHint.get(stem)
   return byName?.id ?? null
 }
 
@@ -157,8 +173,9 @@ async function loadMetaPools(): Promise<void> {
       groupsApi.list(),
       accountsApi.list({ platform: 'antigravity', page: 1, page_size: 200 }),
     ])
-    groups.value = gRes.items
-    agyAccounts.value = aRes.items
+    groups.value = gRes.items ?? []
+    agyAccounts.value = aRes.items ?? []
+    agyAccountsTotal.value = aRes.total ?? agyAccounts.value.length
   } catch {
     /* 静默容错，不影响主流程 */
   }
@@ -205,6 +222,13 @@ async function loadAuthFiles(nodeId?: number): Promise<void> {
   }
 }
 
+async function refreshAll(): Promise<void> {
+  await Promise.all([loadEnv(), loadNodes(), loadMetaPools()])
+  if (selectedNode.value) {
+    await loadAuthFiles(selectedNode.value.id)
+  }
+}
+
 watch(
   () => selectedNode.value?.id,
   (id) => {
@@ -218,10 +242,7 @@ watch(
 )
 
 onMounted(async () => {
-  await Promise.all([loadEnv(), loadNodes(), loadMetaPools()])
-  if (selectedNode.value) {
-    await loadAuthFiles(selectedNode.value.id)
-  }
+  await refreshAll()
 })
 
 function openCreateNode(): void {
@@ -476,11 +497,50 @@ function nodeEndpoint(node: ContainerNode): string {
   }
   return `http://${host}:${node.host_port}`
 }
+
+async function onAccountsConverted(): Promise<void> {
+  await Promise.all([loadNodes(), loadMetaPools()])
+  if (selectedNode.value) {
+    await loadAuthFiles(selectedNode.value.id)
+  }
+}
 </script>
 
 <template>
   <div class="space-y-4">
-    <!-- 顶部宿主机 Docker 环境与操作条 -->
+    <!-- 顶部池水位与运行态势概览 -->
+    <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <MetricTile
+        label="AGY 调度账号池"
+        :value="`${activeAgyAccountsCount} / ${agyAccountsTotal}`"
+        hint="正常可调度 / 已入库 AGY 账号"
+        icon="users"
+        tone="success"
+      />
+      <MetricTile
+        label="容器与远程节点"
+        :value="`${runningNodesCount} / ${nodes.length}`"
+        :hint="env?.docker_available ? `宿主机 Docker v${env.docker_version || '就绪'}` : '本机直连 agy CLI / 远程节点模式'"
+        icon="server"
+        tone="accent"
+      />
+      <MetricTile
+        label="AGY 提示词管线"
+        :value="activePromptMode === 'default_intercept_continue' ? '默认->拦截->接续' : activePromptMode"
+        hint="保留原生指纹 · 双向拦截 · 下游接续"
+        icon="shield"
+        tone="info"
+      />
+      <MetricTile
+        label="当前节点凭证文件"
+        :value="selectedNode ? `${authFiles.length} 份` : '未选节点'"
+        :hint="selectedNode ? `节点：${selectedNode.name}` : '支持无容器直接全格式转 AGY 入池'"
+        icon="fileText"
+        tone="neutral"
+      />
+    </div>
+
+    <!-- 顶部宿主机 Docker 环境与快捷操作条 -->
     <div class="card flex flex-wrap items-center justify-between gap-3 px-4 py-3">
       <div class="flex flex-wrap items-center gap-2.5">
         <Badge
@@ -488,7 +548,7 @@ function nodeEndpoint(node: ContainerNode): string {
           tone="neutral"
           dot
         >
-          正在检测宿主机 Docker 环境…
+          正在检测宿主机环境…
         </Badge>
         <Badge
           v-else-if="env?.docker_available"
@@ -499,11 +559,11 @@ function nodeEndpoint(node: ContainerNode): string {
         </Badge>
         <Badge
           v-else
-          tone="warning"
+          tone="info"
           dot
-          :title="env?.error || '未检测到 Docker 守护进程'"
+          :title="env?.error || '未检测到 Docker 守护进程，可使用本机 agy CLI 驱动或远程节点'"
         >
-          本机未安装或未启动 Docker · 仅支持外部远程节点模式
+          本机原生 agy CLI 隔离驱动 / 远程节点模式
         </Badge>
 
         <span v-if="env?.default_image" class="hidden items-center gap-1 text-2xs text-subtle md:inline-flex">
@@ -514,26 +574,26 @@ function nodeEndpoint(node: ContainerNode): string {
         </span>
 
         <span v-if="env?.data_root" class="hidden items-center gap-1 text-2xs text-subtle xl:inline-flex">
-          <span>数据卷目录:</span>
+          <span>隔离数据目录:</span>
           <code class="max-w-[18rem] truncate rounded border border-line bg-raised px-1.5 py-px font-mono text-muted" :title="env.data_root">
             {{ env.data_root }}
           </code>
         </span>
       </div>
 
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2">
         <Button
           variant="secondary"
           size="sm"
           :loading="nodesLoading || envLoading"
-          @click="
-            loadEnv();
-            loadNodes();
-            loadMetaPools();
-          "
+          @click="refreshAll"
         >
           <template #leading><Icon name="refresh" :size="13" /></template>
           刷新状态
+        </Button>
+        <Button variant="secondary" size="sm" @click="uploadModalOpen = true">
+          <template #leading><Icon name="upload" :size="13" /></template>
+          快速全格式导入弹窗
         </Button>
         <Button variant="primary" size="sm" @click="openCreateNode">
           <template #leading><Icon name="plus" :size="13" /></template>
@@ -541,6 +601,17 @@ function nodeEndpoint(node: ContainerNode): string {
         </Button>
       </div>
     </div>
+
+    <!-- 核心面板 1：AGY CLI 提示词运行管线面板 (默认提示词 -> 拦截 -> 接续) -->
+    <AgyPromptPipelinePanel @mode-changed="activePromptMode = $event" />
+
+    <!-- 核心面板 2：多账号全格式自动转 AGY CLI 工作台 -->
+    <AccountFormatConverterPanel
+      :nodes="nodes"
+      :selected-node="selectedNode"
+      :groups="groups"
+      @imported="onAccountsConverted"
+    />
 
     <!-- 错误提示 -->
     <p
@@ -552,10 +623,10 @@ function nodeEndpoint(node: ContainerNode): string {
       <Button variant="ghost" size="xs" class="ml-auto" @click="loadNodes">重试</Button>
     </p>
 
-    <!-- 板块 1：容器与远程节点列表 -->
+    <!-- 板块 3：容器与远程节点列表 -->
     <Card
       title="AntiGravity 容器与远程节点池"
-      subtitle="点击任意节点切换下方 OAuth 授权与 .json 登录凭证工作台"
+      subtitle="点击任意节点切换下方 OAuth 在线授权与节点级登录凭证池"
       body-class="p-0"
     >
       <DataTable
@@ -580,12 +651,12 @@ function nodeEndpoint(node: ContainerNode): string {
         <template #empty>
           <EmptyState
             icon="server"
-            title="尚未配置任何 AntiGravity 节点"
-            description="支持一键在宿主机拉起 CLIProxyAPI Docker 容器，或直接接入已部署在远端服务器的 AntiGravity 节点。"
+            title="尚未配置额外 Docker / 远程容器节点"
+            description="本机 agy CLI 可直接使用上方「多账号全格式自动转 AGY CLI 工作台」导入的隔离账号池运行；如需多容器并发编排或接入外部远端节点，请点击下方创建。"
           >
             <Button variant="primary" size="sm" @click="openCreateNode">
               <template #leading><Icon name="plus" :size="13" /></template>
-              创建第一个节点
+              创建第一个容器 / 远程节点
             </Button>
           </EmptyState>
         </template>
@@ -595,7 +666,7 @@ function nodeEndpoint(node: ContainerNode): string {
             v-for="node in nodes"
             :key="node.id"
             class="cursor-pointer transition"
-            :class="selectedNode?.id === node.id ? 'bg-accent/6' : ''"
+            :class="selectedNode?.id === node.id ? 'bg-accent/[0.06]' : ''"
             @click="selectedNodeId = node.id"
           >
             <td class="td">
@@ -611,7 +682,7 @@ function nodeEndpoint(node: ContainerNode): string {
                       {{ node.mode === 'local_docker' ? 'Docker' : 'Remote' }}
                     </Badge>
                   </div>
-                  <p v-if="node.mode === 'local_docker'" class="mt-0.5 font-mono text-2xs text-subtle">
+                  <p v-if="node.mode === 'local_docker'" class="mt-0.5 max-w-[14rem] truncate font-mono text-2xs text-subtle" :title="node.docker_image">
                     {{ node.docker_image }}
                   </p>
                 </div>
@@ -634,14 +705,16 @@ function nodeEndpoint(node: ContainerNode): string {
               </div>
             </td>
 
-            <td class="td">
-              <div class="font-mono text-xs text-fg">{{ nodeEndpoint(node) }}</div>
-              <div v-if="node.container_name" class="font-mono text-2xs text-subtle">
+            <td class="td max-w-[14rem]">
+              <div class="truncate font-mono text-xs text-fg" :title="nodeEndpoint(node)">
+                {{ nodeEndpoint(node) }}
+              </div>
+              <div v-if="node.container_name" class="truncate font-mono text-2xs text-subtle">
                 容器: {{ node.container_name }}
               </div>
             </td>
 
-            <td class="td">
+            <td class="td max-w-[16rem]">
               <div class="space-y-1">
                 <div class="flex flex-wrap items-center gap-1.5">
                   <Badge
@@ -666,10 +739,10 @@ function nodeEndpoint(node: ContainerNode): string {
                     {{ node.last_exit_ip }}
                   </span>
                 </div>
-                <div class="font-mono text-2xs text-muted">
+                <div class="truncate font-mono text-2xs text-muted" :title="redactProxyDisplay(node.proxy_url)">
                   代理: {{ redactProxyDisplay(node.proxy_url) }}
                 </div>
-                <div v-if="node.fingerprint?.fingerprint_id" class="font-mono text-2xs text-subtle">
+                <div v-if="node.fingerprint?.fingerprint_id" class="truncate font-mono text-2xs text-subtle">
                   指纹: {{ node.fingerprint.fingerprint_id }} · {{ node.fingerprint.hostname }}
                 </div>
               </div>
@@ -802,14 +875,14 @@ function nodeEndpoint(node: ContainerNode): string {
       </DataTable>
     </Card>
 
-    <!-- 板块 2：选中节点的 OAuth 在线授权与 .json 登录文件池 -->
+    <!-- 板块 4：选中节点的 OAuth 在线授权与 .json 登录文件池 -->
     <template v-if="selectedNode">
       <div class="grid gap-4 lg:grid-cols-12">
         <!-- 左栏：一键在线 OAuth 授权台 -->
         <Card
           class="lg:col-span-4"
           :title="`在线 OAuth 登录 · ${selectedNode.name}`"
-          subtitle="通过容器内置 OAuth 端点生成登录链接，完成后自动落盘 .json"
+          subtitle="通过容器内置 OAuth 端点生成登录链接，完成后自动落盘为原生凭证"
         >
           <div class="space-y-3.5">
             <Field label="授权提供商 (Provider)">
@@ -873,7 +946,7 @@ function nodeEndpoint(node: ContainerNode): string {
             <div class="space-y-2 border-t border-line pt-3">
               <Field
                 label="提交回调 URL / 授权码 Code / Token JSON"
-                hint="支持直接粘贴浏览器回调链接（含 ?code=...）、授权码或 OAuth JSON，提交后自动生成 .json 并入池"
+                hint="支持直接粘贴浏览器回调链接（含 ?code=...）、授权码或 OAuth JSON，提交后自动生成原生凭证并入池"
               >
                 <Input
                   v-model="oauthCallbackInput"
@@ -899,7 +972,7 @@ function nodeEndpoint(node: ContainerNode): string {
         <!-- 右栏：.json 凭证文件列表与一键同步 -->
         <Card
           class="lg:col-span-8"
-          :title="`OAuth .json 登录凭证池 · ${selectedNode.name}`"
+          :title="`OAuth 登录凭证池 · ${selectedNode.name}`"
           :subtitle="`共 ${authFiles.length} 份凭证文件${selectedNode.auth_dir ? ` · 目录 ${selectedNode.auth_dir}` : ''}`"
           body-class="p-0"
         >
@@ -915,7 +988,7 @@ function nodeEndpoint(node: ContainerNode): string {
             </Button>
             <Button variant="secondary" size="sm" @click="uploadModalOpen = true">
               <template #leading><Icon name="upload" :size="13" /></template>
-              上传 / 粘贴 .json
+              全格式上传 / 转换
             </Button>
             <Button
               variant="primary"
@@ -958,26 +1031,28 @@ function nodeEndpoint(node: ContainerNode): string {
             <template #empty>
               <EmptyState
                 icon="fileText"
-                title="当前节点尚无 .json 登录凭证文件"
-                description="可通过左侧「在线 OAuth 登录」生成，或点击右上角「上传 / 粘贴 .json」批量导入已有凭证文件。"
+                title="当前节点尚无登录凭证文件"
+                description="可通过左侧「在线 OAuth 登录」生成，或点击「全格式上传 / 转换」批量导入任意格式账号文件。"
               >
                 <Button variant="primary" size="sm" @click="uploadModalOpen = true">
                   <template #leading><Icon name="upload" :size="13" /></template>
-                  导入 .json 登录文件
+                  全格式导入登录凭证
                 </Button>
               </EmptyState>
             </template>
 
             <template #body>
               <tr v-for="file in authFiles" :key="file.filename">
-                <td class="td">
-                  <div class="font-mono text-xs font-medium text-fg">{{ file.filename }}</div>
+                <td class="td max-w-[13rem]">
+                  <div class="truncate font-mono text-xs font-medium text-fg" :title="file.filename">
+                    {{ file.filename }}
+                  </div>
                   <div class="tnum text-2xs text-subtle">{{ formatBytes(file.size_bytes) }}</div>
                 </td>
 
-                <td class="td">
-                  <div class="text-xs text-fg">{{ file.email || '—' }}</div>
-                  <div v-if="file.project_id" class="font-mono text-2xs text-subtle">
+                <td class="td max-w-[14rem]">
+                  <div class="truncate text-xs text-fg" :title="file.email">{{ file.email || '—' }}</div>
+                  <div v-if="file.project_id" class="truncate font-mono text-2xs text-subtle">
                     {{ file.project_id }}
                   </div>
                 </td>
@@ -1016,8 +1091,8 @@ function nodeEndpoint(node: ContainerNode): string {
 
                 <td class="td tnum text-right font-mono text-xs text-fg">
                   P{{ file.priority ?? 0 }}
-                  <div v-if="file.excluded_models?.length" class="text-2xs text-subtle">
-                    排除 {{ file.excluded_models.length }} 模型
+                  <div v-if="(file.excluded_models ?? []).length" class="text-2xs text-subtle">
+                    排除 {{ (file.excluded_models ?? []).length }} 模型
                   </div>
                 </td>
 
@@ -1068,11 +1143,7 @@ function nodeEndpoint(node: ContainerNode): string {
       v-model:open="uploadModalOpen"
       :node="selectedNode"
       :groups="groups"
-      @uploaded="
-        loadAuthFiles(selectedNode?.id);
-        loadNodes();
-        loadMetaPools();
-      "
+      @uploaded="onAccountsConverted"
     />
 
     <!-- 一键同步凭证至调度账号池弹窗 -->
