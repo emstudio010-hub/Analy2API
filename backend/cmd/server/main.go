@@ -53,6 +53,10 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "agy-bridge" {
 		logger := newLogger()
 		slog.SetDefault(logger)
+		promptMode := os.Getenv("AGY_PROMPT_MODE")
+		if promptMode == "" {
+			promptMode = os.Getenv("AGY_PROMPT_BLEND_MODE")
+		}
 		cfg := antigravity.BridgeConfig{
 			ListenAddr:       os.Getenv("AGY_BRIDGE_ADDR"),
 			CLIBinary:        os.Getenv("AGY_CLI_BIN"),
@@ -61,7 +65,7 @@ func main() {
 			ManagementKey:    os.Getenv("AGY_MANAGEMENT_KEY"),
 			ProxyURL:         os.Getenv("AGY_PROXY_URL"),
 			SessionRetention: os.Getenv("AGY_SESSION_RETENTION"),
-			PromptBlendMode:  os.Getenv("AGY_PROMPT_BLEND_MODE"),
+			PromptBlendMode:  promptMode,
 			NativePrompt:     os.Getenv("AGY_NATIVE_PROMPT"),
 			Logger:           logger,
 		}
