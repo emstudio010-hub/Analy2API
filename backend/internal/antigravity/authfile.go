@@ -225,6 +225,9 @@ func ListLocalAuthFiles(authDir string) ([]AuthFileInfo, error) {
 			continue
 		}
 		name := entry.Name()
+		if IsCompanionNonCredJSON(name) {
+			continue
+		}
 		cleanName, err := SanitizeAuthFilename(name)
 		if err != nil {
 			continue
@@ -265,16 +268,25 @@ func ListLocalAuthFiles(authDir string) ([]AuthFileInfo, error) {
 	return result, nil
 }
 
-// SaveLocalAuthFile 校验路径安全与合法 JSON 格式后，将登录凭证原子写入宿主机 authDir。
+// SaveLocalAuthFile 校验路径安全与合法凭证格式后，将登录凭证原子写入宿主机 authDir；
+// 当凭证属于 AntiGravity / Gemini / Google ADC OAuth 账号时，同步在隔离目录下生成真实 `agy` CLI
+// 可直接识别的 `.gemini/oauth_creds.json`、`.gemini/google_accounts.json` 与 `.config/gcloud/application_default_credentials.json`。
 func SaveLocalAuthFile(authDir, filename string, rawJSON []byte) (AuthFileInfo, error) {
 	targetPath, cleanName, err := safeResolveAuthFilePath(authDir, filename)
 	if err != nil {
 		return AuthFileInfo{}, err
 	}
 
+	writePayload := rawJSON
 	info, err := ParseAuthFileJSON(cleanName, rawJSON)
 	if err != nil {
 		return AuthFileInfo{}, err
+	}
+	var convertedAcc *ConvertedAGYAccount
+	if info.Provider == "antigravity" || info.Provider == "gemini" || info.AccountType == "authorized_user" {
+		if normAcc, convErr := NormalizeSingleCredential(cleanName, rawJSON, ""); convErr == nil && normAcc.Valid {
+			convertedAcc = &normAcc
+		}
 	}
 
 	dirPath := filepath.Dir(targetPath)
@@ -284,27 +296,53 @@ func SaveLocalAuthFile(authDir, filename string, rawJSON []byte) (AuthFileInfo, 
 
 	// 格式化或保留合法 JSON 内容，通过临时文件重命名保证写入完整性
 	tmpPath := fmt.Sprintf("%s.tmp.%d", targetPath, time.Now().UnixNano())
-	if err := os.WriteFile(tmpPath, rawJSON, 0o600); err != nil {
+	if err := os.WriteFile(tmpPath, writePayload, 0o600); err != nil {
 		return AuthFileInfo{}, fmt.Errorf("写入临时凭证文件失败: %w", err)
 	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		_ = os.Remove(tmpPath)
 		// Windows 上某些卷锁情形回退直接覆盖写
-		if writeErr := os.WriteFile(targetPath, rawJSON, 0o600); writeErr != nil {
+		if writeErr := os.WriteFile(targetPath, writePayload, 0o600); writeErr != nil {
 			return AuthFileInfo{}, fmt.Errorf("保存凭证文件 %q 失败: %w", cleanName, writeErr)
 		}
+	}
+
+	// 对隔离目录下的 AntiGravity / Gemini OAuth 凭证同步写入真实 agy CLI 标准子目录文件（不改变顶层文件列表）
+	if convertedAcc != nil && (convertedAcc.HasRefreshToken || convertedAcc.HasAccessToken) && !isHostPersonalGeminiOrHomeDir(dirPath) {
+		syncCompanionAGYCLISubdirFiles(dirPath, *convertedAcc)
 	}
 
 	if st, statErr := os.Stat(targetPath); statErr == nil {
 		info.SizeBytes = st.Size()
 		info.UpdatedAt = st.ModTime().UTC().Format(time.RFC3339)
 	} else {
-		info.SizeBytes = int64(len(rawJSON))
+		info.SizeBytes = int64(len(writePayload))
 		info.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	}
 	info.Filename = cleanName
 	info.Source = SourceLocalDir
 	return info, nil
+}
+
+func syncCompanionAGYCLISubdirFiles(absAuthDir string, acc ConvertedAGYAccount) {
+	if len(acc.AGYCLIFiles) == 0 {
+		used := map[string]int{}
+		rebuildAccountAGYFiles(&acc, used, true)
+	}
+	for _, rel := range []string{
+		".gemini/oauth_creds.json",
+		".gemini/google_accounts.json",
+		".config/gcloud/application_default_credentials.json",
+	} {
+		content, ok := acc.AGYCLIFiles[rel]
+		if !ok || strings.TrimSpace(content) == "" {
+			continue
+		}
+		dst := filepath.Join(absAuthDir, filepath.FromSlash(rel))
+		if os.MkdirAll(filepath.Dir(dst), 0o755) == nil {
+			_ = atomicWriteFile(dst, []byte(content), 0o600)
+		}
+	}
 }
 
 // DeleteLocalAuthFile 严格校验文件名路径安全后删除本地凭证文件。

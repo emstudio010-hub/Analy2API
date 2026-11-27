@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cmd2api/ent"
@@ -180,13 +182,15 @@ type SyncNodeAccountsOutput struct {
 
 // AntigravityService 负责 AntiGravity / CLIProxyAPI 容器节点编排、OAuth 登录凭证与账号池同步。
 type AntigravityService struct {
-	db           *ent.Client
-	vault        *crypto.Vault
-	agClient     *antigravity.Client
-	docker       *antigravity.DockerManager
-	dataRoot     string
-	defaultImage string
-	logger       *slog.Logger
+	db            *ent.Client
+	vault         *crypto.Vault
+	agClient      *antigravity.Client
+	docker        *antigravity.DockerManager
+	dataRoot      string
+	defaultImage  string
+	logger        *slog.Logger
+	portMu        sync.Mutex
+	reservedPorts map[int]time.Time
 }
 
 // NewAntigravityService 构造 AntigravityService。
@@ -215,13 +219,14 @@ func NewAntigravityService(
 		logger = slog.Default()
 	}
 	return &AntigravityService{
-		db:           db,
-		vault:        vault,
-		agClient:     agClient,
-		docker:       docker,
-		dataRoot:     dataRoot,
-		defaultImage: defaultImage,
-		logger:       logger,
+		db:            db,
+		vault:         vault,
+		agClient:      agClient,
+		docker:        docker,
+		dataRoot:      dataRoot,
+		defaultImage:  defaultImage,
+		logger:        logger,
+		reservedPorts: make(map[int]time.Time),
 	}
 }
 
@@ -480,7 +485,7 @@ func (s *AntigravityService) UpdateNode(ctx context.Context, id int64, in Update
 		upd = upd.SetAuthDir(strings.TrimSpace(*in.AuthDir))
 	}
 	if in.ProxyURL != nil {
-		p := strings.TrimSpace(*in.ProxyURL)
+		p := preserveRedactedNodeProxy(strings.TrimSpace(*in.ProxyURL), row.ProxyURL)
 		if p != "" {
 			normP, pErr := workbuddy.NormalizeProxyURL(p)
 			if pErr != nil {
@@ -520,7 +525,7 @@ func (s *AntigravityService) UpdateNode(ctx context.Context, id int64, in Update
 
 	effectiveProxy := row.ProxyURL
 	if in.ProxyURL != nil {
-		effectiveProxy = strings.TrimSpace(*in.ProxyURL)
+		effectiveProxy = preserveRedactedNodeProxy(strings.TrimSpace(*in.ProxyURL), row.ProxyURL)
 		if effectiveProxy != "" {
 			if np, pErr := workbuddy.NormalizeProxyURL(effectiveProxy); pErr == nil {
 				effectiveProxy = np
@@ -765,7 +770,7 @@ func (s *AntigravityService) ListAuthFiles(ctx context.Context, nodeID int64) ([
 	return views, nil
 }
 
-// UploadAuthFile 上传 .json 登录凭证到节点（可选自动同步到调度账号池）。
+// UploadAuthFile 上传任意受支持格式凭证到节点（自动识别 Google ADC / Gemini CLI / CPA / 分隔符文本 / Base64 并转为 agy 原生格式，可选自动同步到调度账号池）。
 func (s *AntigravityService) UploadAuthFile(
 	ctx context.Context,
 	nodeID int64,
@@ -780,9 +785,60 @@ func (s *AntigravityService) UploadAuthFile(
 	}
 	spec := s.nodeSpec(row)
 
-	info, err := s.agClient.UploadAuthFile(ctx, spec, filename, content)
+	uploadName := strings.TrimSpace(filename)
+	if uploadName != "" && !strings.HasSuffix(strings.ToLower(uploadName), ".json") {
+		ext := filepath.Ext(uploadName)
+		stem := strings.TrimSuffix(uploadName, ext)
+		if strings.TrimSpace(stem) != "" {
+			uploadName = stem + ".json"
+		} else {
+			uploadName = ""
+		}
+	}
+
+	uploadBytes := content
+	var normalizedAcc *antigravity.ConvertedAGYAccount
+
+	if cleanProbe, sErr := antigravity.SanitizeAuthFilename(firstNonEmptyStrSvc(uploadName, "auth.json")); sErr == nil {
+		if parsedInfo, pErr := antigravity.ParseAuthFileJSON(cleanProbe, content); pErr == nil {
+			// 已是合法 JSON 对象：若是 gcloud_adc / gemini_cli / cpa_export，补齐顶层 antigravity 元数据以便容器与账号池识别
+			if norm, nErr := antigravity.NormalizeSingleCredential(filename, content, row.ProxyURL); nErr == nil && norm.Valid {
+				normalizedAcc = &norm
+				if parsedInfo.Email == "" || parsedInfo.AccountType == "authorized_user" ||
+					norm.SourceFormat == antigravity.SourceFormatGCloudADC ||
+					norm.SourceFormat == antigravity.SourceFormatGeminiCLI ||
+					norm.SourceFormat == antigravity.SourceFormatCPAExport {
+					uploadBytes = norm.CanonicalAuthJSONBytes()
+				}
+				if uploadName == "" {
+					uploadName = norm.AuthFilename
+				}
+			}
+		} else {
+			// 非单一 JSON 对象（例如分隔符文本行、裸 1// refresh_token、CSV、Base64）：自动转换为标准 agy 凭证 JSON
+			norm, nErr := antigravity.NormalizeSingleCredential(filename, content, row.ProxyURL)
+			if nErr != nil {
+				return nil, pErr
+			}
+			normalizedAcc = &norm
+			uploadBytes = norm.CanonicalAuthJSONBytes()
+			if uploadName == "" {
+				uploadName = norm.AuthFilename
+			}
+		}
+	}
+	if uploadName == "" {
+		uploadName = fmt.Sprintf("agy-%d.json", time.Now().Unix())
+	}
+
+	info, err := s.agClient.UploadAuthFile(ctx, spec, uploadName, uploadBytes)
 	if err != nil {
 		return nil, err
+	}
+
+	// 若节点具备本地隔离目录且转换出了有效 OAuth 令牌，确保完整写入 .gemini/oauth_creds.json 等伴生文件
+	if normalizedAcc != nil && strings.TrimSpace(spec.AuthDir) != "" {
+		_, _ = antigravity.WriteIsolatedAGYAuthFiles(spec.AuthDir, *normalizedAcc, info.Filename)
 	}
 
 	// 刷新节点 auth_files_count
@@ -799,6 +855,11 @@ func (s *AntigravityService) UploadAuthFile(
 		}
 		for _, a := range syncOut.Accounts {
 			if strings.EqualFold(extractExtraString(a.Extra, "auth_file"), info.Filename) {
+				if normalizedAcc != nil {
+					if enriched, eErr := s.enrichSyncedAccountBundle(ctx, a, *normalizedAcc, spec.AuthDir); eErr == nil && enriched != nil {
+						a = enriched
+					}
+				}
 				syncedAcc = a
 				idCopy := a.ID
 				view.AccountID = &idCopy
@@ -1090,8 +1151,9 @@ func (s *AntigravityService) resolveOrEnsureAntigravityGroups(ctx context.Contex
 		return []int64{existingGroups[0].ID}, nil
 	}
 
-	// 自动创建默认分组 "antigravity"（若同名已被软删占用则附加后缀）。
+	// 自动创建默认分组 "antigravity"（若存在同名已软删旧分组则先归档释放唯一索引）。
 	groupName := domain.PlatformAntigravity
+	s.archiveSoftDeletedGroupByName(ctx, groupName)
 	nameTaken, _ := s.db.Group.Query().Where(group.NameEQ(groupName)).Exist(ctx)
 	if nameTaken {
 		groupName = fmt.Sprintf("antigravity-%d", time.Now().Unix()%10000)
@@ -1298,7 +1360,7 @@ func (s *AntigravityService) toNodeViewWithPeerSet(ctx context.Context, row *ent
 		MaskedManagementKey: crypto.MaskKey(mgmtPlain),
 		HasAPIKey:           apiPlain != "",
 		MaskedAPIKey:        crypto.MaskKey(apiPlain),
-		ProxyURL:            row.ProxyURL,
+		ProxyURL:            workbuddy.RedactProxyURL(row.ProxyURL),
 		StrictIsolation:     spec.StrictIsolation,
 		Fingerprint:         spec.Fingerprint,
 		IsolationStatus:     isoStatus,
@@ -1496,20 +1558,37 @@ type ProvisionAccountContainerInput struct {
 	AuthJSON        []byte
 }
 
-// AllocateFreeHostPort 扫描全部已登记容器节点，自动分配一个未占用的宿主机映射端口（从 18317 起步）。
+// AllocateFreeHostPort 扫描全部已登记容器节点与短期预占表，并发安全地分配未占用的宿主机映射端口（从 18317 起步）。
 func (s *AntigravityService) AllocateFreeHostPort(ctx context.Context) (int, error) {
+	s.portMu.Lock()
+	defer s.portMu.Unlock()
+
 	rows, err := s.db.ContainerNode.Query().All(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("查询容器端口占用失败: %w", err)
 	}
-	used := make(map[int]struct{}, len(rows))
+	now := time.Now()
+	if s.reservedPorts == nil {
+		s.reservedPorts = make(map[int]time.Time)
+	}
+	for p, exp := range s.reservedPorts {
+		if now.After(exp) {
+			delete(s.reservedPorts, p)
+		}
+	}
+
+	used := make(map[int]struct{}, len(rows)+len(s.reservedPorts))
 	for _, r := range rows {
 		if r.HostPort > 0 {
 			used[r.HostPort] = struct{}{}
 		}
 	}
+	for p := range s.reservedPorts {
+		used[p] = struct{}{}
+	}
 	for port := 18317; port < 28317; port++ {
 		if _, taken := used[port]; !taken {
+			s.reservedPorts[port] = now.Add(30 * time.Second)
 			return port, nil
 		}
 	}
@@ -1548,11 +1627,22 @@ func (s *AntigravityService) ProvisionAccountContainer(ctx context.Context, in P
 		return nil, nil, fmt.Errorf("账号 #%d 平台为 %s，仅 antigravity 账号支持自动分配独立 agy 容器", acc.ID, acc.Platform)
 	}
 
-	// 若账号已绑定专属容器节点，则直接复用（必要时自动启动）
+	// 若账号已绑定专属容器节点，则直接复用（如携带最新凭证则同步刷新隔离目录，必要时自动启动）
 	if existingNodeID := extractExtraInt64(acc.Extra, "node_id"); existingNodeID > 0 {
 		if row, gErr := s.getNodeRow(ctx, existingNodeID); gErr == nil && row != nil {
 			boundID := extractExtraInt64(row.Extra, "bound_account_id")
 			if boundID == 0 || boundID == acc.ID {
+				if len(in.AuthJSON) > 0 && strings.TrimSpace(row.AuthDir) != "" {
+					fname := strings.TrimSpace(in.AuthFilename)
+					if fname == "" {
+						fname = fmt.Sprintf("account-%d.json", acc.ID)
+					}
+					if normAcc, nErr := antigravity.NormalizeSingleCredential(fname, in.AuthJSON, row.ProxyURL); nErr == nil && normAcc.Valid {
+						_, _ = antigravity.WriteIsolatedAGYAuthFiles(row.AuthDir, normAcc, fname)
+					} else {
+						_, _ = antigravity.SaveLocalAuthFile(row.AuthDir, fname, in.AuthJSON)
+					}
+				}
 				if in.AutoStart && row.Mode == domain.ContainerModeLocalDocker && row.Status != "running" {
 					if env := s.DetectEnv(ctx); env.DockerAvailable {
 						_, _ = s.RunNodeAction(ctx, row.ID, "start")
@@ -1619,23 +1709,46 @@ func (s *AntigravityService) ProvisionAccountContainer(ctx context.Context, in P
 		return nil, nil, err
 	}
 
-	// 如携带初始 OAuth JSON，自动落盘到该账号专属容器的 auth_dir
+	// 如携带初始凭证，自动转换为真实 agy CLI 可识别全套文件并落盘到该账号专属容器的 auth_dir
+	var savedAuthFilename string
 	if len(in.AuthJSON) > 0 {
 		fname := strings.TrimSpace(in.AuthFilename)
 		if fname == "" {
 			fname = fmt.Sprintf("account-%d.json", acc.ID)
 		}
-		_, _ = antigravity.SaveLocalAuthFile(nodeView.AuthDir, fname, in.AuthJSON)
+		if normAcc, nErr := antigravity.NormalizeSingleCredential(fname, in.AuthJSON, proxyURL); nErr == nil && normAcc.Valid {
+			_, _ = antigravity.WriteIsolatedAGYAuthFiles(nodeView.AuthDir, normAcc, fname)
+			if cleanName, cErr := antigravity.SanitizeAuthFilename(fname); cErr == nil {
+				savedAuthFilename = cleanName
+			} else {
+				savedAuthFilename = normAcc.AuthFilename
+			}
+		} else if savedInfo, sErr := antigravity.SaveLocalAuthFile(nodeView.AuthDir, fname, in.AuthJSON); sErr == nil {
+			savedAuthFilename = savedInfo.Filename
+		}
+	} else {
+		// 从已有账号加密凭证反推一套标准 agy CLI 文件写入专属隔离目录，确保即刻可由 agy.exe 直接加载
+		if synth := s.synthesizeAGYAccountFromEnt(acc, proxyURL); synth.Valid {
+			fname := fmt.Sprintf("account-%d.json", acc.ID)
+			_, _ = antigravity.WriteIsolatedAGYAuthFiles(nodeView.AuthDir, synth, fname)
+			savedAuthFilename = fname
+		}
 	}
 
 	row, err := s.getNodeRow(ctx, nodeView.ID)
 	if err != nil {
 		return nodeView, acc, nil
 	}
+	if savedAuthFilename != "" {
+		if files, lErr := antigravity.ListLocalAuthFiles(nodeView.AuthDir); lErr == nil {
+			row, _ = row.Update().SetAuthFilesCount(len(files)).Save(ctx)
+			nodeView.AuthFilesCount = len(files)
+		}
+	}
 	spec := s.nodeSpec(row)
 	baseURL := antigravity.BaseURL(spec)
 
-	creds, err := s.buildAntigravityCredentials(spec, baseURL)
+	creds, err := s.buildAntigravityCredentialsWithBase(spec, baseURL, acc.Credentials)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1646,6 +1759,10 @@ func (s *AntigravityService) ProvisionAccountContainer(ctx context.Context, in P
 	extra["node_id"] = nodeView.ID
 	extra["node_name"] = nodeView.Name
 	extra["container_name"] = nodeView.ContainerName
+	extra["auth_dir"] = nodeView.AuthDir
+	if savedAuthFilename != "" {
+		extra["auth_file"] = savedAuthFilename
+	}
 	extra["dedicated_container"] = true
 	extra["single_account"] = true
 	extra["base_url"] = baseURL
@@ -1702,4 +1819,569 @@ func extractExtraInt64(m map[string]any, key string) int64 {
 		}
 	}
 	return 0
+}
+
+// ConvertAccountsInput 描述全格式凭证解析与可选一键入池的入参。
+type ConvertAccountsInput struct {
+	Files         []antigravity.AdapterInputFile
+	AutoImport    bool
+	NodeID        int64
+	GroupIDs      []int64
+	ProxyURL      string
+	AutoProvision *bool
+	Deduplicate   *bool
+}
+
+// ConvertImportResult 描述全格式转换后自动导入 AntiGravity 账号池的执行结果。
+type ConvertImportResult struct {
+	Imported int            `json:"imported"`
+	Created  int            `json:"created"`
+	Updated  int            `json:"updated"`
+	Failed   int            `json:"failed"`
+	NodeID   int64          `json:"node_id,omitempty"`
+	GroupIDs []int64        `json:"group_ids,omitempty"`
+	Accounts []*ent.Account `json:"accounts"`
+	Errors   []string       `json:"errors,omitempty"`
+}
+
+// ConvertAccountsOutput 是 ConvertAndImportAccounts 的聚合输出。
+type ConvertAccountsOutput struct {
+	*antigravity.ConvertBatchResult
+	ImportResult *ConvertImportResult `json:"import_result,omitempty"`
+}
+
+// ConvertAndImportAccounts 自动嗅探并转换任意格式账号包为真实 `agy` CLI 规范格式，支持一键导入指定容器节点或独立账号池。
+func (s *AntigravityService) ConvertAndImportAccounts(ctx context.Context, in ConvertAccountsInput) (*ConvertAccountsOutput, error) {
+	batch, err := antigravity.ConvertCredentialsToAGY(in.Files, antigravity.ConvertOptions{
+		DefaultProxy: in.ProxyURL,
+		Deduplicate:  in.Deduplicate,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := &ConvertAccountsOutput{
+		ConvertBatchResult: batch,
+	}
+	if !in.AutoImport || batch.ValidCount == 0 {
+		return out, nil
+	}
+
+	targetGroups, err := s.resolveOrEnsureAntigravityGroups(ctx, in.GroupIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	imp := &ConvertImportResult{
+		NodeID:   in.NodeID,
+		GroupIDs: targetGroups,
+		Accounts: []*ent.Account{},
+	}
+
+	// 分支 A：导入到显式指定的容器节点并同步进调度池
+	if in.NodeID > 0 {
+		row, nErr := s.getNodeRow(ctx, in.NodeID)
+		if nErr != nil {
+			return nil, nErr
+		}
+		spec := s.nodeSpec(row)
+		uploadedByFile := make(map[string]antigravity.ConvertedAGYAccount)
+		for _, acc := range batch.Accounts {
+			if !acc.Valid {
+				continue
+			}
+			upOut, uErr := s.UploadAuthFile(ctx, in.NodeID, acc.AuthFilename, acc.CanonicalAuthJSONBytes(), false, nil)
+			if uErr != nil {
+				imp.Failed++
+				imp.Errors = append(imp.Errors, fmt.Sprintf("%s: %v", acc.Name, uErr))
+				continue
+			}
+			uploadedByFile[strings.ToLower(upOut.File.Filename)] = acc
+		}
+		if len(uploadedByFile) > 0 {
+			syncOut, sErr := s.SyncNodeAccountsWithOptions(ctx, in.NodeID, SyncNodeAccountsOptions{
+				GroupIDs: targetGroups,
+				ProxyURL: in.ProxyURL,
+			})
+			if sErr != nil {
+				imp.Errors = append(imp.Errors, sErr.Error())
+			} else {
+				imp.Created = syncOut.Created
+				imp.Updated = syncOut.Updated
+				imp.Imported = syncOut.Created + syncOut.Updated
+				for _, savedAcc := range syncOut.Accounts {
+					af := strings.ToLower(extractExtraString(savedAcc.Extra, "auth_file"))
+					if srcConv, ok := uploadedByFile[af]; ok {
+						if enriched, eErr := s.enrichSyncedAccountBundle(ctx, savedAcc, srcConv, spec.AuthDir); eErr == nil && enriched != nil {
+							savedAcc = enriched
+						}
+					}
+					imp.Accounts = append(imp.Accounts, savedAcc)
+				}
+				imp.Errors = append(imp.Errors, syncOut.Errors...)
+			}
+		}
+		out.ImportResult = imp
+		return out, nil
+	}
+
+	// 分支 B：直接入池（支持幂等 Upsert + AuthBundle 加密存储 + 自动分配 1:1 专属隔离目录与容器）
+	autoProvision := true
+	if in.AutoProvision != nil {
+		autoProvision = *in.AutoProvision
+	}
+
+	existingRows, _ := s.db.Account.Query().
+		Where(account.DeletedAtIsNil(), account.PlatformEQ(domain.PlatformAntigravity)).
+		WithGroups().
+		All(ctx)
+
+	for _, conv := range batch.Accounts {
+		if !conv.Valid {
+			continue
+		}
+		savedAcc, isCreated, saveErr := s.upsertConvertedAccountToPool(ctx, conv, existingRows, targetGroups, autoProvision)
+		if saveErr != nil {
+			imp.Failed++
+			imp.Errors = append(imp.Errors, fmt.Sprintf("%s: %v", conv.Name, saveErr))
+			continue
+		}
+		if isCreated {
+			imp.Created++
+			existingRows = append(existingRows, savedAcc)
+		} else {
+			imp.Updated++
+		}
+		imp.Imported++
+		imp.Accounts = append(imp.Accounts, savedAcc)
+	}
+
+	out.ImportResult = imp
+	return out, nil
+}
+
+func (s *AntigravityService) upsertConvertedAccountToPool(
+	ctx context.Context,
+	conv antigravity.ConvertedAGYAccount,
+	existingRows []*ent.Account,
+	groupIDs []int64,
+	autoProvision bool,
+) (*ent.Account, bool, error) {
+	matched := s.matchExistingAntigravityAccount(existingRows, conv)
+
+	apiToken := firstNonEmptyStrSvc(conv.AccessToken, conv.RefreshToken, "agy-oauth-json")
+	creds, err := s.buildConvertedAuthBundleCreds(apiToken, conv, nil)
+	if err != nil {
+		return nil, false, err
+	}
+
+	var expPtr *time.Time
+	if conv.ExpiresAt != "" {
+		if parsed, pErr := time.Parse(time.RFC3339, conv.ExpiresAt); pErr == nil {
+			expPtr = &parsed
+		}
+	}
+
+	var saved *ent.Account
+	isCreated := false
+
+	if matched != nil {
+		mergedCreds, cErr := s.buildConvertedAuthBundleCreds(apiToken, conv, matched.Credentials)
+		if cErr != nil {
+			return nil, false, cErr
+		}
+		extra := cloneAnyMap(matched.Extra)
+		extra["source_format"] = conv.SourceFormat
+		if conv.ProjectID != "" {
+			extra["project_id"] = conv.ProjectID
+		}
+		if conv.ClientID != "" {
+			extra["client_id"] = conv.ClientID
+		}
+		upd := matched.Update().
+			SetCredentials(mergedCreds).
+			SetExtra(extra).
+			SetStatus(domain.StatusActive).
+			SetSchedulable(true).
+			ClearErrorMessage()
+		if conv.Email != "" {
+			upd = upd.SetEmail(conv.Email)
+		}
+		if conv.RawProxy != "" {
+			upd = upd.SetProxyURL(conv.RawProxy)
+		}
+		if expPtr != nil {
+			upd = upd.SetExpiresAt(*expPtr)
+		}
+		saved, err = upd.Save(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+	} else {
+		isCreated = true
+		qimei, mid := workbuddy.GenerateDevice()
+		accName := strings.TrimSpace(conv.Name)
+		if accName == "" {
+			accName = "agy-imported"
+		}
+		if len(accName) > 100 {
+			accName = accName[:100]
+		}
+		extra := map[string]any{
+			"source_format": conv.SourceFormat,
+			"auth_file":     conv.AuthFilename,
+		}
+		if conv.ProjectID != "" {
+			extra["project_id"] = conv.ProjectID
+		}
+		if conv.ClientID != "" {
+			extra["client_id"] = conv.ClientID
+		}
+		prio := conv.Priority
+		if prio <= 0 {
+			prio = 50
+		}
+		createB := s.db.Account.Create().
+			SetName(accName).
+			SetPlatform(domain.PlatformAntigravity).
+			SetType(domain.AccountTypeOAuthJSON).
+			SetDomain("http://127.0.0.1:8317").
+			SetEmail(conv.Email).
+			SetProxyURL(conv.RawProxy).
+			SetQimei36(qimei).
+			SetMachineID(mid).
+			SetCredentials(creds).
+			SetExtra(extra).
+			SetConcurrency(5).
+			SetPriority(prio).
+			SetRateMultiplier(1.0).
+			SetStatus(domain.StatusActive).
+			SetSchedulable(true)
+		if expPtr != nil {
+			createB = createB.SetExpiresAt(*expPtr)
+		}
+		saved, err = createB.Save(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+
+	if len(groupIDs) > 0 {
+		_ = s.bindAccountGroups(ctx, saved.ID, groupIDs)
+	}
+
+	if autoProvision {
+		_, provisionedAcc, pErr := s.ProvisionAccountContainer(ctx, ProvisionAccountContainerInput{
+			AccountID:    saved.ID,
+			ProxyURL:     conv.RawProxy,
+			AutoStart:    true,
+			AuthFilename: conv.AuthFilename,
+			AuthJSON:     conv.CanonicalAuthJSONBytes(),
+		})
+		if pErr == nil && provisionedAcc != nil {
+			saved = provisionedAcc
+		} else if pErr != nil {
+			// 即便端口或容器受限，仍确保在独立目录落盘真实 agy CLI 原生凭证文件
+			isoDir := filepath.Join(s.dataRoot, fmt.Sprintf("account-%d", saved.ID), "auths")
+			if _, wErr := antigravity.WriteIsolatedAGYAuthFiles(isoDir, conv, conv.AuthFilename); wErr == nil {
+				extra := cloneAnyMap(saved.Extra)
+				extra["auth_dir"] = isoDir
+				extra["auth_file"] = conv.AuthFilename
+				if uAcc, uErr := saved.Update().SetExtra(extra).Save(ctx); uErr == nil {
+					saved = uAcc
+				}
+			}
+		}
+	} else {
+		isoDir := filepath.Join(s.dataRoot, fmt.Sprintf("account-%d", saved.ID), "auths")
+		if _, wErr := antigravity.WriteIsolatedAGYAuthFiles(isoDir, conv, conv.AuthFilename); wErr == nil {
+			extra := cloneAnyMap(saved.Extra)
+			extra["auth_dir"] = isoDir
+			extra["auth_file"] = conv.AuthFilename
+			if uAcc, uErr := saved.Update().SetExtra(extra).Save(ctx); uErr == nil {
+				saved = uAcc
+			}
+		}
+	}
+
+	if reloaded, rErr := s.db.Account.Query().Where(account.IDEQ(saved.ID)).WithGroups().Only(ctx); rErr == nil {
+		saved = reloaded
+	}
+	return saved, isCreated, nil
+}
+
+func (s *AntigravityService) matchExistingAntigravityAccount(rows []*ent.Account, conv antigravity.ConvertedAGYAccount) *ent.Account {
+	if conv.Email != "" {
+		for _, r := range rows {
+			if strings.EqualFold(strings.TrimSpace(r.Email), conv.Email) {
+				return r
+			}
+		}
+	}
+	if conv.RefreshToken != "" {
+		for _, r := range rows {
+			if rt := s.decryptAccountCredField(r.Credentials, "refresh_token_encrypted", "refresh_token"); rt != "" && rt == conv.RefreshToken {
+				return r
+			}
+		}
+	}
+	if conv.Name != "" && !strings.HasPrefix(conv.Name, "agy-token-") {
+		for _, r := range rows {
+			if strings.EqualFold(strings.TrimSpace(r.Name), conv.Name) {
+				return r
+			}
+		}
+	}
+	return nil
+}
+
+func (s *AntigravityService) buildConvertedAuthBundleCreds(
+	apiToken string,
+	conv antigravity.ConvertedAGYAccount,
+	base map[string]any,
+) (map[string]any, error) {
+	creds := cloneAnyMap(base)
+	if apiToken != "" {
+		enc, err := s.encryptSecret(apiToken)
+		if err != nil {
+			return nil, err
+		}
+		if s.vault != nil {
+			creds["api_key_encrypted"] = enc
+			delete(creds, "api_key")
+		} else {
+			creds["api_key"] = apiToken
+		}
+	}
+	if conv.RefreshToken != "" {
+		enc, err := s.encryptSecret(conv.RefreshToken)
+		if err != nil {
+			return nil, err
+		}
+		if s.vault != nil {
+			creds["refresh_token_encrypted"] = enc
+			delete(creds, "refresh_token")
+		} else {
+			creds["refresh_token"] = conv.RefreshToken
+		}
+	}
+	if conv.ClientSecret != "" {
+		enc, err := s.encryptSecret(conv.ClientSecret)
+		if err != nil {
+			return nil, err
+		}
+		if s.vault != nil {
+			creds["client_secret_encrypted"] = enc
+			delete(creds, "client_secret")
+		} else {
+			creds["client_secret"] = conv.ClientSecret
+		}
+	}
+
+	bundleMeta := map[string]any{
+		"format":         "agy_cli_v1",
+		"source_format":  conv.SourceFormat,
+		"client_id":      conv.ClientID,
+		"project_id":     conv.ProjectID,
+		"scope":          conv.Scope,
+		"expiry_date_ms": conv.ExpiryDateMs,
+		"expires_at":     conv.ExpiresAt,
+		"auth_filename":  conv.AuthFilename,
+	}
+	creds["auth_bundle"] = bundleMeta
+	if conv.ClientID != "" {
+		creds["client_id"] = conv.ClientID
+	}
+	if conv.ProjectID != "" {
+		creds["project_id"] = conv.ProjectID
+	}
+	return creds, nil
+}
+
+func (s *AntigravityService) buildAntigravityCredentialsWithBase(spec antigravity.NodeSpec, baseURL string, existing map[string]any) (map[string]any, error) {
+	nodeCreds, err := s.buildAntigravityCredentials(spec, baseURL)
+	if err != nil {
+		return nil, err
+	}
+	merged := cloneAnyMap(existing)
+	// 若原账号已有 OAuth refresh_token / auth_bundle，保留它们，仅写入节点推理与管理端点凭证
+	for k, v := range nodeCreds {
+		merged[k] = v
+	}
+	return merged, nil
+}
+
+func (s *AntigravityService) enrichSyncedAccountBundle(
+	ctx context.Context,
+	acc *ent.Account,
+	conv antigravity.ConvertedAGYAccount,
+	authDir string,
+) (*ent.Account, error) {
+	if acc == nil {
+		return nil, nil
+	}
+	creds, err := s.buildConvertedAuthBundleCreds("", conv, acc.Credentials)
+	if err != nil {
+		return acc, err
+	}
+	extra := cloneAnyMap(acc.Extra)
+	extra["source_format"] = conv.SourceFormat
+	if strings.TrimSpace(authDir) != "" {
+		extra["auth_dir"] = strings.TrimSpace(authDir)
+	}
+	if conv.ProjectID != "" {
+		extra["project_id"] = conv.ProjectID
+	}
+	upd := acc.Update().SetCredentials(creds).SetExtra(extra)
+	if conv.ExpiresAt != "" {
+		if parsed, pErr := time.Parse(time.RFC3339, conv.ExpiresAt); pErr == nil {
+			upd = upd.SetExpiresAt(parsed)
+		}
+	}
+	saved, sErr := upd.Save(ctx)
+	if sErr != nil {
+		return acc, sErr
+	}
+	if reloaded, rErr := s.db.Account.Query().Where(account.IDEQ(saved.ID)).WithGroups().Only(ctx); rErr == nil {
+		return reloaded, nil
+	}
+	return saved, nil
+}
+
+func (s *AntigravityService) synthesizeAGYAccountFromEnt(acc *ent.Account, proxyURL string) antigravity.ConvertedAGYAccount {
+	if acc == nil {
+		return antigravity.ConvertedAGYAccount{}
+	}
+	accessTok := s.decryptAccountCredField(acc.Credentials, "api_key_encrypted", "api_key")
+	refreshTok := s.decryptAccountCredField(acc.Credentials, "refresh_token_encrypted", "refresh_token")
+	clientSec := s.decryptAccountCredField(acc.Credentials, "client_secret_encrypted", "client_secret")
+	if strings.HasPrefix(accessTok, "sk-agy-") || accessTok == "agy-oauth-json" {
+		accessTok = ""
+	}
+	if strings.HasPrefix(accessTok, "1//") && refreshTok == "" {
+		refreshTok = accessTok
+		accessTok = ""
+	}
+	if accessTok == "" && refreshTok == "" {
+		return antigravity.ConvertedAGYAccount{}
+	}
+	clientID := extractExtraString(acc.Credentials, "client_id")
+	if clientID == "" {
+		clientID = extractExtraString(acc.Extra, "client_id")
+	}
+	projectID := extractExtraString(acc.Credentials, "project_id")
+	if projectID == "" {
+		projectID = extractExtraString(acc.Extra, "project_id")
+	}
+	var expStr string
+	var expMs int64
+	if acc.ExpiresAt != nil {
+		expStr = acc.ExpiresAt.UTC().Format(time.RFC3339)
+		expMs = acc.ExpiresAt.UnixMilli()
+	}
+	rawJSON, _ := json.Marshal(map[string]any{
+		"type":          "antigravity",
+		"email":         acc.Email,
+		"name":          acc.Name,
+		"access_token":  accessTok,
+		"refresh_token": refreshTok,
+		"client_id":     clientID,
+		"client_secret": clientSec,
+		"project_id":    projectID,
+		"expires_at":    expStr,
+		"expiry_date":   expMs,
+	})
+	norm, err := antigravity.NormalizeSingleCredential(fmt.Sprintf("account-%d.json", acc.ID), rawJSON, proxyURL)
+	if err != nil {
+		return antigravity.ConvertedAGYAccount{}
+	}
+	return norm
+}
+
+func (s *AntigravityService) decryptAccountCredField(creds map[string]any, encKey, plainKey string) string {
+	if creds == nil {
+		return ""
+	}
+	if enc, ok := creds[encKey].(string); ok && strings.TrimSpace(enc) != "" {
+		if dec := s.decryptSecret(enc); dec != "" {
+			return dec
+		}
+	}
+	if raw, ok := creds[plainKey].(string); ok {
+		return strings.TrimSpace(raw)
+	}
+	return ""
+}
+
+func (s *AntigravityService) archiveSoftDeletedGroupByName(ctx context.Context, name string) {
+	if strings.TrimSpace(name) == "" {
+		return
+	}
+	softDeleted, err := s.db.Group.Query().
+		Where(group.NameEQ(name), group.DeletedAtNotNil()).
+		All(ctx)
+	if err != nil {
+		return
+	}
+	for _, r := range softDeleted {
+		archived := fmt.Sprintf("%s__deleted_%d", r.Name, time.Now().UnixNano())
+		_, _ = r.Update().SetName(archived).Save(ctx)
+	}
+}
+
+func preserveRedactedNodeProxy(newRaw, existingRaw string) string {
+	trimmedNew := strings.TrimSpace(newRaw)
+	trimmedOld := strings.TrimSpace(existingRaw)
+	if trimmedNew == "" {
+		return ""
+	}
+	lowerNew := strings.ToLower(trimmedNew)
+	if !strings.Contains(lowerNew, "***") && !strings.Contains(lowerNew, "%2a%2a%2a") {
+		return trimmedNew
+	}
+	if trimmedOld == "" {
+		return ""
+	}
+	uNew, errNew := parseProxyForCompare(trimmedNew)
+	uOld, errOld := parseProxyForCompare(trimmedOld)
+	if errNew != nil || errOld != nil {
+		return trimmedOld
+	}
+	if strings.EqualFold(uNew.Scheme, uOld.Scheme) && strings.EqualFold(uNew.Host, uOld.Host) {
+		newUser := uNew.User.Username()
+		oldUser := uOld.User.Username()
+		if newUser == "" || newUser == "***" || newUser == oldUser {
+			return trimmedOld
+		}
+		if oldPass, hasPass := uOld.User.Password(); hasPass && oldPass != "" {
+			uNew.User = url.UserPassword(newUser, oldPass)
+			return uNew.String()
+		}
+	}
+	return trimmedOld
+}
+
+func parseProxyForCompare(raw string) (*url.URL, error) {
+	s := strings.TrimSpace(raw)
+	if !strings.Contains(s, "://") {
+		s = "http://" + s
+	}
+	return url.Parse(s)
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	out := make(map[string]any, len(src)+4)
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+func firstNonEmptyStrSvc(vals ...string) string {
+	for _, v := range vals {
+		if t := strings.TrimSpace(v); t != "" {
+			return t
+		}
+	}
+	return ""
 }

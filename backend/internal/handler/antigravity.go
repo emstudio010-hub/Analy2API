@@ -4,11 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"cmd2api/internal/antigravity"
+	"cmd2api/internal/config"
 	"cmd2api/internal/service"
+	"cmd2api/internal/workbuddy"
 
 	"github.com/gin-gonic/gin"
 )
@@ -671,4 +677,398 @@ func (h *Handler) ProvisionAntigravityAccountContainer(c *gin.Context) {
 		"node":    nodeView,
 		"account": accDTO,
 	})
+}
+
+type convertAntigravityFilePayload struct {
+	Filename string `json:"filename"`
+	Content  string `json:"content"`
+}
+
+type convertAntigravityAccountsRequest struct {
+	RawText       string                          `json:"raw_text"`
+	Filename      string                          `json:"filename"`
+	Files         []convertAntigravityFilePayload `json:"files"`
+	AutoImport    bool                            `json:"auto_import"`
+	NodeID        int64                           `json:"node_id"`
+	GroupIDs      []int64                         `json:"group_ids"`
+	ProxyURL      string                          `json:"proxy_url"`
+	AutoProvision *bool                           `json:"auto_provision"`
+	Deduplicate   *bool                           `json:"deduplicate"`
+}
+
+// ConvertAntigravityAccounts 全格式多账号自动识别并转为真实 `agy` CLI 原生格式，支持一键导入号池/容器（POST /api/antigravity/accounts/convert）。
+// 同时接受 `multipart/form-data`（`files` / `files[]`）与 `application/json`。
+func (h *Handler) ConvertAntigravityAccounts(c *gin.Context) {
+	in, err := parseConvertAntigravityRequest(c)
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx := c.Request.Context()
+	if !in.AutoImport {
+		// 纯解析预览与下载凭证包不强依赖数据库节点（即使无 DB 也可离线测试转换）
+		batch, convErr := antigravity.ConvertCredentialsToAGY(in.Files, antigravity.ConvertOptions{
+			DefaultProxy: in.ProxyURL,
+			Deduplicate:  in.Deduplicate,
+		})
+		if convErr != nil {
+			fail(c, http.StatusBadRequest, convErr.Error())
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"ok":                batch.OK,
+			"total":             batch.Total,
+			"valid_count":       batch.ValidCount,
+			"invalid_count":     batch.InvalidCount,
+			"duplicate_count":   batch.DuplicateCount,
+			"detected_formats":  batch.DetectedFormats,
+			"summary":           batch.Summary,
+			"accounts":          batch.Accounts,
+			"items":             batch.Accounts,
+			"bundle_filename":   batch.BundleFilename,
+			"bundle_zip_base64": batch.BundleZipBase64,
+			"bundle_json":       batch.BundleJSON,
+		})
+		return
+	}
+
+	svc := h.antigravitySvc()
+	if svc == nil {
+		fail(c, http.StatusServiceUnavailable, "AntiGravity 服务未初始化，无法执行自动入池")
+		return
+	}
+
+	out, err := svc.ConvertAndImportAccounts(ctx, in)
+	if err != nil {
+		if errors.Is(err, service.ErrContainerNodeNotFound) {
+			fail(c, http.StatusNotFound, err.Error())
+			return
+		}
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if out.ImportResult != nil && out.ImportResult.Imported > 0 {
+		if h.sched != nil {
+			h.sched.Invalidate()
+		}
+		if ps := h.promptSvc(); ps != nil {
+			_ = ps.ReloadEngine(ctx)
+		}
+	}
+
+	var importDTO gin.H
+	if out.ImportResult != nil {
+		dtos := make([]accountDTO, 0, len(out.ImportResult.Accounts))
+		for _, a := range out.ImportResult.Accounts {
+			dtos = append(dtos, h.toAccountDTO(a))
+		}
+		importDTO = gin.H{
+			"imported":  out.ImportResult.Imported,
+			"created":   out.ImportResult.Created,
+			"updated":   out.ImportResult.Updated,
+			"failed":    out.ImportResult.Failed,
+			"node_id":   out.ImportResult.NodeID,
+			"group_ids": out.ImportResult.GroupIDs,
+			"accounts":  dtos,
+			"errors":    out.ImportResult.Errors,
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":                out.OK,
+		"total":             out.Total,
+		"valid_count":       out.ValidCount,
+		"invalid_count":     out.InvalidCount,
+		"duplicate_count":   out.DuplicateCount,
+		"detected_formats":  out.DetectedFormats,
+		"summary":           out.Summary,
+		"accounts":          out.Accounts,
+		"items":             out.Accounts,
+		"bundle_filename":   out.BundleFilename,
+		"bundle_zip_base64": out.BundleZipBase64,
+		"bundle_json":       out.BundleJSON,
+		"import_result":     importDTO,
+	})
+}
+
+func parseConvertAntigravityRequest(c *gin.Context) (service.ConvertAccountsInput, error) {
+	contentType := strings.ToLower(strings.TrimSpace(c.GetHeader("Content-Type")))
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		if err := c.Request.ParseMultipartForm(40 << 20); err != nil {
+			return service.ConvertAccountsInput{}, fmt.Errorf("解析 multipart 表单失败: %w", err)
+		}
+		form := c.Request.MultipartForm
+		var files []antigravity.AdapterInputFile
+		if form != nil {
+			var fileHeaders []*multipart.FileHeader
+			fileHeaders = append(fileHeaders, form.File["files"]...)
+			fileHeaders = append(fileHeaders, form.File["files[]"]...)
+			fileHeaders = append(fileHeaders, form.File["file"]...)
+			for _, fh := range fileHeaders {
+				f, openErr := fh.Open()
+				if openErr != nil {
+					return service.ConvertAccountsInput{}, fmt.Errorf("读取上传文件 %q 失败: %w", fh.Filename, openErr)
+				}
+				raw, readErr := io.ReadAll(io.LimitReader(f, antigravity.MaxZipCompressedBytes+1))
+				_ = f.Close()
+				if readErr != nil {
+					return service.ConvertAccountsInput{}, fmt.Errorf("读取上传文件 %q 内容失败: %w", fh.Filename, readErr)
+				}
+				if len(raw) > antigravity.MaxZipCompressedBytes {
+					return service.ConvertAccountsInput{}, fmt.Errorf("上传文件 %q 超过 32MB 限制", fh.Filename)
+				}
+				files = append(files, antigravity.AdapterInputFile{
+					Filename: fh.Filename,
+					Content:  raw,
+				})
+			}
+		}
+		rawText := strings.TrimSpace(c.PostForm("raw_text"))
+		if rawText != "" {
+			hintName := strings.TrimSpace(c.PostForm("filename"))
+			if hintName == "" {
+				hintName = "pasted-input.txt"
+			}
+			files = append(files, antigravity.AdapterInputFile{
+				Filename: hintName,
+				Content:  []byte(rawText),
+			})
+		}
+		if len(files) == 0 {
+			return service.ConvertAccountsInput{}, errors.New("请至少上传一个凭证文件或粘贴凭证文本")
+		}
+
+		autoImport, _ := strconv.ParseBool(strings.TrimSpace(c.PostForm("auto_import")))
+		nodeID, _ := strconv.ParseInt(strings.TrimSpace(c.PostForm("node_id")), 10, 64)
+		groupIDs := parseFlexibleGroupIDsForm(c.PostFormArray("group_ids"), c.PostFormArray("group_ids[]"))
+		proxyURL := strings.TrimSpace(c.PostForm("proxy_url"))
+
+		var autoProvPtr *bool
+		if rawAP := strings.TrimSpace(c.PostForm("auto_provision")); rawAP != "" {
+			b, bErr := strconv.ParseBool(rawAP)
+			if bErr == nil {
+				autoProvPtr = &b
+			}
+		}
+		var dedupPtr *bool
+		if rawDedup := strings.TrimSpace(c.PostForm("deduplicate")); rawDedup != "" {
+			b, bErr := strconv.ParseBool(rawDedup)
+			if bErr == nil {
+				dedupPtr = &b
+			}
+		}
+
+		return service.ConvertAccountsInput{
+			Files:         files,
+			AutoImport:    autoImport,
+			NodeID:        nodeID,
+			GroupIDs:      groupIDs,
+			ProxyURL:      proxyURL,
+			AutoProvision: autoProvPtr,
+			Deduplicate:   dedupPtr,
+		}, nil
+	}
+
+	var req convertAntigravityAccountsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		return service.ConvertAccountsInput{}, fmt.Errorf("请求体格式错误: %w", err)
+	}
+
+	var files []antigravity.AdapterInputFile
+	for _, f := range req.Files {
+		if strings.TrimSpace(f.Content) == "" {
+			continue
+		}
+		// 支持前端将二进制文件（如 .zip）以 data URL 或 Base64 字符串放入 files[].content
+		rawBytes := decodePossiblyDataURLContent(f.Filename, f.Content)
+		files = append(files, antigravity.AdapterInputFile{
+			Filename: f.Filename,
+			Content:  rawBytes,
+		})
+	}
+	if strings.TrimSpace(req.RawText) != "" {
+		fname := strings.TrimSpace(req.Filename)
+		if fname == "" {
+			fname = "raw_text.txt"
+		}
+		files = append(files, antigravity.AdapterInputFile{
+			Filename: fname,
+			Content:  decodePossiblyDataURLContent(fname, req.RawText),
+		})
+	}
+	if len(files) == 0 {
+		return service.ConvertAccountsInput{}, errors.New("raw_text 与 files 不能为空")
+	}
+
+	return service.ConvertAccountsInput{
+		Files:         files,
+		AutoImport:    req.AutoImport,
+		NodeID:        req.NodeID,
+		GroupIDs:      req.GroupIDs,
+		ProxyURL:      strings.TrimSpace(req.ProxyURL),
+		AutoProvision: req.AutoProvision,
+		Deduplicate:   req.Deduplicate,
+	}, nil
+}
+
+func decodePossiblyDataURLContent(filename, content string) []byte {
+	trimmed := strings.TrimSpace(content)
+	if strings.HasPrefix(strings.ToLower(trimmed), "data:") {
+		if comma := strings.IndexByte(trimmed, ','); comma > 0 {
+			b64Part := strings.TrimSpace(trimmed[comma+1:])
+			if decoded, ok := tryStdBase64(b64Part); ok {
+				return decoded
+			}
+		}
+	}
+	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(filename)), ".zip") && !strings.HasPrefix(trimmed, "PK") {
+		if decoded, ok := tryStdBase64(trimmed); ok {
+			return decoded
+		}
+	}
+	return []byte(content)
+}
+
+func tryStdBase64(s string) ([]byte, bool) {
+	var clean strings.Builder
+	clean.Grow(len(s))
+	for _, r := range s {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			continue
+		}
+		clean.WriteRune(r)
+	}
+	raw, err := decodeBase64Any(clean.String())
+	if err != nil || len(raw) == 0 {
+		return nil, false
+	}
+	return raw, true
+}
+
+func decodeBase64Any(s string) ([]byte, error) {
+	var raw []byte
+	err := json.Unmarshal([]byte(`"`+s+`"`), &raw)
+	if err == nil && len(raw) > 0 {
+		return raw, nil
+	}
+	return nil, errors.New("not base64")
+}
+
+func parseFlexibleGroupIDsForm(slices ...[]string) []int64 {
+	var out []int64
+	for _, arr := range slices {
+		for _, item := range arr {
+			trimmed := strings.TrimSpace(item)
+			if trimmed == "" {
+				continue
+			}
+			if strings.HasPrefix(trimmed, "[") {
+				var ids []int64
+				if json.Unmarshal([]byte(trimmed), &ids) == nil {
+					out = append(out, ids...)
+					continue
+				}
+			}
+			for _, part := range strings.Split(trimmed, ",") {
+				if id, err := strconv.ParseInt(strings.TrimSpace(part), 10, 64); err == nil && id > 0 {
+					out = append(out, id)
+				}
+			}
+		}
+	}
+	return out
+}
+
+// GetAntigravityPromptModes 返回 AGY CLI 四种提示词运行管线模式及三段式实时预览（GET /api/antigravity/prompt-modes）。
+func (h *Handler) GetAntigravityPromptModes(c *gin.Context) {
+	previewMode := strings.TrimSpace(c.Query("mode"))
+	downstreamSys := c.Query("downstream_system")
+	hasTools := true
+	if rawHT := strings.TrimSpace(c.Query("has_tools")); rawHT != "" {
+		if parsed, err := strconv.ParseBool(rawHT); err == nil {
+			hasTools = parsed
+		}
+	}
+	status := antigravity.BuildPromptModesStatus(previewMode, downstreamSys, hasTools)
+	c.JSON(http.StatusOK, status)
+}
+
+type updateAntigravityPromptModeRequest struct {
+	Mode             string `json:"mode"`
+	DownstreamSystem string `json:"downstream_system"`
+	HasTools         *bool  `json:"has_tools"`
+}
+
+// UpdateAntigravityPromptModes 切换当前全局 AGY CLI 提示词运行管线模式并持久化热生效（PUT /api/antigravity/prompt-modes）。
+func (h *Handler) UpdateAntigravityPromptModes(c *gin.Context) {
+	var req updateAntigravityPromptModeRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	rawMode := strings.TrimSpace(req.Mode)
+	if rawMode != "" && !antigravity.IsValidPromptMode(rawMode) {
+		fail(c, http.StatusBadRequest, fmt.Sprintf("不支持的 AGY 提示词模式 %q（可选 default_intercept_continue | blend_sanitized | native_only | downstream_only）", rawMode))
+		return
+	}
+
+	normMode := ""
+	if rawMode != "" {
+		normMode = antigravity.NormalizePromptMode(rawMode)
+	}
+
+	if rs := h.runtimeSettingsSvc(); rs != nil {
+		if h.cfg == nil {
+			h.cfg = &config.Config{}
+		}
+		var wbCli *workbuddy.Client
+		if h.relay != nil {
+			wbCli = h.relay.WorkBuddyClient()
+		}
+		if _, err := rs.Update(c.Request.Context(), h.cfg, wbCli, service.RuntimeSettingsInput{
+			AgyPromptMode: &normMode,
+		}); err != nil {
+			fail(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		antigravity.SetRuntimePromptMode(normMode)
+	}
+
+	hasTools := true
+	if req.HasTools != nil {
+		hasTools = *req.HasTools
+	}
+	status := antigravity.BuildPromptModesStatus(normMode, req.DownstreamSystem, hasTools)
+	c.JSON(http.StatusOK, status)
+}
+
+type previewAntigravityPromptModeRequest struct {
+	Mode             string `json:"mode"`
+	DownstreamSystem string `json:"downstream_system"`
+	UserMessage      string `json:"user_message"`
+	HasTools         *bool  `json:"has_tools"`
+}
+
+// PreviewAntigravityPromptModes 实时预览「AGY 原生默认 -> 拦截 -> 下游接续」三阶段管线产物（POST /api/antigravity/prompt-modes/preview）。
+func (h *Handler) PreviewAntigravityPromptModes(c *gin.Context) {
+	var req previewAntigravityPromptModeRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	targetMode := strings.TrimSpace(req.Mode)
+	if targetMode == "" {
+		targetMode = antigravity.ActivePromptMode()
+	} else if !antigravity.IsValidPromptMode(targetMode) {
+		fail(c, http.StatusBadRequest, fmt.Sprintf("不支持的 AGY 提示词模式 %q", targetMode))
+		return
+	}
+
+	hasTools := true
+	if req.HasTools != nil {
+		hasTools = *req.HasTools
+	}
+	preview := antigravity.PreviewPromptModeWithUser(targetMode, req.DownstreamSystem, req.UserMessage, hasTools)
+	c.JSON(http.StatusOK, preview)
 }

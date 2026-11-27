@@ -98,6 +98,10 @@ func NewRouter(opts Options) *gin.Engine {
 			admin.POST("/antigravity/nodes/:id/rotate-fingerprint", h.RotateAntigravityFingerprint)
 			admin.POST("/antigravity/nodes/:id/check-ip", h.CheckAntigravityNodeExitIP)
 			admin.POST("/antigravity/accounts/:id/provision-container", h.ProvisionAntigravityAccountContainer)
+			admin.POST("/antigravity/accounts/convert", h.ConvertAntigravityAccounts)
+			admin.GET("/antigravity/prompt-modes", h.GetAntigravityPromptModes)
+			admin.PUT("/antigravity/prompt-modes", h.UpdateAntigravityPromptModes)
+			admin.POST("/antigravity/prompt-modes/preview", h.PreviewAntigravityPromptModes)
 
 			// 四端上游账号池与远程补号推送入口（支持 full 与最小权限 push_accounts 补号专用密钥）
 			admin.POST("/remote/accounts/push", h.RemotePushAccounts)
