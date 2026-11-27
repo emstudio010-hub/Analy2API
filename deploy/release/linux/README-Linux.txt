@@ -1,5 +1,5 @@
 ============================================================
-  Analy2API v1.0.0 — Linux (amd64) 发行包快速指南
+  Analy2API v1.2.1 — Linux (amd64) 发行包快速指南
 ============================================================
 
 1. 零配置一键启动（单二进制 + 内置 SQLite WAL）
@@ -9,16 +9,17 @@
    ./start.sh              # 前台启动
    ./start.sh -d           # 后台守护运行（日志写入 ./data/analy2api.log）
 
-2. 生产 systemd 安装（推荐）
+2. 生产 systemd 安装 / 平滑升级（推荐）
    sudo ./install-systemd.sh
    journalctl -u analy2api -f
+   （升级时会自动保留已有 /etc/analy2api/env 与 /opt/analy2api/data 数据库）
 
 3. 空服务器单账号独立 AntiGravity (agy) 容器
-   - 只要宿主机已安装 Docker，录入 AntiGravity 账号时 Analy2API 会利用本二进制与内嵌 Dockerfile
-     自动构建 analy2api-agy-cli:latest 镜像，按 1账号:1容器:1IP:1指纹 独立分配，无需宿主机装 agy。
+   - 只要宿主机已安装 Docker，通过 Google OAuth 直接授权或全格式导入账号时，
+     Analy2API 会自动分配独立出口 IP 并按 1账号:1容器:1IP:1指纹 自动创建启动容器。
    - 默认策略：
-     * AGY_SESSION_RETENTION=stateless   每轮请求结束自动清理 .db / brain 目录，零磁盘膨胀
-     * AGY_PROMPT_BLEND_MODE=blend_clean 净化版 AGY 原生提示词 + 后接下游系统提示词
+     * AGY_SESSION_RETENTION=stateless              每轮请求结束自动清理会话，零磁盘膨胀
+     * AGY_PROMPT_MODE=default_intercept_continue   默认提示词 -> 双向拦截 -> 下游接续
 
 4. 常用命令
    ./analy2api --version     查看版本与构建信息

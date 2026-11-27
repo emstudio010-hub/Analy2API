@@ -64,7 +64,9 @@ type accountDTO struct {
 	LastHealthCheckError *string `json:"last_health_check_error"`
 	LatencyMs            *int    `json:"latency_ms"`
 
-	GroupIDs []int64 `json:"group_ids"`
+	GroupIDs []int64        `json:"group_ids"`
+	NodeID   int64          `json:"node_id,omitempty"`
+	Extra    map[string]any `json:"extra,omitempty"`
 
 	Balance accountBalanceDTO `json:"balance"`
 
@@ -168,6 +170,15 @@ func (h *Handler) toAccountDTO(acc *ent.Account) accountDTO {
 	if acc.Extra != nil {
 		dto.AccountMode, _ = acc.Extra["account_mode"].(string)
 		dto.BaseURL, _ = acc.Extra["base_url"].(string)
+		dto.Extra = acc.Extra
+		switch v := acc.Extra["node_id"].(type) {
+		case int64:
+			dto.NodeID = v
+		case int:
+			dto.NodeID = int64(v)
+		case float64:
+			dto.NodeID = int64(v)
+		}
 	}
 	if dto.BaseURL == "" {
 		switch dto.Platform {

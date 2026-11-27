@@ -186,6 +186,7 @@ type AntigravityService struct {
 	vault         *crypto.Vault
 	agClient      *antigravity.Client
 	docker        *antigravity.DockerManager
+	proxyPool     *ProxyPoolService
 	dataRoot      string
 	defaultImage  string
 	logger        *slog.Logger
@@ -212,6 +213,9 @@ func NewAntigravityService(
 	if strings.TrimSpace(dataRoot) == "" {
 		dataRoot = "./data/antigravity"
 	}
+	if docker != nil {
+		docker.SetBuildWorkDir(filepath.Join(dataRoot, ".docker-build"))
+	}
 	if strings.TrimSpace(defaultImage) == "" {
 		defaultImage = antigravity.DefaultDockerImage
 	}
@@ -227,6 +231,111 @@ func NewAntigravityService(
 		defaultImage:  defaultImage,
 		logger:        logger,
 		reservedPorts: make(map[int]time.Time),
+	}
+}
+
+// SetProxyPoolService 注入代理 IP 池服务，用于 OAuth 与批量导入时按策略自动分 IP。
+func (s *AntigravityService) SetProxyPoolService(pool *ProxyPoolService) {
+	if s != nil {
+		s.proxyPool = pool
+	}
+}
+
+// ResolveAccountProxy 按 ip_mode ("auto_pool" | "manual" | "keep" | "direct") 为单个账号解析或从 IP 池分配出口代理。
+func (s *AntigravityService) ResolveAccountProxy(
+	ctx context.Context,
+	ipMode string,
+	manualProxy string,
+	existingProxy string,
+	inFlight map[string]int,
+) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(ipMode))
+	rawManual := strings.TrimSpace(manualProxy)
+	rawExisting := strings.TrimSpace(existingProxy)
+
+	switch mode {
+	case "direct", "none":
+		return "", nil
+	case "manual":
+		if rawManual == "" {
+			return "", nil
+		}
+		norm, err := workbuddy.NormalizeProxyURL(rawManual)
+		if err != nil {
+			return "", fmt.Errorf("手动填写的代理地址无效: %w", err)
+		}
+		return norm, nil
+	case "keep":
+		if rawExisting != "" {
+			if norm, err := workbuddy.NormalizeProxyURL(rawExisting); err == nil {
+				return norm, nil
+			}
+		}
+		if rawManual != "" {
+			norm, err := workbuddy.NormalizeProxyURL(rawManual)
+			if err != nil {
+				return "", fmt.Errorf("默认代理地址无效: %w", err)
+			}
+			return norm, nil
+		}
+		if s != nil && s.proxyPool != nil {
+			alloc, err := s.proxyPool.AllocateForPush(ctx, ProxyAllocationRequest{
+				Platform:          domain.PlatformAntigravity,
+				InFlightBindings:  inFlight,
+				AllowEmptyOnError: true,
+			})
+			if err == nil && alloc.ProxyURL != "" {
+				if inFlight != nil {
+					inFlight[alloc.ProxyURL]++
+				}
+				return alloc.ProxyURL, nil
+			}
+		}
+		return "", nil
+	case "auto_pool", "pool":
+		if s != nil && s.proxyPool != nil {
+			alloc, err := s.proxyPool.AllocateForPush(ctx, ProxyAllocationRequest{
+				Platform:          domain.PlatformAntigravity,
+				RequestMode:       KeyProxyModePool,
+				InFlightBindings:  inFlight,
+				AllowEmptyOnError: true,
+			})
+			if err != nil {
+				return "", err
+			}
+			if alloc.ProxyURL != "" && inFlight != nil {
+				inFlight[alloc.ProxyURL]++
+			}
+			return alloc.ProxyURL, nil
+		}
+		return "", nil
+	default:
+		if rawManual != "" {
+			norm, err := workbuddy.NormalizeProxyURL(rawManual)
+			if err != nil {
+				return "", fmt.Errorf("代理地址无效: %w", err)
+			}
+			return norm, nil
+		}
+		if rawExisting != "" {
+			if norm, err := workbuddy.NormalizeProxyURL(rawExisting); err == nil {
+				return norm, nil
+			}
+		}
+		if s != nil && s.proxyPool != nil {
+			alloc, err := s.proxyPool.AllocateForPush(ctx, ProxyAllocationRequest{
+				Platform:          domain.PlatformAntigravity,
+				InFlightBindings:  inFlight,
+				AllowEmptyOnError: true,
+			})
+			if err == nil && alloc.ProxyURL != "" {
+				if inFlight != nil {
+					inFlight[alloc.ProxyURL]++
+				}
+				return alloc.ProxyURL, nil
+			}
+		}
+		return "", nil
 	}
 }
 
@@ -309,7 +418,20 @@ func (s *AntigravityService) CreateNode(ctx context.Context, in CreateContainerN
 		hostIP = antigravity.DefaultHostIP
 	}
 	hostPort := in.HostPort
-	if hostPort <= 0 || hostPort > 65535 {
+	if mode == domain.ContainerModeLocalDocker {
+		if hostPort <= 0 || hostPort > 65535 {
+			if allocPort, pErr := s.AllocateFreeHostPort(ctx); pErr == nil {
+				hostPort = allocPort
+			} else {
+				hostPort = antigravity.DefaultHostPort
+			}
+		} else if hostPort == antigravity.DefaultHostPort && !antigravity.IsLocalTCPPortFree(hostIP, hostPort) {
+			// 默认 8317 端口若已被宿主机外部进程或旧容器占用，自动顺延分配空闲端口，杜绝 docker run 端口冲突
+			if allocPort, pErr := s.AllocateFreeHostPort(ctx); pErr == nil {
+				hostPort = allocPort
+			}
+		}
+	} else if hostPort <= 0 || hostPort > 65535 {
 		hostPort = antigravity.DefaultHostPort
 	}
 
@@ -589,6 +711,18 @@ func (s *AntigravityService) RunNodeAction(ctx context.Context, id int64, action
 		if row.Mode != domain.ContainerModeLocalDocker {
 			return nil, errors.New("远程节点不支持本机 Docker 启动操作，请使用连通性检测 (check)")
 		}
+		// 启动前自愈检查：若当前容器未运行但宿主机目标端口已被其它外部服务占用（例如旧 cli-proxy-api 占用 8317），自动迁移至空闲端口
+		st, _ := s.docker.InspectContainer(ctx, spec.EffectiveContainerName())
+		if !st.Running && !antigravity.IsLocalTCPPortFree(row.HostIP, row.HostPort) {
+			if freePort, pErr := s.AllocateFreeHostPort(ctx); pErr == nil && freePort != row.HostPort {
+				s.logger.Info("检测到宿主机端口已被外部进程占用，自动迁移容器端口", "node_id", row.ID, "old_port", row.HostPort, "new_port", freePort)
+				if uRow, uErr := row.Update().SetHostPort(freePort).Save(ctx); uErr == nil {
+					row = uRow
+					spec = s.nodeSpec(row)
+					s.syncBoundAccountsEndpoint(ctx, row, spec)
+				}
+			}
+		}
 		cid, sErr := s.docker.EnsureAndStartContainer(ctx, spec)
 		if sErr != nil {
 			errMsg := sErr.Error()
@@ -741,13 +875,32 @@ func (s *AntigravityService) GetNodeLogs(ctx context.Context, id int64, tail int
 }
 
 // ListAuthFiles 列出节点下的 OAuth .json 登录文件，并自动匹配关联已同步的调度账号 ID。
+// 对于本机 Docker 节点：若容器当前未处于运行态，直接读取隔离挂载目录，避免误连宿主机同端口外部进程触发 401。
 func (s *AntigravityService) ListAuthFiles(ctx context.Context, nodeID int64) ([]AntigravityAuthFileView, error) {
 	row, err := s.getNodeRow(ctx, nodeID)
 	if err != nil {
 		return nil, err
 	}
 	spec := s.nodeSpec(row)
-	files, err := s.agClient.ListAuthFiles(ctx, spec)
+	var files []antigravity.AuthFileInfo
+	if row.Mode == domain.ContainerModeLocalDocker && strings.TrimSpace(spec.AuthDir) != "" {
+		st, _ := s.docker.InspectContainer(ctx, spec.EffectiveContainerName())
+		if !st.Running {
+			files, err = antigravity.ListLocalAuthFiles(spec.AuthDir)
+			if err != nil {
+				files = []antigravity.AuthFileInfo{}
+				err = nil
+			}
+		} else {
+			files, err = s.agClient.ListAuthFiles(ctx, spec)
+			if err != nil {
+				files, _ = antigravity.ListLocalAuthFiles(spec.AuthDir)
+				err = nil
+			}
+		}
+	} else {
+		files, err = s.agClient.ListAuthFiles(ctx, spec)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1587,7 +1740,7 @@ func (s *AntigravityService) AllocateFreeHostPort(ctx context.Context) (int, err
 		used[p] = struct{}{}
 	}
 	for port := 18317; port < 28317; port++ {
-		if _, taken := used[port]; !taken {
+		if _, taken := used[port]; !taken && antigravity.IsLocalTCPPortFree("127.0.0.1", port) {
 			s.reservedPorts[port] = now.Add(30 * time.Second)
 			return port, nil
 		}
@@ -1627,11 +1780,21 @@ func (s *AntigravityService) ProvisionAccountContainer(ctx context.Context, in P
 		return nil, nil, fmt.Errorf("账号 #%d 平台为 %s，仅 antigravity 账号支持自动分配独立 agy 容器", acc.ID, acc.Platform)
 	}
 
-	// 若账号已绑定专属容器节点，则直接复用（如携带最新凭证则同步刷新隔离目录，必要时自动启动）
+	// 若账号已绑定专属容器节点，则直接复用（如携带最新凭证/新代理则同步刷新隔离目录与容器配置，必要时自动启动）
 	if existingNodeID := extractExtraInt64(acc.Extra, "node_id"); existingNodeID > 0 {
 		if row, gErr := s.getNodeRow(ctx, existingNodeID); gErr == nil && row != nil {
 			boundID := extractExtraInt64(row.Extra, "bound_account_id")
 			if boundID == 0 || boundID == acc.ID {
+				nextProxy := strings.TrimSpace(in.ProxyURL)
+				if nextProxy != "" && nextProxy != strings.TrimSpace(row.ProxyURL) {
+					strictIso := true
+					if _, uErr := s.UpdateNode(ctx, row.ID, UpdateContainerNodeInput{
+						ProxyURL:        &nextProxy,
+						StrictIsolation: &strictIso,
+					}); uErr == nil {
+						row, _ = s.getNodeRow(ctx, row.ID)
+					}
+				}
 				if len(in.AuthJSON) > 0 && strings.TrimSpace(row.AuthDir) != "" {
 					fname := strings.TrimSpace(in.AuthFilename)
 					if fname == "" {
@@ -1641,6 +1804,9 @@ func (s *AntigravityService) ProvisionAccountContainer(ctx context.Context, in P
 						_, _ = antigravity.WriteIsolatedAGYAuthFiles(row.AuthDir, normAcc, fname)
 					} else {
 						_, _ = antigravity.SaveLocalAuthFile(row.AuthDir, fname, in.AuthJSON)
+					}
+					if files, lErr := antigravity.ListLocalAuthFiles(row.AuthDir); lErr == nil {
+						row, _ = row.Update().SetAuthFilesCount(len(files)).Save(ctx)
 					}
 				}
 				if in.AutoStart && row.Mode == domain.ContainerModeLocalDocker && row.Status != "running" {
@@ -1687,6 +1853,30 @@ func (s *AntigravityService) ProvisionAccountContainer(ctx context.Context, in P
 	containerName := fmt.Sprintf("cmd2api-agy-acc-%d", acc.ID)
 	authDir := filepath.Join(s.dataRoot, fmt.Sprintf("account-%d", acc.ID), "auths")
 
+	// 在启动 Docker 容器之前先把真实 agy CLI 隔离文件写入宿主机 authDir，
+	// 防止非 root 服务进程下 Docker 守护进程先行创建 root 属主目录导致权限拒绝，同时确保容器 t=0 即刻可见凭证。
+	var savedAuthFilename string
+	if len(in.AuthJSON) > 0 {
+		fname := strings.TrimSpace(in.AuthFilename)
+		if fname == "" {
+			fname = fmt.Sprintf("account-%d.json", acc.ID)
+		}
+		if normAcc, nErr := antigravity.NormalizeSingleCredential(fname, in.AuthJSON, proxyURL); nErr == nil && normAcc.Valid {
+			_, _ = antigravity.WriteIsolatedAGYAuthFiles(authDir, normAcc, fname)
+			if cleanName, cErr := antigravity.SanitizeAuthFilename(fname); cErr == nil {
+				savedAuthFilename = cleanName
+			} else {
+				savedAuthFilename = normAcc.AuthFilename
+			}
+		} else if savedInfo, sErr := antigravity.SaveLocalAuthFile(authDir, fname, in.AuthJSON); sErr == nil {
+			savedAuthFilename = savedInfo.Filename
+		}
+	} else if synth := s.synthesizeAGYAccountFromEnt(acc, proxyURL); synth.Valid {
+		fname := fmt.Sprintf("account-%d.json", acc.ID)
+		_, _ = antigravity.WriteIsolatedAGYAuthFiles(authDir, synth, fname)
+		savedAuthFilename = fname
+	}
+
 	nodeView, err := s.CreateNode(ctx, CreateContainerNodeInput{
 		Name:            nodeName,
 		Mode:            domain.ContainerModeLocalDocker,
@@ -1707,32 +1897,6 @@ func (s *AntigravityService) ProvisionAccountContainer(ctx context.Context, in P
 	})
 	if err != nil {
 		return nil, nil, err
-	}
-
-	// 如携带初始凭证，自动转换为真实 agy CLI 可识别全套文件并落盘到该账号专属容器的 auth_dir
-	var savedAuthFilename string
-	if len(in.AuthJSON) > 0 {
-		fname := strings.TrimSpace(in.AuthFilename)
-		if fname == "" {
-			fname = fmt.Sprintf("account-%d.json", acc.ID)
-		}
-		if normAcc, nErr := antigravity.NormalizeSingleCredential(fname, in.AuthJSON, proxyURL); nErr == nil && normAcc.Valid {
-			_, _ = antigravity.WriteIsolatedAGYAuthFiles(nodeView.AuthDir, normAcc, fname)
-			if cleanName, cErr := antigravity.SanitizeAuthFilename(fname); cErr == nil {
-				savedAuthFilename = cleanName
-			} else {
-				savedAuthFilename = normAcc.AuthFilename
-			}
-		} else if savedInfo, sErr := antigravity.SaveLocalAuthFile(nodeView.AuthDir, fname, in.AuthJSON); sErr == nil {
-			savedAuthFilename = savedInfo.Filename
-		}
-	} else {
-		// 从已有账号加密凭证反推一套标准 agy CLI 文件写入专属隔离目录，确保即刻可由 agy.exe 直接加载
-		if synth := s.synthesizeAGYAccountFromEnt(acc, proxyURL); synth.Valid {
-			fname := fmt.Sprintf("account-%d.json", acc.ID)
-			_, _ = antigravity.WriteIsolatedAGYAuthFiles(nodeView.AuthDir, synth, fname)
-			savedAuthFilename = fname
-		}
 	}
 
 	row, err := s.getNodeRow(ctx, nodeView.ID)
@@ -1827,6 +1991,7 @@ type ConvertAccountsInput struct {
 	AutoImport    bool
 	NodeID        int64
 	GroupIDs      []int64
+	IPMode        string // "auto_pool" | "manual" | "keep" | "direct"
 	ProxyURL      string
 	AutoProvision *bool
 	Deduplicate   *bool
@@ -1936,10 +2101,21 @@ func (s *AntigravityService) ConvertAndImportAccounts(ctx context.Context, in Co
 		WithGroups().
 		All(ctx)
 
+	inFlightProxies := make(map[string]int)
 	for _, conv := range batch.Accounts {
 		if !conv.Valid {
 			continue
 		}
+		// 按 ip_mode 为每个导入账号分配独立 IP（支持 1 账号 1 IP 池轮询、手动填写、保留原代理或直连）
+		resolvedProxy, pErr := s.ResolveAccountProxy(ctx, in.IPMode, in.ProxyURL, conv.RawProxy, inFlightProxies)
+		if pErr != nil {
+			imp.Failed++
+			imp.Errors = append(imp.Errors, fmt.Sprintf("%s: %v", conv.Name, pErr))
+			continue
+		}
+		conv.RawProxy = resolvedProxy
+		conv.Proxy = workbuddy.RedactProxyURL(resolvedProxy)
+
 		savedAcc, isCreated, saveErr := s.upsertConvertedAccountToPool(ctx, conv, existingRows, targetGroups, autoProvision)
 		if saveErr != nil {
 			imp.Failed++
@@ -1958,6 +2134,126 @@ func (s *AntigravityService) ConvertAndImportAccounts(ctx context.Context, in Co
 
 	out.ImportResult = imp
 	return out, nil
+}
+
+// UpsertSingleAGYAccountWithContainer 将单条标准化 AGY 凭证写入账号池并自动分配/启动 1:1 专属独立容器（供 OAuth 回调闭环与直接导入复用）。
+func (s *AntigravityService) UpsertSingleAGYAccountWithContainer(
+	ctx context.Context,
+	conv antigravity.ConvertedAGYAccount,
+	groupIDs []int64,
+	autoProvision bool,
+) (*ent.Account, *ContainerNodeView, error) {
+	targetGroups, err := s.resolveOrEnsureAntigravityGroups(ctx, groupIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	existingRows, _ := s.db.Account.Query().
+		Where(account.DeletedAtIsNil(), account.PlatformEQ(domain.PlatformAntigravity)).
+		WithGroups().
+		All(ctx)
+	savedAcc, _, err := s.upsertConvertedAccountToPool(ctx, conv, existingRows, targetGroups, autoProvision)
+	if err != nil {
+		return nil, nil, err
+	}
+	var nodeView *ContainerNodeView
+	if savedAcc != nil {
+		if nid := extractExtraInt64(savedAcc.Extra, "node_id"); nid > 0 {
+			nodeView, _ = s.GetNode(ctx, nid)
+		}
+	}
+	return savedAcc, nodeView, nil
+}
+
+// SwapAccountIPAndRestartContainer 为单个 AntiGravity 账号重新分配代理池 IP 或设置指定代理 IP，并自动同步重启其 1:1 专属容器。
+func (s *AntigravityService) SwapAccountIPAndRestartContainer(
+	ctx context.Context,
+	accountID int64,
+	ipMode string,
+	manualProxy string,
+) (*ent.Account, *ContainerNodeView, error) {
+	acc, err := s.db.Account.Query().
+		Where(account.IDEQ(accountID), account.DeletedAtIsNil()).
+		WithGroups().
+		Only(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("查询账号 #%d 失败: %w", accountID, err)
+	}
+	if strings.TrimSpace(ipMode) == "" {
+		if strings.TrimSpace(manualProxy) != "" {
+			ipMode = "manual"
+		} else {
+			ipMode = "auto_pool"
+		}
+	}
+	nextProxy, err := s.ResolveAccountProxy(ctx, ipMode, manualProxy, "", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	acc, err = acc.Update().SetProxyURL(nextProxy).Save(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("更新账号代理失败: %w", err)
+	}
+
+	nodeID := extractExtraInt64(acc.Extra, "node_id")
+	if nodeID > 0 {
+		strictIso := nextProxy != ""
+		nodeView, uErr := s.UpdateNode(ctx, nodeID, UpdateContainerNodeInput{
+			ProxyURL:        &nextProxy,
+			StrictIsolation: &strictIso,
+		})
+		if uErr == nil && nodeView != nil {
+			if nodeView.Mode == domain.ContainerModeLocalDocker && s.DetectEnv(ctx).DockerAvailable {
+				// 重建容器以使新的 HTTP_PROXY / HTTPS_PROXY 环境变量立即生效
+				if row, gErr := s.getNodeRow(ctx, nodeID); gErr == nil {
+					spec := s.nodeSpec(row)
+					if cid, startErr := s.docker.EnsureAndStartContainer(ctx, spec); startErr == nil {
+						row, _ = row.Update().SetStatus("running").SetContainerID(cid).ClearLastError().Save(ctx)
+						v := s.toNodeView(ctx, row, true)
+						nodeView = &v
+					}
+				}
+			}
+			if reloaded, rErr := s.db.Account.Query().Where(account.IDEQ(acc.ID)).WithGroups().Only(ctx); rErr == nil {
+				acc = reloaded
+			}
+			return acc, nodeView, nil
+		}
+	}
+
+	nodeView, updatedAcc, err := s.ProvisionAccountContainer(ctx, ProvisionAccountContainerInput{
+		AccountID: acc.ID,
+		ProxyURL:  nextProxy,
+		AutoStart: true,
+	})
+	if err != nil {
+		return acc, nil, err
+	}
+	return updatedAcc, nodeView, nil
+}
+
+func (s *AntigravityService) syncBoundAccountsEndpoint(ctx context.Context, row *ent.ContainerNode, spec antigravity.NodeSpec) {
+	if row == nil {
+		return
+	}
+	baseURL := antigravity.BaseURL(spec)
+	allAgy, err := s.db.Account.Query().
+		Where(account.DeletedAtIsNil(), account.PlatformEQ(domain.PlatformAntigravity)).
+		All(ctx)
+	if err != nil {
+		return
+	}
+	for _, acc := range allAgy {
+		if extractExtraInt64(acc.Extra, "node_id") != row.ID {
+			continue
+		}
+		creds, cErr := s.buildAntigravityCredentialsWithBase(spec, baseURL, acc.Credentials)
+		if cErr != nil {
+			continue
+		}
+		extra := cloneAnyMap(acc.Extra)
+		extra["base_url"] = baseURL
+		_, _ = acc.Update().SetDomain(baseURL).SetCredentials(creds).SetExtra(extra).Save(ctx)
+	}
 }
 
 func (s *AntigravityService) upsertConvertedAccountToPool(

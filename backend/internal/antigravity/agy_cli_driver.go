@@ -33,10 +33,22 @@ const (
 // ResolveAgyCLIBinary 查找本机或容器内安装的真实 AntiGravity CLI (`agy` / `agy.exe`) 路径。
 func ResolveAgyCLIBinary(override string) (string, error) {
 	if p := strings.TrimSpace(override); p != "" {
-		return p, nil
+		if found, err := exec.LookPath(p); err == nil && found != "" {
+			return found, nil
+		}
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, nil
+		}
+		return "", fmt.Errorf("未找到真实的 AntiGravity CLI 可执行文件 (%s): executable file not found", p)
 	}
 	if p := strings.TrimSpace(os.Getenv(AgyCLIBinEnv)); p != "" {
-		return p, nil
+		if found, err := exec.LookPath(p); err == nil && found != "" {
+			return found, nil
+		}
+		if st, err := os.Stat(p); err == nil && !st.IsDir() {
+			return p, nil
+		}
+		return "", fmt.Errorf("未找到环境变量 AGY_CLI_BIN 指定的 AntiGravity CLI 可执行文件 (%s): executable file not found", p)
 	}
 	if found, err := exec.LookPath("agy"); err == nil && found != "" {
 		return found, nil
@@ -110,6 +122,7 @@ func buildIsolatedCLIEnv(spec NodeSpec) []string {
 	}
 	// 抑制无头反代子进程触发后台自动更新检查，防止派生孤儿更新器锁住磁盘目录
 	filtered = append(filtered,
+		"AGY_CLI_DISABLE_AUTO_UPDATE=true",
 		"AGY_DISABLE_AUTO_UPDATE=1",
 		"DISABLE_AUTOUPDATER=1",
 		"NO_UPDATE_NOTIFIER=1",

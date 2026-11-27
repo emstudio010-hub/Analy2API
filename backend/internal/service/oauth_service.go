@@ -44,6 +44,7 @@ type OAuthSession struct {
 	NodeName       string                      `json:"node_name,omitempty"`
 	AccountID      int64                       `json:"account_id,omitempty"`
 	GroupIDs       []int64                     `json:"group_ids,omitempty"`
+	IPMode         string                      `json:"ip_mode,omitempty"`
 	ProxyURL       string                      `json:"proxy_url,omitempty"`
 	AuthURL        string                      `json:"auth_url"`
 	RedirectURI     string                      `json:"redirect_uri"`
@@ -71,6 +72,7 @@ type CreateOAuthSessionInput struct {
 	NodeID       int64
 	AccountID    int64
 	GroupIDs     []int64
+	IPMode       string // "auto_pool" | "manual" | "direct"
 	ProxyURL     string
 	RedirectURI  string
 	RedirectMode bool
@@ -87,6 +89,7 @@ type CompleteOAuthCallbackInput struct {
 	Provider     string
 	NodeID       int64
 	GroupIDs     []int64
+	IPMode       string // "auto_pool" | "manual" | "direct"
 	ProxyURL     string
 	CallbackURL  string
 	RedirectURI  string
@@ -113,6 +116,7 @@ type OAuthCallbackResult struct {
 	Platform     string                   `json:"platform"`
 	Provider     string                   `json:"provider"`
 	NodeID       int64                    `json:"node_id,omitempty"`
+	Node         *ContainerNodeView       `json:"node,omitempty"`
 	Filename     string                   `json:"filename,omitempty"`
 	AuthFile     *AntigravityAuthFileView `json:"auth_file,omitempty"`
 	Account      *ent.Account             `json:"account,omitempty"`
@@ -193,6 +197,7 @@ func (s *OAuthService) CreateSession(ctx context.Context, in CreateOAuthSessionI
 		NodeID:        in.NodeID,
 		AccountID:     in.AccountID,
 		GroupIDs:      uniqueIDs(in.GroupIDs),
+		IPMode:        strings.ToLower(strings.TrimSpace(in.IPMode)),
 		ProxyURL:      proxyURL,
 		RedirectURI:   redirectURI,
 		State:         state,
@@ -251,15 +256,16 @@ func (s *OAuthService) initAntigravitySession(ctx context.Context, sess *OAuthSe
 	if s.antigravity == nil {
 		return errors.New("AntiGravity 服务未初始化")
 	}
-	if sess.NodeID <= 0 {
-		// 若未传 NodeID，自动挑选第一个可用 AntiGravity 节点
-		nodes, err := s.antigravity.ListNodes(ctx)
-		if err == nil && len(nodes) > 0 {
-			sess.NodeID = nodes[0].ID
-		}
+
+	// Google Desktop OAuth 客户端 (1071006060591-...) 仅接受 http://localhost:<port>/... 回环地址；
+	// 严禁把公网域名（如 https://cmd.essapi.uno/api/oauth/callback）传给 Google，否则必触发 Error 400: redirect_uri_mismatch。
+	provLower := strings.ToLower(strings.TrimSpace(sess.Provider))
+	if provLower == "" || provLower == "antigravity" || provLower == "agy" || provLower == "gemini-cli" || provLower == "gemini" {
+		sess.RedirectURI = antigravity.NormalizeGoogleDesktopRedirectURI(sess.RedirectURI)
 	}
 
 	var spec antigravity.NodeSpec
+	var nodeRunning bool
 	if sess.NodeID > 0 {
 		row, err := s.antigravity.getNodeRow(ctx, sess.NodeID)
 		if err != nil {
@@ -267,16 +273,24 @@ func (s *OAuthService) initAntigravitySession(ctx context.Context, sess *OAuthSe
 		}
 		spec = s.antigravity.nodeSpec(row)
 		sess.NodeName = row.Name
-		if sess.ProxyURL == "" {
+		if sess.ProxyURL == "" && sess.IPMode != "direct" && sess.IPMode != "auto_pool" {
 			sess.ProxyURL = row.ProxyURL
 		}
 		sess.Fingerprint = spec.Fingerprint
+		if row.Mode == domain.ContainerModeRemoteAPI {
+			nodeRunning = true
+		} else if s.antigravity.docker != nil {
+			st, _ := s.antigravity.docker.InspectContainer(ctx, spec.EffectiveContainerName())
+			nodeRunning = st.Running
+		}
 	} else {
+		// Account-First 1:1 模式：无需预先创建空节点，回调成功后自动按账号分配 IP 与 1:1 独立容器
 		sess.Fingerprint = antigravity.GenerateNodeFingerprint(sess.Provider)
 	}
 
-	// 优先尝试向在线节点管理接口请求 OAuth URL
-	if sess.NodeID > 0 {
+	// 仅当显式指定了在线节点且为第三方容器 Provider 时才尝试向节点请求 OAuth URL
+	if sess.NodeID > 0 && nodeRunning && !s.antigravity.NodeHasBoundAccount(ctx, sess.NodeID) &&
+		(provLower == "claude" || provLower == "codex") {
 		remoteCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 		remoteRes, rErr := s.antigravity.agClient.RequestOAuthURL(remoteCtx, spec, sess.Provider, sess.RedirectURI)
 		cancel()
@@ -287,16 +301,18 @@ func (s *OAuthService) initAntigravitySession(ctx context.Context, sess *OAuthSe
 				sess.State = strings.TrimSpace(remoteRes.State)
 			}
 			sess.Instructions = firstNonEmptyService(remoteRes.Instructions,
-				"请在浏览器打开容器节点授权链接登录，完成后复制浏览器地址栏回调 URL（含 code/state）或直接授权回传到本网关自动落盘 .json。")
+				"请在浏览器打开授权链接登录，完成后复制浏览器地址栏完整回调 URL（含 ?code=...）粘贴到下方完成入池与容器绑定。")
 			return nil
 		}
 	}
 
-	// 容器未启动或管理端不支持远程生成 OAuth URL 时，自动启用网关内置 PKCE 授权 URL 生成器
+	// 网关内置标准 Google Desktop PKCE 授权链接生成器（本地与公网服务器 100% 通用，零 redirect_uri_mismatch）
 	sess.Mode = "gateway_pkce"
 	sess.AuthURL = buildProviderPKCEOAuthURL(sess.Provider, sess.RedirectURI, sess.State, sess.CodeChallenge)
-	sess.Instructions = fmt.Sprintf("已由网关通过节点专属隔离指纹 (%s) 生成 PKCE OAuth 授权链接。登录完成后，粘贴回调 URL（含 ?code=...）、授权码或 OAuth JSON 凭证，网关将自动生成 .json 并同步到调度账号池。",
-		sess.Fingerprint.FingerprintID)
+	sess.Instructions = fmt.Sprintf(
+		"1) 点击「新窗口打开授权」完成 Google 登录；2) 登录成功后浏览器会跳转至 %s?code=...（若部署在远程服务器，页面提示「无法访问此网站 / 拒绝连接」属完全正常现象！）；3) 直接复制浏览器地址栏里那整串 http://localhost... 链接粘贴到下方提交，系统将自动换取 Token、分配 IP 并创建 1:1 专属独立容器。",
+		sess.RedirectURI,
+	)
 	return nil
 }
 
@@ -345,6 +361,8 @@ func (s *OAuthService) CompleteCallback(ctx context.Context, in CompleteOAuthCal
 	groupIDs := uniqueIDs(in.GroupIDs)
 	proxyURL := strings.TrimSpace(in.ProxyURL)
 
+	ipMode := strings.ToLower(strings.TrimSpace(in.IPMode))
+
 	if sess != nil {
 		if platform == "" {
 			platform = sess.Platform
@@ -358,10 +376,15 @@ func (s *OAuthService) CompleteCallback(ctx context.Context, in CompleteOAuthCal
 		if len(groupIDs) == 0 {
 			groupIDs = sess.GroupIDs
 		}
+		if ipMode == "" {
+			ipMode = sess.IPMode
+		}
 		if proxyURL == "" {
 			proxyURL = sess.ProxyURL
 		}
 	}
+	in.IPMode = ipMode
+	in.ProxyURL = proxyURL
 	platform, provider = normalizeOAuthPlatformAndProvider(platform, provider, nodeID)
 
 	var (
@@ -424,53 +447,13 @@ func (s *OAuthService) completeAntigravityCallback(
 		return nil, errors.New("AntiGravity 服务未初始化")
 	}
 
-	// 严格「1 账号 = 1 独立 agy 容器」：
-	// 若未指定节点，或指定的本机容器节点已经绑定了其他账号，则自动分配一个新的专属端口与独立 agy 容器节点。
-	needAutoAlloc := nodeID <= 0
-	if !needAutoAlloc {
-		if existingRow, rErr := s.antigravity.getNodeRow(ctx, nodeID); rErr == nil && existingRow != nil {
-			if existingRow.Mode == domain.ContainerModeLocalDocker && s.antigravity.NodeHasBoundAccount(ctx, nodeID) {
-				needAutoAlloc = true
-			}
-		}
+	// 0. 先按 ip_mode ("auto_pool" | "manual" | "direct") 解析或从代理池自动分配专属出口 IP
+	resolvedProxy, pErr := s.antigravity.ResolveAccountProxy(ctx, in.IPMode, in.ProxyURL, "", nil)
+	if pErr != nil {
+		return nil, pErr
 	}
-	if needAutoAlloc {
-		freePort, pErr := s.antigravity.AllocateFreeHostPort(ctx)
-		if pErr != nil {
-			return nil, pErr
-		}
-		proxy := strings.TrimSpace(in.ProxyURL)
-		if proxy == "" && sess != nil {
-			proxy = strings.TrimSpace(sess.ProxyURL)
-		}
-		strictIso := proxy != ""
-		autoStart := s.antigravity.DetectEnv(ctx).DockerAvailable
-		slug := sanitizeOAuthFileSlug(firstNonEmptyService(in.Email, in.AccountName, provider))
-		newNode, cErr := s.antigravity.CreateNode(ctx, CreateContainerNodeInput{
-			Name:            fmt.Sprintf("agy-oauth-%s-%d", slug, freePort),
-			Mode:            domain.ContainerModeLocalDocker,
-			HostIP:          antigravity.DefaultHostIP,
-			HostPort:        freePort,
-			ProxyURL:        proxy,
-			StrictIsolation: &strictIso,
-			AutoStart:       autoStart,
-			Extra: map[string]any{
-				"single_account":   true,
-				"auto_provisioned": true,
-			},
-		})
-		if cErr != nil {
-			return nil, fmt.Errorf("自动分配独立 agy 容器失败: %w", cErr)
-		}
-		nodeID = newNode.ID
-	}
-	row, err := s.antigravity.getNodeRow(ctx, nodeID)
-	if err != nil {
-		return nil, err
-	}
-	spec := s.antigravity.nodeSpec(row)
 
-	// 1. 解析是否直接提供了完整 OAuth Token JSON
+	// 1. 解析回调 URL、Code 或直接传入的 Token JSON（先兑换验证成功，再分配容器，杜绝失败时残留空容器！）
 	rawTokenJSON := firstNonEmptyService(strings.TrimSpace(string(in.TokenJSON)), strings.TrimSpace(in.RawJSON))
 	if rawTokenJSON == "null" {
 		rawTokenJSON = ""
@@ -493,49 +476,86 @@ func (s *OAuthService) completeAntigravityCallback(
 		state = sess.State
 	}
 
-	// 2. 若提供了 callback_url 且节点在线，优先转发给容器管理端尝试直接兑换
-	var remoteResult map[string]any
-	if cb := strings.TrimSpace(in.CallbackURL); cb != "" {
-		cbCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-		rOut, rErr := s.antigravity.agClient.SubmitOAuthCallback(cbCtx, spec, provider, cb)
-		cancel()
-		if rErr == nil {
-			remoteResult = rOut
+	// 判断是否使用指定的未绑定现有节点，还是采用「1 账号 = 1 独立容器」自动创建新容器
+	useDedicatedAutoContainer := nodeID <= 0
+	var existingNodeRow *ent.ContainerNode
+	var existingSpec antigravity.NodeSpec
+	if !useDedicatedAutoContainer {
+		if rRow, rErr := s.antigravity.getNodeRow(ctx, nodeID); rErr == nil && rRow != nil {
+			if rRow.Mode == domain.ContainerModeLocalDocker && s.antigravity.NodeHasBoundAccount(ctx, nodeID) {
+				useDedicatedAutoContainer = true
+			} else {
+				existingNodeRow = rRow
+				existingSpec = s.antigravity.nodeSpec(rRow)
+				if resolvedProxy == "" && in.IPMode != "direct" {
+					resolvedProxy = strings.TrimSpace(rRow.ProxyURL)
+				}
+			}
+		} else {
+			useDedicatedAutoContainer = true
 		}
 	}
 
-	// 3. 构建并落盘标准 CLIProxyAPI .json 凭证文件，再同步到调度账号池（保留容器专属指纹与独立 ProxyURL）
+	// 2. 若显式绑定到了外部远程节点且提供了 callback_url，可尝试转发给远程管理端
+	var remoteResult map[string]any
+	if !useDedicatedAutoContainer && existingNodeRow != nil && existingNodeRow.Mode == domain.ContainerModeRemoteAPI {
+		if cb := strings.TrimSpace(in.CallbackURL); cb != "" {
+			cbCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
+			rOut, rErr := s.antigravity.agClient.SubmitOAuthCallback(cbCtx, existingSpec, provider, cb)
+			cancel()
+			if rErr == nil {
+				remoteResult = rOut
+			}
+		}
+	}
+
 	credMap := map[string]any{}
 	if rawTokenJSON != "" {
-		if err := json.Unmarshal([]byte(rawTokenJSON), &credMap); err != nil {
+		// 支持直接粘贴任意多格式单条凭证（ADC / oauth_creds / 1// 裸 Token / JSON）
+		if normConv, nErr := antigravity.NormalizeSingleCredential("oauth-paste.json", []byte(rawTokenJSON), resolvedProxy); nErr == nil && normConv.Valid {
+			_ = json.Unmarshal(normConv.CanonicalAuthJSONBytes(), &credMap)
+		} else if err := json.Unmarshal([]byte(rawTokenJSON), &credMap); err != nil {
 			return nil, fmt.Errorf("解析 OAuth Token JSON 失败: %w", err)
 		}
-	} else {
-		if code == "" && remoteResult == nil && strings.TrimSpace(in.APIKey) == "" {
-			return nil, errors.New("请提供回调 URL（含 code）、授权码 code 或 OAuth Token JSON 凭证")
-		}
+	} else if code == "" && remoteResult == nil && strings.TrimSpace(in.APIKey) == "" && strings.TrimSpace(in.RefreshToken) == "" {
+		return nil, errors.New("请粘贴浏览器跳转后的完整回调 URL（含 ?code=...）、授权码 code 或 Token 凭证")
 	}
 
-	// 2.5 若为 antigravity / gemini-cli 授权码模式且尚未直接提供 access_token，
-	// 尝试经节点专属隔离代理向 Google OAuth 兑换真实 Token 并拉取 userinfo 与 loadCodeAssist project_id；
-	// 离线/本地测试授权码在兑换失败时优雅降级为标准 .json 凭证落盘。
-	if code != "" && extractExtraString(credMap, "access_token") == "" &&
-		(strings.EqualFold(provider, "antigravity") || strings.EqualFold(provider, "gemini-cli")) {
-		exCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	if rt := strings.TrimSpace(in.RefreshToken); rt != "" && extractExtraString(credMap, "refresh_token") == "" {
+		credMap["refresh_token"] = rt
+	}
+
+	// 2.5 Google OAuth 授权码真实兑换：经分配的独立代理向 Google 换取 access_token + refresh_token + email + project_id
+	provLower := strings.ToLower(strings.TrimSpace(provider))
+	isGoogleProvider := provLower == "" || provLower == "antigravity" || provLower == "agy" || provLower == "gemini-cli" || provLower == "gemini"
+	if code != "" && extractExtraString(credMap, "access_token") == "" && isGoogleProvider {
+		exCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 		httpCli, _, _ := s.antigravity.agClient.HTTPClientForNode(antigravity.NodeSpec{
 			HostIP:   antigravity.GoogleOAuthTokenURL,
-			ProxyURL: row.ProxyURL,
+			ProxyURL: resolvedProxy,
 		})
-		redir := strings.TrimSpace(in.RedirectURI)
+		redir := extractCallbackBaseRedirectURI(in.CallbackURL)
+		if redir == "" {
+			redir = strings.TrimSpace(in.RedirectURI)
+		}
 		if redir == "" && sess != nil {
 			redir = sess.RedirectURI
 		}
+		redir = antigravity.NormalizeGoogleDesktopRedirectURI(redir)
+
 		verifier := ""
 		if sess != nil {
 			verifier = sess.CodeVerifier
 		}
-		if tok, tErr := antigravity.ExchangeOAuthCode(exCtx, httpCli, code, verifier, redir, ""); tErr == nil && tok != nil {
+		fpUA := antigravity.BuildCLIUserAgent("", "", "")
+		if sess != nil && sess.Fingerprint.UserAgent != "" {
+			fpUA = sess.Fingerprint.UserAgent
+		}
+
+		tok, tErr := antigravity.ExchangeOAuthCode(exCtx, httpCli, code, verifier, redir, "")
+		if tErr == nil && tok != nil {
 			credMap["access_token"] = tok.AccessToken
+			credMap["client_id"] = antigravity.OfficialOAuthClientID
 			if tok.RefreshToken != "" {
 				credMap["refresh_token"] = tok.RefreshToken
 			}
@@ -548,7 +568,7 @@ func (s *OAuthService) completeAntigravityCallback(
 					credMap["email"] = uInfo.Email
 				}
 			}
-			if ca, caErr := antigravity.LoadCodeAssist(exCtx, httpCli, "", tok.AccessToken, spec.Fingerprint.UserAgent); caErr == nil && ca != nil {
+			if ca, caErr := antigravity.LoadCodeAssist(exCtx, httpCli, "", tok.AccessToken, fpUA); caErr == nil && ca != nil {
 				if ca.ProjectID != "" && extractExtraString(credMap, "project_id") == "" {
 					credMap["project_id"] = ca.ProjectID
 				}
@@ -556,8 +576,24 @@ func (s *OAuthService) completeAntigravityCallback(
 					credMap["tier_id"] = ca.TierID
 				}
 			}
+			cancel()
+		} else {
+			cancel()
+			// 真实 Google 授权码（以 "4/" 开头）兑换失败时明确向用户返回具体原因，绝不静默落盘空凭证！
+			if remoteResult == nil && strings.HasPrefix(code, "4/") {
+				return nil, fmt.Errorf("Google OAuth 令牌兑换失败（请确认授权码未重复使用且服务器/所选代理可连接 oauth2.googleapis.com）：%w", tErr)
+			}
 		}
-		cancel()
+	}
+
+	// 补齐通用元数据字段
+	fp := existingSpec.Fingerprint
+	if fp.FingerprintID == "" {
+		if sess != nil && sess.Fingerprint.FingerprintID != "" {
+			fp = sess.Fingerprint
+		} else {
+			fp = antigravity.GenerateNodeFingerprint(provider)
+		}
 	}
 
 	if len(credMap) > 0 || code != "" || strings.TrimSpace(in.APIKey) != "" {
@@ -592,10 +628,10 @@ func (s *OAuthService) completeAntigravityCallback(
 		if redirectURI != "" {
 			credMap["redirect_uri"] = redirectURI
 		}
-		if row.ProxyURL != "" {
-			credMap["proxy_url"] = row.ProxyURL
+		if resolvedProxy != "" {
+			credMap["proxy_url"] = resolvedProxy
 		}
-		credMap["fingerprint"] = spec.Fingerprint
+		credMap["fingerprint"] = fp
 		credMap["source"] = "cmd2api_oauth_hub"
 		credMap["authorized_at"] = time.Now().UTC().Format(time.RFC3339)
 
@@ -608,14 +644,75 @@ func (s *OAuthService) completeAntigravityCallback(
 		if filename == "" {
 			tag := extractExtraString(credMap, "email")
 			if tag == "" {
-				tag = spec.Fingerprint.FingerprintID
+				tag = fp.FingerprintID
 			}
 			filename = fmt.Sprintf("%s-%s-%d.json", sanitizeOAuthFileSlug(provider), sanitizeOAuthFileSlug(tag), time.Now().Unix()%100000)
+		}
+
+		// 分支 A：Account-First「1 账号 = 1 独立容器」自动入池 + 自动创建并启动专属容器
+		if useDedicatedAutoContainer {
+			if normConv, nErr := antigravity.NormalizeSingleCredential(filename, jsonBytes, resolvedProxy); nErr == nil && normConv.Valid {
+				normConv.RawProxy = resolvedProxy
+				normConv.Proxy = workbuddy.RedactProxyURL(resolvedProxy)
+				savedAcc, nodeView, uErr := s.antigravity.UpsertSingleAGYAccountWithContainer(ctx, normConv, groupIDs, true)
+				if uErr != nil {
+					return nil, fmt.Errorf("创建 AGY 账号与专属容器失败: %w", uErr)
+				}
+				var outNodeID int64
+				var containerMsg string
+				if nodeView != nil {
+					outNodeID = nodeView.ID
+					containerMsg = fmt.Sprintf("，已自动绑定专属容器 %s（状态: %s）", nodeView.ContainerName, nodeView.Status)
+				}
+				return &OAuthCallbackResult{
+					OK:           true,
+					Platform:     domain.PlatformAntigravity,
+					Provider:     provider,
+					NodeID:       outNodeID,
+					Node:         nodeView,
+					Filename:     normConv.AuthFilename,
+					Account:      savedAcc,
+					RemoteResult: remoteResult,
+					Message:      fmt.Sprintf("Google OAuth 授权成功：%s 已入池%s", savedAcc.Name, containerMsg),
+				}, nil
+			}
+			// 兜底（例如离线合成测试 code）：先建独立节点再落盘
+			freePort, fpErr := s.antigravity.AllocateFreeHostPort(ctx)
+			if fpErr != nil {
+				return nil, fpErr
+			}
+			strictIso := resolvedProxy != ""
+			autoStart := s.antigravity.DetectEnv(ctx).DockerAvailable
+			slug := sanitizeOAuthFileSlug(firstNonEmptyService(extractExtraString(credMap, "email"), in.AccountName, provider))
+			newNode, cErr := s.antigravity.CreateNode(ctx, CreateContainerNodeInput{
+				Name:            fmt.Sprintf("agy-oauth-%s-%d", slug, freePort),
+				Mode:            domain.ContainerModeLocalDocker,
+				HostIP:          antigravity.DefaultHostIP,
+				HostPort:        freePort,
+				ProxyURL:        resolvedProxy,
+				StrictIsolation: &strictIso,
+				AutoStart:       autoStart,
+				Extra: map[string]any{
+					"single_account":   true,
+					"auto_provisioned": true,
+				},
+			})
+			if cErr != nil {
+				return nil, fmt.Errorf("自动分配独立 agy 容器失败: %w", cErr)
+			}
+			nodeID = newNode.ID
 		}
 
 		upOut, err := s.antigravity.UploadAuthFile(ctx, nodeID, filename, jsonBytes, true, groupIDs)
 		if err != nil {
 			return nil, fmt.Errorf("写入 OAuth .json 凭证并同步账号池失败: %w", err)
+		}
+		// 若该本机节点尚未启动且 Docker 可用，落盘凭证后顺手启动该专属容器
+		nodeView, _ := s.antigravity.GetNode(ctx, nodeID)
+		if nodeView != nil && nodeView.Mode == domain.ContainerModeLocalDocker && nodeView.Status != "running" && s.antigravity.DetectEnv(ctx).DockerAvailable {
+			if actOut, aErr := s.antigravity.RunNodeAction(ctx, nodeID, "start"); aErr == nil && actOut != nil && actOut.Node != nil {
+				nodeView = actOut.Node
+			}
 		}
 
 		return &OAuthCallbackResult{
@@ -623,11 +720,12 @@ func (s *OAuthService) completeAntigravityCallback(
 			Platform:     domain.PlatformAntigravity,
 			Provider:     provider,
 			NodeID:       nodeID,
+			Node:         nodeView,
 			Filename:     upOut.File.Filename,
 			AuthFile:     &upOut.File,
 			Account:      upOut.Account,
 			RemoteResult: remoteResult,
-			Message:      fmt.Sprintf("OAuth 授权完成：已落盘 %s 并自动入池（容器指纹 %s）", upOut.File.Filename, spec.Fingerprint.FingerprintID),
+			Message:      fmt.Sprintf("OAuth 授权完成：已落盘 %s 并自动入池（容器指纹 %s）", upOut.File.Filename, fp.FingerprintID),
 		}, nil
 	}
 
@@ -640,16 +738,32 @@ func (s *OAuthService) completeAntigravityCallback(
 	if len(syncOut.Accounts) > 0 {
 		firstAcc = syncOut.Accounts[0]
 	}
+	nodeView, _ := s.antigravity.GetNode(ctx, nodeID)
 	return &OAuthCallbackResult{
 		OK:           true,
 		Platform:     domain.PlatformAntigravity,
 		Provider:     provider,
 		NodeID:       nodeID,
+		Node:         nodeView,
 		Account:      firstAcc,
 		Accounts:     syncOut.Accounts,
 		RemoteResult: remoteResult,
 		Message:      fmt.Sprintf("容器 OAuth 回调成功，已同步 %d 个账号入池", syncOut.Total),
 	}, nil
+}
+
+func extractCallbackBaseRedirectURI(rawCallback string) string {
+	trimmed := strings.TrimSpace(rawCallback)
+	if trimmed == "" || (!strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://")) {
+		return ""
+	}
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 func (s *OAuthService) completeCommandCodeCallback(

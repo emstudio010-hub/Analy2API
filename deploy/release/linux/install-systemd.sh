@@ -55,12 +55,17 @@ ADMIN_API_KEY=
 AGY_DOCKER_IMAGE=analy2api-agy-cli:latest
 AGY_DATA_DIR=$APP_DIR/data/antigravity
 AGY_SESSION_RETENTION=stateless
-AGY_PROMPT_BLEND_MODE=blend_clean
+AGY_PROMPT_MODE=default_intercept_continue
+TMPDIR=$APP_DIR/tmp
 EOF
   chown root:"$SERVICE" "$CONF_FILE"
   chmod 0640 "$CONF_FILE"
   echo "已生成配置文件 $CONF_FILE"
   echo "初始管理员: admin@analy2api.local / $ADMIN_PW"
+else
+  if ! grep -q '^TMPDIR=' "$CONF_FILE"; then
+    echo "TMPDIR=$APP_DIR/tmp" >> "$CONF_FILE"
+  fi
 fi
 
 install -m 0644 "$UNIT_SRC" "/etc/systemd/system/$SERVICE.service"

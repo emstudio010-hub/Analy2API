@@ -300,6 +300,34 @@ export function checkAntigravityNodeExitIP(nodeId: number) {
   return postLong<NodeExitIPResponse>(`/antigravity/nodes/${nodeId}/check-ip`)
 }
 
+export function requestAntigravityDirectOAuthURL(payload: RequestAntigravityOAuthPayload) {
+  return post<AntigravityOAuthURLResponse>('/antigravity/oauth/url', payload)
+}
+
+export function completeAntigravityDirectOAuthCallback(payload: CompleteOAuthCallbackPayload) {
+  return postLong<OAuthCallbackResponse>('/antigravity/oauth/callback', payload)
+}
+
+export function provisionAntigravityAccountContainer(
+  accountId: number,
+  payload: { proxy_url?: string; docker_image?: string; strict_isolation?: boolean; auto_start?: boolean } = {},
+) {
+  return postLong<{ ok: boolean; node: ContainerNode; account?: Account }>(
+    `/antigravity/accounts/${accountId}/provision-container`,
+    payload,
+  )
+}
+
+export function swapAntigravityAccountIP(
+  accountId: number,
+  payload: { ip_mode?: string; proxy_url?: string },
+) {
+  return postLong<{ ok: boolean; account?: Account; node?: ContainerNode; message?: string }>(
+    `/antigravity/accounts/${accountId}/swap-ip`,
+    payload,
+  )
+}
+
 export const antigravityApi = {
   env: fetchAntigravityEnv,
   listNodes: listAntigravityNodes,

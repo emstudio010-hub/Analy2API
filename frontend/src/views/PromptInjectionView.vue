@@ -25,6 +25,7 @@ import type {
   PromptPreviewResponse,
   PromptTemplate,
 } from '@/api/types'
+import AgyPromptPipelinePanel from '@/components/antigravity/AgyPromptPipelinePanel.vue'
 import AgyInterceptGuide from '@/components/prompts/AgyInterceptGuide.vue'
 import PlatformPromptGallery from '@/components/prompts/PlatformPromptGallery.vue'
 import {
@@ -79,7 +80,7 @@ const workbenchTabItems = computed(() => [
   },
   {
     value: 'agy_guide' satisfies WorkbenchTab,
-    label: 'AGY 拦截接续说明',
+    label: 'AGY 提示词运行管线',
     icon: 'shield' as const,
   },
 ])
@@ -808,12 +809,27 @@ onMounted(async () => {
       @open-guide="workbenchTab = 'agy_guide'"
     />
 
-    <!-- ==================== 分区 3：AGY 拦截接续说明 ==================== -->
-    <AgyInterceptGuide
-      v-else-if="workbenchTab === 'agy_guide'"
-      @browse-agy-catalog="jumpToAgyCatalog"
-      @open-templates="workbenchTab = 'active'"
-    />
+    <!-- ==================== 分区 3：AGY 提示词运行管线设置与说明 ==================== -->
+    <div v-else-if="workbenchTab === 'agy_guide'" class="space-y-4">
+      <AgyPromptPipelinePanel />
+
+      <details class="card group overflow-hidden">
+        <summary class="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-xs font-semibold text-fg transition hover:bg-raised/60">
+          <div class="flex items-center gap-2">
+            <Icon name="fileText" :size="14" class="text-accent" />
+            <span>展开查看 AGY 三阶段拦截与无缝接续底层架构说明</span>
+          </div>
+          <span class="text-2xs font-normal text-subtle group-open:hidden">点击展开</span>
+          <span class="hidden text-2xs font-normal text-subtle group-open:inline">点击收起</span>
+        </summary>
+        <div class="border-t border-line p-4">
+          <AgyInterceptGuide
+            @browse-agy-catalog="jumpToAgyCatalog"
+            @open-templates="workbenchTab = 'active'"
+          />
+        </div>
+      </details>
+    </div>
 
     <!-- ==================== 分区 1：已配置注入模板与分层矩阵 ==================== -->
     <template v-else>

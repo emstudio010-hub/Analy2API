@@ -244,6 +244,8 @@ export interface Account {
   last_health_check_error: string | null
   latency_ms: number | null
   group_ids: number[]
+  node_id?: number
+  extra?: Record<string, unknown>
   balance: AccountBalance
   created_at: string
   updated_at: string
@@ -1047,10 +1049,15 @@ export interface UploadAntigravityAuthFileResponse {
   account?: Account | null
 }
 
+export type AgyIPAllocationMode = 'auto_pool' | 'manual' | 'keep' | 'direct'
+
 export interface RequestAntigravityOAuthPayload {
   provider: string
   redirect_uri?: string
   group_ids?: number[]
+  ip_mode?: AgyIPAllocationMode | string
+  proxy_url?: string
+  node_id?: number
 }
 
 export interface AntigravityOAuthURLResponse {
@@ -1098,6 +1105,7 @@ export interface CreateOAuthSessionPayload {
   node_id?: number
   account_id?: number
   group_ids?: number[]
+  ip_mode?: AgyIPAllocationMode | string
   proxy_url?: string
   redirect_uri?: string
   redirect_mode?: boolean
@@ -1113,6 +1121,7 @@ export interface CompleteOAuthCallbackPayload {
   provider?: string
   node_id?: number
   group_ids?: number[]
+  ip_mode?: AgyIPAllocationMode | string
   proxy_url?: string
   callback_url?: string
   redirect_url?: string
@@ -1139,6 +1148,7 @@ export interface OAuthCallbackResponse {
   platform: string
   provider: string
   node_id?: number
+  node?: ContainerNode | null
   filename?: string
   auth_file?: AntigravityAuthFile
   account?: Account | null
@@ -1758,6 +1768,7 @@ export interface AntigravityConvertAccountsPayload {
   auto_import?: boolean
   node_id?: number
   group_ids?: number[]
+  ip_mode?: AgyIPAllocationMode | string
   proxy_url?: string
   auto_provision?: boolean
   deduplicate?: boolean

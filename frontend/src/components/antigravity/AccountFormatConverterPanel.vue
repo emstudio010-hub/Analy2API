@@ -31,8 +31,9 @@ import { formatBytes, formatExpiry } from '@/utils/format'
 
 const props = defineProps<{
   nodes: ContainerNode[]
-  selectedNode: ContainerNode | null
+  selectedNode?: ContainerNode | null
   groups: Group[]
+  embedded?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -62,11 +63,19 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const isDragging = ref(false)
 const uploadedFiles = ref<File[]>([])
 const rawText = ref('')
-const targetNodeId = ref<string>('')
+const targetNodeId = ref<string>('0')
 const selectedGroupIds = ref<number[]>([])
+const ipMode = ref<string>('auto_pool')
 const defaultProxyUrl = ref('')
 const deduplicate = ref(true)
 const autoProvision = ref(true)
+
+const ipModeOptions = [
+  { label: '自动从 IP 池分配（1号1IP · 推荐）', value: 'auto_pool' },
+  { label: '手动填写指定代理 IP', value: 'manual' },
+  { label: '优先保留文件内自带代理（缺省走 IP 池）', value: 'keep' },
+  { label: '直连（不绑定代理 IP）', value: 'direct' },
+]
 
 const parsing = ref(false)
 const importing = ref(false)
@@ -87,28 +96,18 @@ const effectiveGroupIds = computed(() => {
 
 const nodeSelectOptions = computed(() => [
   {
-    label: props.selectedNode
-      ? `当前选中节点：${props.selectedNode.name} (#${props.selectedNode.id})`
-      : '自动分配隔离容器 / 写入网关 AGY 号池',
-    value: props.selectedNode ? String(props.selectedNode.id) : '0',
+    label: '一账号一容器（为每个账号自动创建并启动专属 Docker 容器 · 推荐）',
+    value: '0',
   },
-  ...(props.selectedNode
-    ? [{ label: '不指定固定节点（按网关策略自动分配隔离目录）', value: '0' }]
-    : []),
-  ...props.nodes
-    .filter((n) => n.id !== props.selectedNode?.id)
-    .map((n) => ({
-      label: `节点：${n.name} (${n.mode === 'local_docker' ? 'Docker' : 'Remote'} · #${n.id})`,
-      value: String(n.id),
-    })),
+  ...props.nodes.map((n) => ({
+    label: `指定现有节点：${n.name} (${n.mode === 'local_docker' ? 'Docker' : 'Remote'} · #${n.id})`,
+    value: String(n.id),
+  })),
 ])
 
 const resolvedTargetNodeId = computed<number | undefined>(() => {
-  if (targetNodeId.value !== '') {
-    const n = Number(targetNodeId.value)
-    return Number.isFinite(n) && n > 0 ? n : undefined
-  }
-  return props.selectedNode?.id
+  const n = Number(targetNodeId.value)
+  return Number.isFinite(n) && n > 0 ? n : undefined
 })
 
 const hasAnyInput = computed(
@@ -266,9 +265,12 @@ async function runConvert(autoImport: boolean): Promise<void> {
       fd.append('auto_import', autoImport ? 'true' : 'false')
       fd.append('deduplicate', deduplicate.value ? 'true' : 'false')
       fd.append('auto_provision', autoProvision.value ? 'true' : 'false')
+      fd.append('ip_mode', ipMode.value)
       if (nodeId) fd.append('node_id', String(nodeId))
       if (groupIds.length > 0) fd.append('group_ids', JSON.stringify(groupIds))
-      if (defaultProxyUrl.value.trim()) fd.append('proxy_url', defaultProxyUrl.value.trim())
+      if (ipMode.value === 'manual' || ipMode.value === 'keep') {
+        if (defaultProxyUrl.value.trim()) fd.append('proxy_url', defaultProxyUrl.value.trim())
+      }
       res = await convertAntigravityAccountsMultipart(fd)
     } else {
       res = await convertAntigravityAccounts({
@@ -276,9 +278,13 @@ async function runConvert(autoImport: boolean): Promise<void> {
         auto_import: autoImport,
         deduplicate: deduplicate.value,
         auto_provision: autoProvision.value,
+        ip_mode: ipMode.value,
         node_id: nodeId,
         group_ids: groupIds.length > 0 ? groupIds : undefined,
-        proxy_url: defaultProxyUrl.value.trim() || undefined,
+        proxy_url:
+          (ipMode.value === 'manual' || ipMode.value === 'keep') && defaultProxyUrl.value.trim()
+            ? defaultProxyUrl.value.trim()
+            : undefined,
       })
     }
 
@@ -514,31 +520,45 @@ function inspectAccountFiles(acc: ConvertedAGYAccount): void {
     <div class="panel-inset flex flex-col gap-3 p-3.5">
       <div class="grid gap-3 md:grid-cols-12">
         <div class="md:col-span-4">
-          <Field label="导入目标节点 / 容器（可选）">
+          <Field label="容器编排方式">
             <Select
-              :model-value="targetNodeId || (selectedNode ? String(selectedNode.id) : '0')"
+              v-model="targetNodeId"
               size="sm"
               :options="nodeSelectOptions"
-              @update:model-value="targetNodeId = $event"
             />
           </Field>
         </div>
 
         <div class="md:col-span-4">
-          <Field label="默认出口代理 (proxy_url · 可选)">
-            <Input
-              v-model="defaultProxyUrl"
+          <Field label="出口 IP 分配策略">
+            <Select
+              v-model="ipMode"
               size="sm"
-              mono
-              placeholder="留空保留原账号代理或走 IP 池"
+              :options="ipModeOptions"
             />
           </Field>
         </div>
 
-        <div class="flex flex-wrap items-end gap-4 pb-1 md:col-span-4">
-          <Switch v-model="deduplicate" size="sm" label="按邮箱/Token 自动去重" />
-          <Switch v-model="autoProvision" size="sm" label="自动落盘隔离目录" />
+        <div v-if="ipMode === 'manual' || ipMode === 'keep'" class="md:col-span-4">
+          <Field :label="ipMode === 'manual' ? '指定出口代理 IP' : '缺省兜底代理 IP (可选)'">
+            <Input
+              v-model="defaultProxyUrl"
+              size="sm"
+              mono
+              placeholder="http://user:pass@ip:port 或 socks5://..."
+            />
+          </Field>
         </div>
+
+        <div v-else class="flex flex-wrap items-end gap-4 pb-1 md:col-span-4">
+          <Switch v-model="deduplicate" size="sm" label="自动去重" />
+          <Switch v-model="autoProvision" size="sm" label="自动建 1:1 容器" />
+        </div>
+      </div>
+
+      <div v-if="ipMode === 'manual' || ipMode === 'keep'" class="flex flex-wrap items-center gap-4 pt-0.5">
+        <Switch v-model="deduplicate" size="sm" label="按邮箱/Token 自动去重" />
+        <Switch v-model="autoProvision" size="sm" label="每号自动创建并启动专属 1:1 容器" />
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-3 border-t border-line/70 pt-3">
@@ -586,7 +606,7 @@ function inspectAccountFiles(acc: ConvertedAGYAccount): void {
             @click="runConvert(true)"
           >
             <template #leading><Icon name="upload" :size="13" /></template>
-            一键转换并导入 AGY 号池/容器
+            一键导入并为每号自动创建专属容器
           </Button>
         </div>
       </div>

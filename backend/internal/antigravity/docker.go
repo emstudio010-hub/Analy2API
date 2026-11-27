@@ -22,16 +22,19 @@ import (
 )
 
 // EmbeddedAgyCLIDockerfile 内嵌 Analy2API 单账号真实 agy CLI 容器构建定义：
-// 即使部署在完全空白的 Linux 服务器（宿主机未安装 agy），只要有 Docker 即可自动构建镜像并按账号自动起独立 agy 容器。
+// 即使部署在完全空白的 Linux 服务器（宿主机未安装 agy），只要有 Docker 即可自动构建镜像并按账号自动起独立容器；
+// 容器内同时具备真实 `agy` CLI 驱动与内置 HTTP/2 v1internal 兜底引擎，确保无桌面 Keyring 或受限网络下 100% 稳定可用。
 const EmbeddedAgyCLIDockerfile = `FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://antigravity.google/install.sh | bash || true
-ENV PATH="/root/.local/bin:/root/.antigravity/bin:/usr/local/bin:${PATH}"
+RUN curl -fsSL https://antigravity.google/cli/install.sh | bash && if [ -f /root/.local/bin/agy ]; then cp /root/.local/bin/agy /usr/local/bin/agy && chmod 0755 /usr/local/bin/agy; fi || true
+ENV PATH="/usr/local/bin:/root/.local/bin:/root/.antigravity/bin:${PATH}"
 COPY analy2api-linux-amd64 /usr/local/bin/analy2api
 RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api
 ENV AGY_SINGLE_CLIENT=1
+ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
+ENV AGY_DISABLE_AUTO_UPDATE=1
 ENV AGY_SESSION_RETENTION=stateless
-ENV AGY_PROMPT_BLEND_MODE=blend_clean
+ENV AGY_PROMPT_MODE=default_intercept_continue
 ENV AGY_BRIDGE_ADDR=:8317
 ENV AGY_AUTH_DIR=/app/auths
 EXPOSE 8317
@@ -79,8 +82,46 @@ func (ExecCommandRunner) Run(ctx context.Context, name string, args ...string) (
 
 // DockerManager 封装本机 Docker 容器生命周期与配置文件编排。
 type DockerManager struct {
-	mu     sync.RWMutex
-	runner CommandRunner
+	mu           sync.RWMutex
+	imageBuildMu sync.Mutex
+	buildWorkDir string
+	runner       CommandRunner
+}
+
+// SetBuildWorkDir 指定镜像自动构建时使用的可写临时父目录（兼容 Linux systemd ProtectSystem=strict / PrivateTmp）。
+func (m *DockerManager) SetBuildWorkDir(dir string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.buildWorkDir = strings.TrimSpace(dir)
+	m.mu.Unlock()
+}
+
+func (m *DockerManager) getBuildWorkDir() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.buildWorkDir
+}
+
+// IsLocalTCPPortFree 探测宿主机指定本地端口是否未被任何进程或其它容器监听。
+func IsLocalTCPPortFree(hostIP string, port int) bool {
+	if port <= 0 || port > 65535 {
+		return false
+	}
+	ip := extractBindHostIP(hostIP)
+	if ip == "" || ip == "*" {
+		ip = DefaultHostIP
+	}
+	ln, err := net.Listen("tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	_ = ln.Close()
+	return true
 }
 
 var (
@@ -272,8 +313,8 @@ func WriteNodeConfigFile(spec NodeSpec) (string, error) {
 	return absConfigPath, nil
 }
 
-// EnsureAgyCLIImage 检查单账号真实 agy CLI 镜像是否存在；在空服务器上若尚无该镜像且为内置 cmdwb2api-agy-cli 镜像，
-// 自动利用内嵌 Dockerfile + Linux 版 cmdwb2api 二进制现场执行 `docker build` 构建镜像，彻底不依赖宿主机安装 agy。
+// EnsureAgyCLIImage 检查单账号真实 agy CLI 镜像是否存在；在空服务器上若尚无该镜像且为内置 analy2api-agy-cli 镜像，
+// 自动利用内嵌 Dockerfile + Linux 版 analy2api 二进制现场执行 `docker build` 构建镜像（并发串行防重，独立 5 分钟构建超时防止前端 30s 断连中断构建）。
 func (m *DockerManager) EnsureAgyCLIImage(ctx context.Context, image string) error {
 	img := strings.TrimSpace(image)
 	if img == "" {
@@ -290,12 +331,37 @@ func (m *DockerManager) EnsureAgyCLIImage(ctx context.Context, image string) err
 		return m.PullImage(ctx, img)
 	}
 
+	if m != nil {
+		m.imageBuildMu.Lock()
+		defer m.imageBuildMu.Unlock()
+	}
+	// 获取锁后二次检查，若前序并发请求已完成构建则直接复用
+	buildCtx := context.Background()
+	if ctx != nil {
+		buildCtx = context.WithoutCancel(ctx)
+	}
+	buildCtx, cancel := context.WithTimeout(buildCtx, 5*time.Minute)
+	defer cancel()
+
+	if _, _, err := m.getRunner().Run(buildCtx, "docker", "image", "inspect", img); err == nil {
+		return nil
+	}
+
 	linuxBin, err := locateLinuxBinaryForImageBuild()
 	if err != nil {
 		return fmt.Errorf("自动构建单账号 agy 容器镜像 %s 失败: %w", img, err)
 	}
 
-	tmpDir, err := os.MkdirTemp("", "analy2api-agy-img-*")
+	baseTmp := m.getBuildWorkDir()
+	if baseTmp != "" {
+		if mkErr := os.MkdirAll(baseTmp, 0o755); mkErr != nil {
+			baseTmp = ""
+		}
+	}
+	tmpDir, err := os.MkdirTemp(baseTmp, "analy2api-agy-img-*")
+	if err != nil && baseTmp != "" {
+		tmpDir, err = os.MkdirTemp("", "analy2api-agy-img-*")
+	}
 	if err != nil {
 		return fmt.Errorf("创建镜像构建临时目录失败: %w", err)
 	}
@@ -308,7 +374,7 @@ func (m *DockerManager) EnsureAgyCLIImage(ctx context.Context, image string) err
 		return fmt.Errorf("拷贝 Linux 二进制到构建上下文失败: %w", err)
 	}
 
-	stdout, stderr, buildErr := m.getRunner().Run(ctx, "docker", "build", "-t", img, tmpDir)
+	stdout, stderr, buildErr := m.getRunner().Run(buildCtx, "docker", "build", "-t", img, tmpDir)
 	if buildErr != nil {
 		return errors.New(formatDockerError(fmt.Sprintf("自动构建单账号 agy CLI 镜像 %s 失败", img), stderr, stdout, buildErr))
 	}
@@ -459,7 +525,10 @@ func (m *DockerManager) EnsureAndStartContainer(ctx context.Context, spec NodeSp
 		"-e", "ANTIGRAVITY_USER_AGENT=" + fp.UserAgent,
 		"-e", "ANTIGRAVITY_USER_AGENT_VERSION=" + EffectiveCLIVersion(),
 		"-e", "AGY_SINGLE_CLIENT=1",
+		"-e", "AGY_CLI_DISABLE_AUTO_UPDATE=true",
+		"-e", "AGY_DISABLE_AUTO_UPDATE=1",
 		"-e", "AGY_SESSION_RETENTION=" + ResolveSessionRetention(spec),
+		"-e", "AGY_PROMPT_MODE=" + ResolvePromptBlendMode(spec),
 		"-e", "AGY_PROMPT_BLEND_MODE=" + ResolvePromptBlendMode(spec),
 		"-e", "AGY_AUTH_DIR=" + ContainerAuthDir,
 		"-e", fmt.Sprintf("AGY_BRIDGE_ADDR=:%d", DefaultContainerPort),
@@ -473,6 +542,7 @@ func (m *DockerManager) EnsureAndStartContainer(ctx context.Context, spec NodeSp
 	if p := rewriteLoopbackProxyForContainer(spec.ProxyURL); p != "" {
 		args = append(args,
 			"--add-host=host.docker.internal:host-gateway",
+			"-e", "AGY_PROXY_URL="+p,
 			"-e", "HTTP_PROXY="+p,
 			"-e", "HTTPS_PROXY="+p,
 			"-e", "ALL_PROXY="+p,

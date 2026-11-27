@@ -307,4 +307,73 @@ func TestStrictContainerIsolationAndUnifiedOAuthHub(t *testing.T) {
 	if resAG2.NodeID == node1.ID {
 		t.Fatalf("已有账号的容器 node1 (%d) 严禁复用到第二个账号，必须自动分配新容器节点", node1.ID)
 	}
+
+	// 9. 测试公网域名下直接 OAuth（NodeID=0 + IPMode=auto_pool）：
+	//    - 自动将公网 redirect_uri 规范化为 Google Desktop 允许的 http://localhost:51121/oauth-callback
+	//    - 自动从代理池分配独立 IP，并在回调后直接自动创建 1:1 专属容器与隔离凭证文件
+	//    - 未运行本机 Docker 容器读取本地 AuthDir，绝不误打已占用端口触发伪 401
+	//    - 支持一键换 IP (SwapAccountIPAndRestartContainer)
+	poolSvc := NewProxyPoolService(clientDB, logger)
+	_, _, err = poolSvc.AddEntries(ctx, "http://10.88.0.1:7890\nhttp://10.88.0.2:7890", nil, "agy", "test-pool")
+	if err != nil {
+		t.Fatalf("AddEntries to proxy pool failed: %v", err)
+	}
+	poolView, err := poolSvc.GetView(ctx)
+	if err != nil {
+		t.Fatalf("GetView failed: %v", err)
+	}
+	poolCfg := poolView.Config
+	poolCfg.Enabled = true
+	poolCfg.Strategy = ProxyStrategyStickyUnique
+	poolCfg.MaxAccountsPerIP = 1
+	if _, err := poolSvc.UpdateConfig(ctx, poolCfg, "", ""); err != nil {
+		t.Fatalf("UpdateConfig failed: %v", err)
+	}
+	agSvc.SetProxyPoolService(poolSvc)
+
+	sessDirect, err := oauthSvc.CreateSession(ctx, CreateOAuthSessionInput{
+		Platform:    domain.PlatformAntigravity,
+		Provider:    "antigravity",
+		NodeID:      0,
+		IPMode:      "auto_pool",
+		RedirectURI: "https://cmd.essapi.uno/api/oauth/callback",
+	})
+	if err != nil {
+		t.Fatalf("创建直接 OAuth 会话失败: %v", err)
+	}
+	if sessDirect.NodeID != 0 {
+		t.Fatalf("直接 OAuth 会话在令牌兑换前不应预绑旧容器节点，实际 NodeID=%d", sessDirect.NodeID)
+	}
+	if !strings.Contains(sessDirect.AuthURL, "redirect_uri=http%3A%2F%2Flocalhost%3A51121%2Foauth-callback") {
+		t.Fatalf("公网域名应自动规范化为官方 localhost:51121 回调以避免 redirect_uri_mismatch: %s", sessDirect.AuthURL)
+	}
+
+	resDirect, err := oauthSvc.CompleteCallback(ctx, CompleteOAuthCallbackInput{
+		SessionID:   sessDirect.SessionID,
+		CallbackURL: "http://localhost:51121/oauth-callback?code=oauth_direct_7788&state=" + sessDirect.State + "&email=direct-auto@example.com&project_id=proj-direct-1",
+	})
+	if err != nil {
+		t.Fatalf("完成直接 OAuth 回调自动建容器失败: %v", err)
+	}
+	if !resDirect.OK || resDirect.Account == nil || resDirect.NodeID <= 0 {
+		t.Fatalf("直接 OAuth 回调应自动创建 1:1 容器节点并返回账号: %+v", resDirect)
+	}
+	if resDirect.Account.ProxyURL != "http://10.88.0.1:7890" {
+		t.Fatalf("直接 OAuth 应自动从代理池分配首个空闲 IP，实际为 %q", resDirect.Account.ProxyURL)
+	}
+
+	// 验证未启动的本机容器调用 ListAuthFiles 直接读取本地 AuthDir（不走端口 HTTP 避免伪 401）
+	listedAuths, err := agSvc.ListAuthFiles(ctx, resDirect.NodeID)
+	if err != nil || len(listedAuths) != 1 || listedAuths[0].Email != "direct-auto@example.com" {
+		t.Fatalf("停止状态的本机容器 ListAuthFiles 应直接读取本地 AuthDir: err=%v files=%+v", err, listedAuths)
+	}
+
+	// 验证一键换 IP 自动切换到代理池中第二个未占用 IP
+	swappedAcc, swappedNode, err := agSvc.SwapAccountIPAndRestartContainer(ctx, resDirect.Account.ID, "auto_pool", "")
+	if err != nil {
+		t.Fatalf("一键换 IP 失败: %v", err)
+	}
+	if swappedAcc.ProxyURL != "http://10.88.0.2:7890" || swappedNode == nil {
+		t.Fatalf("一键换 IP 后期望切换到第二个池 IP http://10.88.0.2:7890，实际为 %q (node=%+v)", swappedAcc.ProxyURL, swappedNode)
+	}
 }

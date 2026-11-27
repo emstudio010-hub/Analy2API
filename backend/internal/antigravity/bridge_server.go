@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"cmd2api/internal/netx"
+	"cmd2api/internal/workbuddy"
 )
 
 // BridgeConfig 描述单容器独立真实 agy CLI 客户端桥接服务 (`analy2api agy-bridge`) 的运行配置。
@@ -100,6 +101,12 @@ func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConf
 		modelsFetchMu  sync.Mutex // 并发防惊群：避免多客户端同时冷启多个 `agy models` 子进程
 		cachedModels   []ModelItem
 		modelsCachedAt time.Time
+
+		credMu         sync.Mutex
+		cachedTok      string
+		cachedTokExp   time.Time
+		cachedProjID   string
+		bridgePool     = workbuddy.NewProxyPool(strings.TrimSpace(cfg.ProxyURL))
 	)
 
 	sessStore := NewCLISessionStore(cfg.SessionTTL, cfg.MaxSessions)
@@ -273,6 +280,32 @@ func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConf
 		}
 
 		resp, _, err := ChatStreamViaCLIWithSession(r.Context(), reqSpec, body, upstreamSID, sessStore)
+		driverLabel := "real-agy-cli"
+		if err == nil && resp != nil && resp.Body != nil {
+			// 在真正向客户端写出 HTTP 响应头前，先窥探首帧：
+			// 若无头 Linux 容器内 agy CLI 因缺少 GNOME Keyring / D-Bus 会话首帧即报登录或密钥环错误，立即无缝切到容器内 HTTP/2 v1internal 引擎。
+			rewoundBody, firstErrMsg := peekFirstAgySSEError(resp.Body)
+			if firstErrMsg != "" && shouldFallbackToBridgeV1Internal(errors.New(firstErrMsg), reqSpec) {
+				_ = resp.Body.Close()
+				resp = nil
+				err = errors.New(firstErrMsg)
+			} else {
+				resp.Body = rewoundBody
+			}
+		}
+		if err != nil && shouldFallbackToBridgeV1Internal(err, reqSpec) {
+			if fbResp, fbErr := chatStreamViaBridgeV1Internal(
+				r.Context(), reqSpec, body, upstreamSID, bridgePool,
+				&credMu, &cachedTok, &cachedTokExp, &cachedProjID, logger,
+			); fbErr == nil {
+				resp = fbResp
+				err = nil
+				driverLabel = "container-http2-v1internal"
+			} else {
+				logger.Warn("单容器 HTTP/2 v1internal 兜底引擎执行失败", "cli_err", err, "fallback_err", fbErr)
+				err = fbErr
+			}
+		}
 		if err != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
@@ -281,7 +314,7 @@ func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConf
 		}
 		defer resp.Body.Close()
 
-		w.Header().Set("X-Agy-Driver", "real-agy-cli")
+		w.Header().Set("X-Agy-Driver", driverLabel)
 		for _, hk := range []string{
 			"X-Agy-Retention-Mode",
 			"X-Agy-Upstream-Session",
@@ -631,4 +664,247 @@ func RunAgyBridgeServer(cfg BridgeConfig) error {
 		_ = srv.Shutdown(shutdownCtx)
 		return nil
 	}
+}
+
+func shouldFallbackToBridgeV1Internal(cliErr error, spec NodeSpec) bool {
+	if cliErr == nil || strings.TrimSpace(spec.AuthDir) == "" {
+		return false
+	}
+	msg := strings.ToLower(cliErr.Error())
+	isMissingOrKeyring := strings.Contains(msg, "未找到真实的 antigravity cli") ||
+		strings.Contains(msg, "executable file not found") ||
+		strings.Contains(msg, "no such file or directory") ||
+		strings.Contains(msg, "cannot find the file") ||
+		strings.Contains(msg, "keyring") ||
+		strings.Contains(msg, "secret-service") ||
+		strings.Contains(msg, "dbus") ||
+		strings.Contains(msg, "not logged in") ||
+		strings.Contains(msg, "please sign in") ||
+		strings.Contains(msg, "failed to retrieve token") ||
+		strings.Contains(msg, "unauthenticated")
+	if !isMissingOrKeyring {
+		return false
+	}
+	_, ok := loadFirstValidAccountFromDir(spec.AuthDir, spec.ProxyURL)
+	return ok
+}
+
+type compositeReadCloser struct {
+	io.Reader
+	io.Closer
+}
+
+func peekFirstAgySSEError(body io.ReadCloser) (io.ReadCloser, string) {
+	br := bufio.NewReaderSize(body, 8192)
+	var consumed bytes.Buffer
+	for i := 0; i < 4; i++ {
+		line, rErr := br.ReadBytes('\n')
+		if len(line) > 0 {
+			consumed.Write(line)
+		}
+		trimmed := strings.TrimSpace(string(line))
+		if trimmed != "" {
+			if strings.HasPrefix(trimmed, "data:") {
+				payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+				if strings.HasPrefix(payload, "{") {
+					var errWrap struct {
+						Error *struct {
+							Message string `json:"message"`
+						} `json:"error"`
+					}
+					if json.Unmarshal([]byte(payload), &errWrap) == nil && errWrap.Error != nil && strings.TrimSpace(errWrap.Error.Message) != "" {
+						return &compositeReadCloser{Reader: io.MultiReader(&consumed, br), Closer: body}, strings.TrimSpace(errWrap.Error.Message)
+					}
+				}
+			}
+			break
+		}
+		if rErr != nil {
+			break
+		}
+	}
+	return &compositeReadCloser{Reader: io.MultiReader(&consumed, br), Closer: body}, ""
+}
+
+func loadFirstValidAccountFromDir(authDir, proxyURL string) (ConvertedAGYAccount, bool) {
+	dir := strings.TrimSpace(authDir)
+	if dir == "" {
+		return ConvertedAGYAccount{}, false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ConvertedAGYAccount{}, false
+	}
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		name := ent.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		raw, rErr := os.ReadFile(filepath.Join(dir, name))
+		if rErr != nil || len(raw) == 0 {
+			continue
+		}
+		if conv, cErr := NormalizeSingleCredential(name, raw, proxyURL); cErr == nil && conv.Valid {
+			if conv.RefreshToken != "" || conv.AccessToken != "" {
+				return conv, true
+			}
+		}
+	}
+	// 兜底检查 .gemini/oauth_creds.json
+	oauthPath := filepath.Join(dir, ".gemini", "oauth_creds.json")
+	if raw, rErr := os.ReadFile(oauthPath); rErr == nil && len(raw) > 0 {
+		if conv, cErr := NormalizeSingleCredential("oauth_creds.json", raw, proxyURL); cErr == nil && conv.Valid {
+			return conv, true
+		}
+	}
+	return ConvertedAGYAccount{}, false
+}
+
+// chatStreamViaBridgeV1Internal 在单账号独立容器内直接通过 HTTP/2 + 独立代理出口驱动 Google Cloud Code Assist v1internal 流式接口：
+// 当容器内未安装桌面版 agy CLI 或无 Linux GNOME Keyring 时无缝接管，100% 保持「1 账号 = 1 容器 = 1 独立 IP = 1 指纹」与提示词拦截接续管线。
+func chatStreamViaBridgeV1Internal(
+	ctx context.Context,
+	spec NodeSpec,
+	openaiBody []byte,
+	sessionID string,
+	pool *workbuddy.ProxyPool,
+	credMu *sync.Mutex,
+	cachedTok *string,
+	cachedTokExp *time.Time,
+	cachedProjID *string,
+	logger *slog.Logger,
+) (*http.Response, error) {
+	conv, ok := loadFirstValidAccountFromDir(spec.AuthDir, spec.ProxyURL)
+	if !ok {
+		return nil, errors.New("容器隔离目录尚未写入有效的 OAuth refresh_token / access_token 凭证")
+	}
+
+	proxyAddr := strings.TrimSpace(spec.ProxyURL)
+	if proxyAddr == "" {
+		proxyAddr = firstNonEmptyStr(os.Getenv("AGY_PROXY_URL"), os.Getenv("HTTPS_PROXY"), os.Getenv("HTTP_PROXY"), os.Getenv("ALL_PROXY"))
+	}
+	var (
+		httpCli *http.Client
+		err     error
+	)
+	if pool != nil {
+		httpCli, err = pool.Client(proxyAddr)
+		if err != nil {
+			return nil, fmt.Errorf("初始化容器出口代理客户端失败: %w", err)
+		}
+	} else {
+		httpCli = netx.NewHTTP2Client(0)
+	}
+
+	ua := BuildCLIUserAgent("", spec.Fingerprint.OS, spec.Fingerprint.Arch)
+
+	credMu.Lock()
+	accessTok := *cachedTok
+	projID := *cachedProjID
+	needRefresh := accessTok == "" || (!cachedTokExp.IsZero() && time.Now().Add(2*time.Minute).After(*cachedTokExp))
+	if accessTok == "" && conv.AccessToken != "" && !conv.Expired {
+		accessTok = conv.AccessToken
+		if conv.ExpiryDateMs > 0 {
+			exp := time.UnixMilli(conv.ExpiryDateMs)
+			if time.Now().Add(2 * time.Minute).Before(exp) {
+				*cachedTok = accessTok
+				*cachedTokExp = exp
+				needRefresh = false
+			} else {
+				needRefresh = true
+			}
+		} else {
+			needRefresh = conv.RefreshToken != ""
+		}
+	}
+	if projID == "" && conv.ProjectID != "" {
+		projID = conv.ProjectID
+		*cachedProjID = projID
+	}
+
+	upstreamBase := strings.TrimRight(strings.TrimSpace(os.Getenv("AGY_UPSTREAM_BASE_URL")), "/")
+	tokenEndpoint := strings.TrimSpace(os.Getenv("AGY_OAUTH_TOKEN_URL"))
+
+	if needRefresh && conv.RefreshToken != "" {
+		refCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		tokRes, rErr := RefreshGoogleOAuthToken(refCtx, httpCli, conv.ClientID, conv.ClientSecret, conv.RefreshToken, tokenEndpoint)
+		cancel()
+		if rErr != nil {
+			credMu.Unlock()
+			return nil, fmt.Errorf("容器内自动刷新 Google OAuth 令牌失败: %w", rErr)
+		}
+		accessTok = tokRes.AccessToken
+		exp := time.Now().Add(55 * time.Minute)
+		if tokRes.ExpiresIn > 0 {
+			exp = time.Now().Add(time.Duration(tokRes.ExpiresIn) * time.Second)
+		}
+		*cachedTok = accessTok
+		*cachedTokExp = exp
+	}
+	if accessTok == "" {
+		credMu.Unlock()
+		return nil, errors.New("容器内凭证缺少可用 access_token 且无法刷新")
+	}
+
+	if projID == "" {
+		caCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		if ca, caErr := LoadCodeAssist(caCtx, httpCli, upstreamBase, accessTok, ua); caErr == nil && ca != nil && ca.ProjectID != "" {
+			projID = ca.ProjectID
+			*cachedProjID = projID
+		} else if caErr != nil && logger != nil {
+			logger.Warn("容器内自动获取 CodeAssist project_id 告警", "err", caErr)
+		}
+		cancel()
+	}
+	credMu.Unlock()
+
+	sanitizedBody, err := SanitizeOpenAIPayload(openaiBody)
+	if err != nil {
+		return nil, err
+	}
+	var modelProbe struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(sanitizedBody, &modelProbe)
+
+	v1Body, err := BuildV1InternalRequest(sanitizedBody, projID, modelProbe.Model, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	baseForStream := upstreamBase
+	if baseForStream == "" {
+		baseForStream = AntigravityProdBaseURL
+	}
+	targetURL := baseForStream + "/v1internal:streamGenerateContent?alt=sse"
+	resp, err := netx.DoWithEOFRetry(ctx, httpCli, func() (*http.Request, error) {
+		req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(v1Body))
+		if rErr != nil {
+			return nil, rErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+accessTok)
+		req.Header.Set("User-Agent", ua)
+		return req, nil
+	}, 2)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		rawErr, _ := io.ReadAll(io.LimitReader(resp.Body, maxMgmtResponseBytes))
+		_ = resp.Body.Close()
+		return nil, parseUpstreamAPIError(resp.StatusCode, rawErr)
+	}
+
+	outResp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body:       TranslateV1InternalSSEToOpenAISSE(ctx, resp.Body, modelProbe.Model, ""),
+	}
+	outResp.Header.Set("Content-Type", "text/event-stream; charset=utf-8")
+	outResp.Header.Set("X-Agy-Prompt-Mode", ResolvePromptBlendMode(spec))
+	return outResp, nil
 }

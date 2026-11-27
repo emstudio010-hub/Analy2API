@@ -387,6 +387,8 @@ func (h *Handler) RequestAntigravityOAuthURL(c *gin.Context) {
 		Provider    string  `json:"provider"`
 		RedirectURI string  `json:"redirect_uri"`
 		GroupIDs    []int64 `json:"group_ids"`
+		IPMode      string  `json:"ip_mode"`
+		ProxyURL    string  `json:"proxy_url"`
 	}
 	if c.Request.ContentLength != 0 {
 		if !bindJSON(c, &req) {
@@ -405,6 +407,8 @@ func (h *Handler) RequestAntigravityOAuthURL(c *gin.Context) {
 			Provider:    req.Provider,
 			NodeID:      id,
 			GroupIDs:    req.GroupIDs,
+			IPMode:      req.IPMode,
+			ProxyURL:    req.ProxyURL,
 			RedirectURI: redirectURI,
 		})
 		if err != nil {
@@ -475,23 +479,25 @@ func (h *Handler) CompleteAntigravityOAuthCallback(c *gin.Context) {
 	}
 
 	res, err := os.CompleteCallback(c.Request.Context(), service.CompleteOAuthCallbackInput{
-		SessionID:   req.SessionID,
-		State:       req.State,
-		Platform:    "antigravity",
-		Provider:    req.Provider,
-		NodeID:      id,
-		GroupIDs:    req.GroupIDs,
-		ProxyURL:    req.ProxyURL,
-		CallbackURL: cbURL,
-		RedirectURI: req.RedirectURI,
-		Code:        req.Code,
-		APIKey:      req.APIKey,
-		Email:       req.Email,
-		ProjectID:   req.ProjectID,
-		AccountName: req.AccountName,
-		Filename:    req.Filename,
-		TokenJSON:   req.TokenJSON,
-		RawJSON:     req.RawJSON,
+		SessionID:    req.SessionID,
+		State:        req.State,
+		Platform:     "antigravity",
+		Provider:     req.Provider,
+		NodeID:       id,
+		GroupIDs:     req.GroupIDs,
+		IPMode:       req.IPMode,
+		ProxyURL:     req.ProxyURL,
+		CallbackURL:  cbURL,
+		RedirectURI:  req.RedirectURI,
+		Code:         req.Code,
+		APIKey:       req.APIKey,
+		RefreshToken: req.RefreshToken,
+		Email:        req.Email,
+		ProjectID:    req.ProjectID,
+		AccountName:  req.AccountName,
+		Filename:     req.Filename,
+		TokenJSON:    req.TokenJSON,
+		RawJSON:      req.RawJSON,
 	})
 	if err != nil {
 		if errors.Is(err, service.ErrContainerNodeNotFound) {
@@ -679,6 +685,146 @@ func (h *Handler) ProvisionAntigravityAccountContainer(c *gin.Context) {
 	})
 }
 
+// RequestAntigravityDirectOAuthURL 无需预先建节点，直接签发 Google Desktop PKCE OAuth 授权地址（POST /api/antigravity/oauth/url）。
+func (h *Handler) RequestAntigravityDirectOAuthURL(c *gin.Context) {
+	os := h.oauthSvc()
+	if os == nil {
+		fail(c, http.StatusServiceUnavailable, "OAuth 服务未初始化")
+		return
+	}
+	var req struct {
+		Provider    string  `json:"provider"`
+		RedirectURI string  `json:"redirect_uri"`
+		GroupIDs    []int64 `json:"group_ids"`
+		IPMode      string  `json:"ip_mode"`
+		ProxyURL    string  `json:"proxy_url"`
+		NodeID      int64   `json:"node_id"`
+	}
+	if c.Request.ContentLength != 0 {
+		if !bindJSON(c, &req) {
+			return
+		}
+	}
+	redirectURI := strings.TrimSpace(req.RedirectURI)
+	if redirectURI == "" {
+		redirectURI = inferExternalOAuthCallbackURL(c)
+	}
+	sess, err := os.CreateSession(c.Request.Context(), service.CreateOAuthSessionInput{
+		Platform:    "antigravity",
+		Provider:    req.Provider,
+		NodeID:      req.NodeID,
+		GroupIDs:    req.GroupIDs,
+		IPMode:      req.IPMode,
+		ProxyURL:    req.ProxyURL,
+		RedirectURI: redirectURI,
+	})
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"session_id":   sess.SessionID,
+		"auth_url":     sess.AuthURL,
+		"url":          sess.AuthURL,
+		"state":        sess.State,
+		"provider":     sess.Provider,
+		"mode":         sess.Mode,
+		"callback_url": sess.RedirectURI,
+		"fingerprint":  sess.Fingerprint,
+		"instructions": sess.Instructions,
+	})
+}
+
+// CompleteAntigravityDirectOAuthCallback 直接提交 Google OAuth 回调，自动分配 IP 并创建 1:1 专属容器（POST /api/antigravity/oauth/callback）。
+func (h *Handler) CompleteAntigravityDirectOAuthCallback(c *gin.Context) {
+	os := h.oauthSvc()
+	if os == nil {
+		fail(c, http.StatusServiceUnavailable, "OAuth 服务未初始化")
+		return
+	}
+	var req completeOAuthCallbackRequest
+	if !bindJSON(c, &req) {
+		return
+	}
+	cbURL := strings.TrimSpace(req.CallbackURL)
+	if cbURL == "" {
+		cbURL = strings.TrimSpace(req.RedirectURL)
+	}
+	res, err := os.CompleteCallback(c.Request.Context(), service.CompleteOAuthCallbackInput{
+		SessionID:    req.SessionID,
+		State:        req.State,
+		Platform:     "antigravity",
+		Provider:     req.Provider,
+		NodeID:       req.NodeID,
+		GroupIDs:     req.GroupIDs,
+		IPMode:       req.IPMode,
+		ProxyURL:     req.ProxyURL,
+		CallbackURL:  cbURL,
+		RedirectURI:  req.RedirectURI,
+		Code:         req.Code,
+		APIKey:       req.APIKey,
+		RefreshToken: req.RefreshToken,
+		Email:        req.Email,
+		ProjectID:    req.ProjectID,
+		AccountName:  req.AccountName,
+		Filename:     req.Filename,
+		TokenJSON:    req.TokenJSON,
+		RawJSON:      req.RawJSON,
+	})
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.sched != nil {
+		h.sched.Invalidate()
+	}
+	if ps := h.promptSvc(); ps != nil {
+		_ = ps.ReloadEngine(c.Request.Context())
+	}
+	h.respondOAuthCallbackJSON(c, res)
+}
+
+// SwapAntigravityAccountIP 一键从代理池重分 IP 或手动修改指定 AntiGravity 账号出口代理，并同步更新重启其专属容器（POST /api/antigravity/accounts/:id/swap-ip）。
+func (h *Handler) SwapAntigravityAccountIP(c *gin.Context) {
+	svc := h.antigravitySvc()
+	if svc == nil {
+		fail(c, http.StatusServiceUnavailable, "AntiGravity 服务未初始化")
+		return
+	}
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var req struct {
+		IPMode   string `json:"ip_mode"`
+		ProxyURL string `json:"proxy_url"`
+	}
+	if c.Request.ContentLength != 0 {
+		if !bindJSON(c, &req) {
+			return
+		}
+	}
+	acc, nodeView, err := svc.SwapAccountIPAndRestartContainer(c.Request.Context(), id, req.IPMode, req.ProxyURL)
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if h.sched != nil {
+		h.sched.Invalidate()
+	}
+	var accDTO *accountDTO
+	if acc != nil {
+		d := h.toAccountDTO(acc)
+		accDTO = &d
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"account": accDTO,
+		"node":    nodeView,
+		"message": "已更新账号出口 IP 并同步刷新专属容器",
+	})
+}
+
 type convertAntigravityFilePayload struct {
 	Filename string `json:"filename"`
 	Content  string `json:"content"`
@@ -691,6 +837,7 @@ type convertAntigravityAccountsRequest struct {
 	AutoImport    bool                            `json:"auto_import"`
 	NodeID        int64                           `json:"node_id"`
 	GroupIDs      []int64                         `json:"group_ids"`
+	IPMode        string                          `json:"ip_mode"`
 	ProxyURL      string                          `json:"proxy_url"`
 	AutoProvision *bool                           `json:"auto_provision"`
 	Deduplicate   *bool                           `json:"deduplicate"`
@@ -843,6 +990,7 @@ func parseConvertAntigravityRequest(c *gin.Context) (service.ConvertAccountsInpu
 		autoImport, _ := strconv.ParseBool(strings.TrimSpace(c.PostForm("auto_import")))
 		nodeID, _ := strconv.ParseInt(strings.TrimSpace(c.PostForm("node_id")), 10, 64)
 		groupIDs := parseFlexibleGroupIDsForm(c.PostFormArray("group_ids"), c.PostFormArray("group_ids[]"))
+		ipMode := strings.TrimSpace(c.PostForm("ip_mode"))
 		proxyURL := strings.TrimSpace(c.PostForm("proxy_url"))
 
 		var autoProvPtr *bool
@@ -865,6 +1013,7 @@ func parseConvertAntigravityRequest(c *gin.Context) (service.ConvertAccountsInpu
 			AutoImport:    autoImport,
 			NodeID:        nodeID,
 			GroupIDs:      groupIDs,
+			IPMode:        ipMode,
 			ProxyURL:      proxyURL,
 			AutoProvision: autoProvPtr,
 			Deduplicate:   dedupPtr,
@@ -907,6 +1056,7 @@ func parseConvertAntigravityRequest(c *gin.Context) (service.ConvertAccountsInpu
 		AutoImport:    req.AutoImport,
 		NodeID:        req.NodeID,
 		GroupIDs:      req.GroupIDs,
+		IPMode:        strings.TrimSpace(req.IPMode),
 		ProxyURL:      strings.TrimSpace(req.ProxyURL),
 		AutoProvision: req.AutoProvision,
 		Deduplicate:   req.Deduplicate,

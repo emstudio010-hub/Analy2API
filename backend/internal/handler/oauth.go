@@ -18,6 +18,7 @@ type createOAuthSessionRequest struct {
 	NodeID       int64   `json:"node_id"`
 	AccountID    int64   `json:"account_id"`
 	GroupIDs     []int64 `json:"group_ids"`
+	IPMode       string  `json:"ip_mode"`
 	ProxyURL     string  `json:"proxy_url"`
 	RedirectURI  string  `json:"redirect_uri"`
 	RedirectMode bool    `json:"redirect_mode"`
@@ -33,6 +34,7 @@ type completeOAuthCallbackRequest struct {
 	Provider     string          `json:"provider"`
 	NodeID       int64           `json:"node_id"`
 	GroupIDs     []int64         `json:"group_ids"`
+	IPMode       string          `json:"ip_mode"`
 	ProxyURL     string          `json:"proxy_url"`
 	CallbackURL  string          `json:"callback_url"`
 	RedirectURL  string          `json:"redirect_url"`
@@ -76,6 +78,7 @@ func (h *Handler) CreateOAuthSession(c *gin.Context) {
 		NodeID:       req.NodeID,
 		AccountID:    req.AccountID,
 		GroupIDs:     req.GroupIDs,
+		IPMode:       req.IPMode,
 		ProxyURL:     req.ProxyURL,
 		RedirectURI:  redirectURI,
 		RedirectMode: req.RedirectMode,
@@ -137,6 +140,7 @@ func (h *Handler) CompleteOAuthCallback(c *gin.Context) {
 		Provider:     req.Provider,
 		NodeID:       req.NodeID,
 		GroupIDs:     req.GroupIDs,
+		IPMode:       req.IPMode,
 		ProxyURL:     req.ProxyURL,
 		CallbackURL:  cbURL,
 		RedirectURI:  req.RedirectURI,
@@ -234,6 +238,7 @@ func (h *Handler) respondOAuthCallbackJSON(c *gin.Context, res *service.OAuthCal
 		"platform":      res.Platform,
 		"provider":      res.Provider,
 		"node_id":       res.NodeID,
+		"node":          res.Node,
 		"filename":      res.Filename,
 		"auth_file":     res.AuthFile,
 		"account":       accDTO,

@@ -1,13 +1,17 @@
 package antigravity
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSanitizeSystemTextAndSchemaCleaner(t *testing.T) {
@@ -175,5 +179,103 @@ func TestNativeV1InternalDirectCLIRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(sseText, `"cached_tokens":20`) || !strings.Contains(sseText, "data: [DONE]") {
 		t.Fatalf("转换后的 OpenAI SSE 缺少 usage 或 [DONE]: %s", sseText)
+	}
+}
+
+func TestGoogleDesktopOAuthRedirectAndBridgeHeadlessFallback(t *testing.T) {
+	// 1. 验证公网域名自动规范化为 Google Desktop 允许的 localhost 回调，而本机地址保持原样
+	if got := NormalizeGoogleDesktopRedirectURI("https://cmd.essapi.uno/api/oauth/callback"); got != OfficialOAuthDefaultRedirectURI {
+		t.Fatalf("remote redirect_uri must fallback to %q, got %q", OfficialOAuthDefaultRedirectURI, got)
+	}
+	if got := NormalizeGoogleDesktopRedirectURI("http://localhost:8080/api/oauth/callback"); got != "http://localhost:8080/api/oauth/callback" {
+		t.Fatalf("loopback redirect_uri should be preserved, got %q", got)
+	}
+
+	// 2. 验证内置公开客户端令牌参数解码有效，且支持环境变量覆盖
+	defaultSec := EffectiveOAuthClientSecret()
+	if len(defaultSec) != 35 {
+		t.Fatalf("expected 35-char decoded desktop client parameter, got len=%d", len(defaultSec))
+	}
+	t.Setenv(AntigravityOAuthClientSecretEnv, "custom-override-secret")
+	if got := EffectiveOAuthClientSecret(); got != "custom-override-secret" {
+		t.Fatalf("expected env override secret, got %q", got)
+	}
+
+	// 3. 验证单账号容器桥接 (agy-bridge) 在无 Linux Keyring / 未装 agy CLI 二进制时，
+	//    能自动用 /app/auths 凭证刷新 OAuth 令牌并无缝降级到内置 HTTP/2 v1internal 流式推理
+	var refreshed, codeAssisted, streamed bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			refreshed = true
+			_ = r.ParseForm()
+			if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("client_secret") == "" {
+				http.Error(w, "missing refresh form fields", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"ya29.refreshed_container_tok","expires_in":3600,"token_type":"Bearer"}`))
+		case "/v1internal:loadCodeAssist":
+			codeAssisted = true
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"cloudaicompanionProject":"proj-headless-01"}`))
+		case "/v1internal:streamGenerateContent":
+			streamed = true
+			if r.Header.Get("Authorization") != "Bearer ya29.refreshed_container_tok" {
+				http.Error(w, "unexpected bearer", http.StatusUnauthorized)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			_, _ = w.Write([]byte("data: {\"response\":{\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"headless container ok\"}]}}]}}\n\ndata: {\"response\":{\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":10,\"candidatesTokenCount\":4}}}\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	t.Setenv("AGY_OAUTH_TOKEN_URL", upstream.URL+"/token")
+	t.Setenv("AGY_UPSTREAM_BASE_URL", upstream.URL)
+
+	authDir := t.TempDir()
+	expiredMs := time.Now().Add(-10 * time.Minute).UnixMilli()
+	credJSON, _ := json.Marshal(map[string]any{
+		"type":          "antigravity",
+		"email":         "headless@example.com",
+		"refresh_token": "1//0gHeadlessRefreshToken123",
+		"expiry_date":   expiredMs,
+	})
+	if err := os.WriteFile(filepath.Join(authDir, "auth.json"), credJSON, 0o600); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+
+	bridgeHandler := NewAgyBridgeHandler(BridgeConfig{
+		CLIBinary:     filepath.Join(authDir, "nonexistent-agy-binary"),
+		AuthDir:       authDir,
+		ProxyURL:      "direct",
+		APIKey:        "sk-bridge-key",
+		ManagementKey: "mgmt-bridge-key",
+	})
+	bridgeSrv := httptest.NewServer(bridgeHandler)
+	defer bridgeSrv.Close()
+
+	reqPayload := []byte(`{"model":"gemini-2.5-pro","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
+	req, _ := http.NewRequest(http.MethodPost, bridgeSrv.URL+"/v1/chat/completions", bytes.NewReader(reqPayload))
+	req.Header.Set("Authorization", "Bearer sk-bridge-key")
+	req.Header.Set("Content-Type", "application/json")
+	directHTTPCli := &http.Client{Transport: &http.Transport{}}
+	resp, err := directHTTPCli.Do(req)
+	if err != nil {
+		t.Fatalf("bridge request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from headless bridge fallback, got %d: %s", resp.StatusCode, string(bodyBytes))
+	}
+	if !refreshed || !codeAssisted || !streamed {
+		t.Fatalf("expected refresh+loadCodeAssist+stream all called, got refreshed=%v codeAssisted=%v streamed=%v", refreshed, codeAssisted, streamed)
+	}
+	if !strings.Contains(string(bodyBytes), "headless container ok") || !strings.Contains(string(bodyBytes), "[DONE]") {
+		t.Fatalf("unexpected bridge SSE output: %s", string(bodyBytes))
 	}
 }

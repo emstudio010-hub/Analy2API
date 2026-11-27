@@ -712,6 +712,9 @@ func parseZipArchiveInput(
 	if len(extracted) == 0 {
 		return nil, fmt.Errorf("zip 归档 %q 中未找到支持的凭证文件 (.json/.jsonl/.csv/.tsv/.txt)", archiveName)
 	}
+	sort.Slice(extracted, func(i, j int) bool {
+		return extracted[i].Filename < extracted[j].Filename
+	})
 
 	companions := collectCompanionGoogleAccounts(extracted)
 	var out []ConvertedAGYAccount
