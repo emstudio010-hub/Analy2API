@@ -313,6 +313,9 @@ func (s *Service) consumeWorkBuddyStream(
 			if chunk.Usage.CachedTokens > 0 {
 				usage.CachedTokens = chunk.Usage.CachedTokens
 			}
+			if chunk.Usage.CacheCreationTokens > 0 {
+				usage.CacheCreationTokens = chunk.Usage.CacheCreationTokens
+			}
 			if chunk.Usage.ReasoningTokens > 0 {
 				usage.ReasoningTokens = chunk.Usage.ReasoningTokens
 			}
@@ -581,6 +584,7 @@ func (s *Service) recordPlatformUsage(
 		rec.InputTokens = nonCached
 		rec.OutputTokens = u.CompletionTokens
 		rec.CacheReadTokens = u.CachedTokens
+		rec.CacheCreationTokens = u.CacheCreationTokens
 		rec.ReasoningTokens = u.ReasoningTokens
 		if u.Credit > 0 {
 			rec.TotalCost = u.Credit * req.RateMultiplier
@@ -863,7 +867,7 @@ func (e *wbAnthropicStreamEncoder) Finish(finishReason string, usage *Normalized
 			"input_tokens":                inputNonCached,
 			"output_tokens":               usage.CompletionTokens,
 			"cache_read_input_tokens":     usage.CachedTokens,
-			"cache_creation_input_tokens": 0,
+			"cache_creation_input_tokens": usage.CacheCreationTokens,
 		},
 	}))
 	out = append(out, anthropicSSEFrame("message_stop", map[string]any{

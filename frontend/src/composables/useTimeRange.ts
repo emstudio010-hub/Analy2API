@@ -29,6 +29,12 @@ export function useTimeRange(defaultHours = 24) {
   const preset = ref(String(defaultHours))
   const customStart = ref('')
   const customEnd = ref('')
+  const tick = ref(0)
+
+  /** 刷新预设时间窗口的当前时刻基准，防止点击「刷新」时截止时间停留在页面初次挂载时刻。 */
+  function refresh(): void {
+    tick.value += 1
+  }
 
   const error = computed(() => {
     if (mode.value !== 'custom') return ''
@@ -44,9 +50,12 @@ export function useTimeRange(defaultHours = 24) {
   })
 
   const range = computed<TimeRange>(() => {
+    void tick.value
     if (mode.value === 'preset') {
-      const end = new Date()
-      const start = new Date(end.getTime() - Number(preset.value) * 3_600_000)
+      const now = Date.now()
+      // 预留 60 秒时钟偏移余量，避免浏览器本地时钟略慢于服务器导致 CreatedAtLT(end) 漏掉刚产生的最新日志
+      const end = new Date(now + 60_000)
+      const start = new Date(now - Number(preset.value) * 3_600_000)
       return { start: start.toISOString(), end: end.toISOString() }
     }
     return {
@@ -66,6 +75,7 @@ export function useTimeRange(defaultHours = 24) {
 
   function usePreset(): void {
     mode.value = 'preset'
+    refresh()
   }
 
   return {
@@ -76,6 +86,7 @@ export function useTimeRange(defaultHours = 24) {
     customEnd,
     error,
     range,
+    refresh,
     useCustom,
     usePreset,
   }

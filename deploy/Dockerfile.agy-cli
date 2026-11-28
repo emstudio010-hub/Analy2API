@@ -2,7 +2,7 @@
 # 每个容器仅挂载单个账号凭证目录与独立出口代理，以 `analy2api agy-bridge` 对外提供标准 /v1 接口。
 FROM debian:bookworm-slim
 
-LABEL io.analy2api.image.rev="v1.2.3-agy-cli"
+LABEL io.analy2api.image.rev="v1.2.5-agy-cli"
 
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
@@ -21,11 +21,10 @@ ENV PATH="/usr/local/bin:/root/.local/bin:/root/.antigravity/bin:${PATH}"
 
 COPY analy2api-linux-amd64 /usr/local/bin/analy2api
 RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api && \
-    mkdir -p /app/auths/.gemini/antigravity/conversations /app/auths/.config/gcloud
+    mkdir -p /app/auths/.gemini/antigravity/conversations /app/auths/.gemini/antigravity-cli /app/auths/.config/gcloud
 
 ENV AGY_SINGLE_CLIENT=1
-ENV AGY_ADC_AUTH=1
-ENV GOOGLE_APPLICATION_CREDENTIALS=/app/auths/.config/gcloud/application_default_credentials.json
+ENV AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1
 ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 ENV AGY_DISABLE_AUTO_UPDATE=1
 ENV AGY_SESSION_RETENTION=stateless

@@ -51,6 +51,7 @@ const {
   customEnd,
   error: rangeError,
   range,
+  refresh: refreshRange,
   useCustom,
   usePreset,
 } = useTimeRange(24)
@@ -246,6 +247,7 @@ function latencyColorClass(ms: number | undefined | null): string {
 
 async function load(softRefresh = false): Promise<void> {
   if (rangeError.value) return
+  if (rangeMode.value === 'preset') refreshRange()
   const seq = ++requestSeq
   const keepContent = softRefresh && Boolean(data.value)
   if (keepContent) refreshing.value = true
@@ -452,7 +454,10 @@ onMounted(() => {
         </MetricTile>
 
         <!-- 5. 全局缓存命中率 -->
-        <div class="card flex flex-col justify-between px-3.5 py-3">
+        <div
+          class="card flex flex-col justify-between px-3.5 py-3"
+          title="命中率 = 缓存读取 / (非缓存输入 + 缓存读取 + 缓存写入)。上游 KV 缓存通常在共享前缀 ≥ 1,024~2,048 Tokens 的多轮会话中触发；短句单测返回 0.0% 属正常现象。"
+        >
           <div class="flex items-start justify-between gap-2">
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-1.5 text-2xs font-medium text-muted">

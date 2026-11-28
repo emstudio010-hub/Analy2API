@@ -26,12 +26,13 @@ type ToolCallDelta struct {
 
 // NormalizedUsage 表示从尾帧提取出的标准化 token 与积分用量。
 type NormalizedUsage struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	CachedTokens     int
-	ReasoningTokens  int
-	Credit           float64
+	PromptTokens        int
+	CompletionTokens    int
+	TotalTokens         int
+	CachedTokens        int
+	CacheCreationTokens int
+	ReasoningTokens     int
+	Credit              float64
 }
 
 // NormalizedChunk 是 StreamDeltaNormalizer 清洗单个上游 SSE 数据帧后的产物。
@@ -361,9 +362,44 @@ func parseToolCallDeltas(v any) []ToolCallDelta {
 
 func parseNormalizedUsage(u map[string]any) *NormalizedUsage {
 	nu := &NormalizedUsage{}
-	if v := intField(u, "prompt_tokens", "input_tokens"); v != nil {
-		nu.PromptTokens = *v
+	if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
+		if v := intField(details, "cached_tokens", "cache_read_tokens"); v != nil {
+			nu.CachedTokens = *v
+		}
+		if v := intField(details, "cache_creation_tokens", "cache_write_tokens"); v != nil {
+			nu.CacheCreationTokens = *v
+		}
+	} else if details, ok := u["input_tokens_details"].(map[string]any); ok {
+		if v := intField(details, "cached_tokens", "cache_read_tokens"); v != nil {
+			nu.CachedTokens = *v
+		}
+		if v := intField(details, "cache_creation_tokens", "cache_write_tokens"); v != nil {
+			nu.CacheCreationTokens = *v
+		}
 	}
+	if nu.CachedTokens == 0 {
+		if v := intField(u, "cached_tokens", "cache_read_tokens", "cache_read_input_tokens", "cached_content_token_count"); v != nil {
+			nu.CachedTokens = *v
+		}
+	}
+	if nu.CacheCreationTokens == 0 {
+		if v := intField(u, "cache_creation_tokens", "cache_creation_input_tokens", "cache_write_tokens"); v != nil {
+			nu.CacheCreationTokens = *v
+		}
+	}
+
+	if v := intField(u, "prompt_tokens"); v != nil {
+		nu.PromptTokens = *v
+	} else if v := intField(u, "input_tokens"); v != nil {
+		// Anthropic 格式的顶层 input_tokens 不含 cache_read_input_tokens，需补齐为含缓存总输入以便下游统一减除；
+		// OpenAI Responses 格式的顶层 input_tokens 已包含 input_tokens_details.cached_tokens。
+		if cr := intField(u, "cache_read_input_tokens"); cr != nil && *cr > 0 {
+			nu.PromptTokens = *v + *cr
+		} else {
+			nu.PromptTokens = *v
+		}
+	}
+
 	if v := intField(u, "completion_tokens", "output_tokens"); v != nil {
 		nu.CompletionTokens = *v
 	}
@@ -372,15 +408,7 @@ func parseNormalizedUsage(u map[string]any) *NormalizedUsage {
 	} else {
 		nu.TotalTokens = nu.PromptTokens + nu.CompletionTokens
 	}
-	if details, ok := u["prompt_tokens_details"].(map[string]any); ok {
-		if v := intField(details, "cached_tokens"); v != nil {
-			nu.CachedTokens = *v
-		}
-	} else if details, ok := u["input_tokens_details"].(map[string]any); ok {
-		if v := intField(details, "cached_tokens"); v != nil {
-			nu.CachedTokens = *v
-		}
-	}
+
 	if details, ok := u["completion_tokens_details"].(map[string]any); ok {
 		if v := intField(details, "reasoning_tokens"); v != nil {
 			nu.ReasoningTokens = *v
@@ -390,6 +418,12 @@ func parseNormalizedUsage(u map[string]any) *NormalizedUsage {
 			nu.ReasoningTokens = *v
 		}
 	}
+	if nu.ReasoningTokens == 0 {
+		if v := intField(u, "reasoning_tokens", "thoughts_token_count"); v != nil {
+			nu.ReasoningTokens = *v
+		}
+	}
+
 	if cr := floatField(u, "credit"); cr != nil {
 		nu.Credit = *cr
 	}

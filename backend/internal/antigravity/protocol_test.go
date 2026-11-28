@@ -168,7 +168,17 @@ func TestNativeV1InternalDirectCLIRoundTrip(t *testing.T) {
 		t.Fatalf("v1internal 缺少 toolConfig VALIDATED 或 functionDeclarations: %s", wireStr)
 	}
 
-	// 验证 v1internal SSE 已无损转换为标准 OpenAI SSE（包含 reasoning_content、tool_calls 与 usage）
+	// 验证 sessionId 已规范化为 Google v1internal 粘性 KV 缓存所需的负 64 位整数十进制字符串
+	innerReq, _ := gotBody["request"].(map[string]any)
+	gotSessID, _ := innerReq["sessionId"].(string)
+	if !negativeInt64SessionRe.MatchString(gotSessID) {
+		t.Fatalf("v1internal request.sessionId 应规范化为负 64 位整数字符串，实际为 %q", gotSessID)
+	}
+	if gotSessID != normalizeV1InternalSessionID("sess-direct-1", "") {
+		t.Fatalf("v1internal request.sessionId 哈希不稳定: %q", gotSessID)
+	}
+
+	// 验证 v1internal SSE 已无损转换为标准 OpenAI SSE（包含 reasoning_content、tool_calls、cached_tokens 与 reasoning_tokens）
 	sseOut, _ := io.ReadAll(resp.Body)
 	sseText := string(sseOut)
 	if !strings.Contains(sseText, `"reasoning_content":"let me check"`) {
@@ -177,8 +187,8 @@ func TestNativeV1InternalDirectCLIRoundTrip(t *testing.T) {
 	if !strings.Contains(sseText, `"name":"exec_task"`) || !strings.Contains(sseText, `"finish_reason":"tool_calls"`) {
 		t.Fatalf("转换后的 OpenAI SSE 缺少 tool_calls 或 tool_calls finish_reason: %s", sseText)
 	}
-	if !strings.Contains(sseText, `"cached_tokens":20`) || !strings.Contains(sseText, "data: [DONE]") {
-		t.Fatalf("转换后的 OpenAI SSE 缺少 usage 或 [DONE]: %s", sseText)
+	if !strings.Contains(sseText, `"cached_tokens":20`) || !strings.Contains(sseText, `"reasoning_tokens":5`) || !strings.Contains(sseText, "data: [DONE]") {
+		t.Fatalf("转换后的 OpenAI SSE 缺少 cached_tokens / reasoning_tokens 或 [DONE]: %s", sseText)
 	}
 }
 

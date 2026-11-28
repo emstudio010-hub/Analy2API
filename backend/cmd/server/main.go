@@ -36,7 +36,7 @@ import (
 var (
 	// AppName、Version、GitCommit 与 BuildTime 支持在发行编译阶段通过 -ldflags 注入。
 	AppName   = "Analy2API"
-	Version   = "1.2.4"
+	Version   = "1.2.5"
 	GitCommit = "dev"
 	BuildTime = ""
 )
@@ -195,6 +195,7 @@ func run() error {
 	}
 	accountService.SetProxyPoolService(proxyPoolService)
 	antigravityService.SetProxyPoolService(proxyPoolService)
+	antigravityService.SetRecorder(recorder)
 
 	cronService := service.NewCronService(client, accountService, logger)
 	if err := cronService.EnsureSeeded(ctx); err != nil {

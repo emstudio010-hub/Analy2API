@@ -50,6 +50,7 @@ const {
   customEnd,
   error: rangeError,
   range,
+  refresh: refreshRange,
   useCustom,
   usePreset,
 } = useTimeRange(24)
@@ -170,12 +171,15 @@ function resolveHttpTransport(log: UsageLog): { label: string; isH2: boolean } {
 function detectClientLabel(ua: string | null | undefined): string {
   const raw = (ua ?? '').toLowerCase()
   if (!raw) return 'API Client'
+  if (raw.includes('analy2api-console-test')) return '控制台测活'
+  if (raw.includes('new-api') || raw.includes('one-api')) return 'NewAPI'
   if (raw.includes('claude-cli') || raw.includes('claude-code')) return 'Claude Code'
   if (raw.includes('codex')) return 'Codex CLI'
   if (raw.includes('antigravity') || raw.includes('agy')) return 'agy CLI'
   if (raw.includes('anthropic')) return 'Anthropic SDK'
   if (raw.includes('openai')) return 'OpenAI SDK'
   if (raw.includes('curl')) return 'cURL'
+  if (raw.includes('go-http-client')) return 'Go / NewAPI'
   return 'HTTP Client'
 }
 
@@ -248,6 +252,20 @@ function resolveCacheHitRatio(log: UsageLog): number | null {
   return (log.cache_read_tokens || 0) / denom
 }
 
+function cacheTooltip(log: UsageLog): string {
+  const read = log.cache_read_tokens || 0
+  const write = log.cache_creation_tokens || 0
+  const input = log.input_tokens || 0
+  const totalIn = input + read + write
+  if (read > 0) {
+    return `缓存命中 ${formatNumber(read)} / 总输入 ${formatNumber(totalIn)} Tokens（缓存写 ${formatNumber(write)}）`
+  }
+  if (totalIn > 0 && totalIn < 1024) {
+    return `本次总输入仅 ${formatNumber(totalIn)} Tokens；上游 KV 缓存通常需共享前缀 ≥ 1,024~2,048 Tokens 且处于多轮会话时触发`
+  }
+  return `缓存读取 ${formatNumber(read)} / 总输入 ${formatNumber(totalIn)} Tokens（多轮长上下文第 2 轮起自动命中粘性缓存）`
+}
+
 function costTooltip(log: UsageLog): string {
   const parts = [`总费用: $${formatCost(log.total_cost)}`, `计费倍率: ${log.rate_multiplier}x`]
   if (log.input_cost !== undefined) parts.push(`输入成本: $${formatCost(log.input_cost)}`)
@@ -267,6 +285,7 @@ let loadSeq = 0
 
 async function load(soft = false): Promise<void> {
   if (rangeError.value) return
+  if (rangeMode.value === 'preset') refreshRange()
   const seq = ++loadSeq
   const keepRows = soft && items.value.length > 0
   if (keepRows) refreshing.value = true
@@ -714,7 +733,7 @@ async function copyLogJson(log: UsageLog): Promise<void> {
             </span>
           </td>
 
-          <td class="td tnum text-right font-mono text-xs">
+          <td class="td tnum text-right font-mono text-xs" :title="cacheTooltip(log)">
             <span
               :class="
                 (resolveCacheHitRatio(log) ?? 0) > 0.2 ? 'font-medium text-success' : 'text-muted'

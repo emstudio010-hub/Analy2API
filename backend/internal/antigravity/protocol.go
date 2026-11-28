@@ -539,11 +539,8 @@ func BuildV1InternalRequest(openaiBody []byte, projectID, modelOverride, session
 		}
 	}
 
-	// 稳定 sessionId
-	resolvedSessID := strings.TrimSpace(sessionID)
-	if resolvedSessID == "" {
-		resolvedSessID = generateStableSessionID(firstUserText)
-	}
+	// 稳定 sessionId（Google v1internal 粘性 KV 缓存严格要求负 64 位整数十进制字符串，如 "-7182930495817263541"）
+	resolvedSessID := normalizeV1InternalSessionID(sessionID, firstUserText)
 
 	innerReq := map[string]any{
 		"contents":  contents,
@@ -658,6 +655,23 @@ func parseToolArgsMap(raw any) map[string]any {
 	default:
 		return map[string]any{}
 	}
+}
+
+var negativeInt64SessionRe = regexp.MustCompile(`^-[0-9]{1,19}$`)
+
+// normalizeV1InternalSessionID 确保传给 Google Cloud Code v1internal 的 sessionId 始终为负 64 位整数十进制字符串：
+//   - 若传入已形如 "-7182930495817263541"，原样保留；
+//   - 若传入任意非空字符串（如 "auto_sess_..." / "sess_..." / UUID），稳定哈希为确定性负 64 位整数；
+//   - 若为空，则用首条用户消息哈希兜底，保证多轮对话 100% 命中上游粘性 KV 缓存。
+func normalizeV1InternalSessionID(sessionID, fallbackSeed string) string {
+	trimmed := strings.TrimSpace(sessionID)
+	if negativeInt64SessionRe.MatchString(trimmed) {
+		return trimmed
+	}
+	if trimmed != "" {
+		return generateStableSessionID(trimmed)
+	}
+	return generateStableSessionID(fallbackSeed)
 }
 
 func generateStableSessionID(seed string) string {
@@ -785,12 +799,22 @@ func TranslateV1InternalSSEToOpenAISSE(ctx context.Context, src io.ReadCloser, m
 				return
 			}
 
-			if um, ok := respObj["usageMetadata"].(map[string]any); ok && um != nil {
+			um, _ := respObj["usageMetadata"].(map[string]any)
+			if um == nil {
+				um, _ = raw["cpaUsageMetadata"].(map[string]any)
+			}
+			if um != nil {
 				sawPayload = true
+				cachedTokens := int(firstInt64(um, "cachedContentTokenCount", "cacheReadInputTokens", "cache_read_input_tokens"))
+				cacheCreateTokens := int(firstInt64(um, "cacheCreationInputTokens", "cache_creation_input_tokens"))
 				promptTokens := int(firstInt64(um, "promptTokenCount"))
-				cachedTokens := int(firstInt64(um, "cachedContentTokenCount"))
-				candTokens := int(firstInt64(um, "candidatesTokenCount"))
-				thoughtTokens := int(firstInt64(um, "thoughtsTokenCount"))
+				if promptTokens == 0 {
+					if inTok := int(firstInt64(um, "inputTokens", "input_tokens")); inTok > 0 {
+						promptTokens = inTok + cachedTokens
+					}
+				}
+				candTokens := int(firstInt64(um, "candidatesTokenCount", "outputTokens", "output_tokens"))
+				thoughtTokens := int(firstInt64(um, "thoughtsTokenCount", "reasoningTokens", "reasoning_tokens"))
 				nonCachedPrompt := promptTokens - cachedTokens
 				if nonCachedPrompt < 0 {
 					nonCachedPrompt = 0
@@ -801,9 +825,15 @@ func TranslateV1InternalSSEToOpenAISSE(ctx context.Context, src io.ReadCloser, m
 					"completion_tokens": completionTokens,
 					"total_tokens":      promptTokens + completionTokens,
 					"prompt_tokens_details": map[string]any{
-						"cached_tokens": cachedTokens,
+						"cached_tokens":         cachedTokens,
+						"cache_creation_tokens": cacheCreateTokens,
 					},
-					"input_tokens": nonCachedPrompt,
+					"completion_tokens_details": map[string]any{
+						"reasoning_tokens": thoughtTokens,
+					},
+					"cached_tokens":               cachedTokens,
+					"cache_creation_input_tokens": cacheCreateTokens,
+					"input_tokens":                nonCachedPrompt,
 				}
 			}
 

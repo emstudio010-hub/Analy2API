@@ -172,7 +172,7 @@ func (r *Recorder) RecordWithMeta(ctx context.Context, rec relay.UsageRecord, pl
 		return
 	}
 
-	if cost.TotalCost <= 0 {
+	if cost.TotalCost <= 0 || strings.HasPrefix(rec.RequestID, "agy-test-") {
 		return
 	}
 	// 用带条件表达式的原子自增，不做「读出来加完写回去」——

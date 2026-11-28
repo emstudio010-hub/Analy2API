@@ -490,6 +490,7 @@ func ExtractSessionID(req *RelayRequest, normalized *normalizedRequest, fallback
 
 	if req != nil && len(req.Body) > 0 {
 		var probe struct {
+			PromptCacheKey string `json:"prompt_cache_key"`
 			SessionID      string `json:"session_id"`
 			ConversationID string `json:"conversation_id"`
 			ThreadID       string `json:"thread_id"`
@@ -501,6 +502,7 @@ func ExtractSessionID(req *RelayRequest, normalized *normalizedRequest, fallback
 		}
 		if json.Unmarshal(req.Body, &probe) == nil {
 			for _, cand := range []string{
+				probe.PromptCacheKey,
 				probe.SessionID,
 				probe.ConversationID,
 				probe.ThreadID,

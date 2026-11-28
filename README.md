@@ -10,7 +10,7 @@
 [![Vue 3](https://img.shields.io/badge/Vue-3%20%2B%20TypeScript-4FC08D?style=flat-square&logo=vue.js&logoColor=white)](https://vuejs.org/)
 [![License: LGPL-3.0](https://img.shields.io/badge/License-LGPL--3.0-ff69b4?style=flat-square)](LICENSE)
 [![Co-Creators](https://img.shields.io/badge/Co--Creators-%E5%B0%8F%E5%96%B5%20%C2%B7%20ChatGPT%20%C2%B7%20Gemini--4-ffb6c1?style=flat-square)](#-共创团队--co-creators)
-[![Release](https://img.shields.io/badge/Release-v1.2.4-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
+[![Release](https://img.shields.io/badge/Release-v1.2.5-a78bfa?style=flat-square)](https://github.com/emstudio010-hub/Analy2API/releases)
 
 </div>
 

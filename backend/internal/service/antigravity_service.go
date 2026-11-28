@@ -19,11 +19,13 @@ import (
 	"cmd2api/ent"
 	"cmd2api/ent/account"
 	"cmd2api/ent/accountgroup"
+	"cmd2api/ent/apikey"
 	"cmd2api/ent/containernode"
 	"cmd2api/ent/group"
 	"cmd2api/internal/antigravity"
 	"cmd2api/internal/crypto"
 	"cmd2api/internal/domain"
+	"cmd2api/internal/relay"
 	"cmd2api/internal/workbuddy"
 )
 
@@ -188,6 +190,7 @@ type AntigravityService struct {
 	agClient      *antigravity.Client
 	docker        *antigravity.DockerManager
 	proxyPool     *ProxyPoolService
+	recorder      *Recorder
 	dataRoot      string
 	defaultImage  string
 	logger        *slog.Logger
@@ -2961,6 +2964,7 @@ func (s *AntigravityService) TestAccountChat(ctx context.Context, in TestAntigra
 	if chatErr != nil {
 		out.OK = false
 		out.Error = chatErr.Error()
+		s.recordConsoleTestUsage(ctx, acc, model, started, nil, 502, out.Error, nil)
 		return out, nil
 	}
 	defer resp.Body.Close()
@@ -2970,9 +2974,13 @@ func (s *AntigravityService) TestAccountChat(ctx context.Context, in TestAntigra
 
 	var replyBuf, reasonBuf strings.Builder
 	var toolCalls []map[string]any
+	var lastUsage map[string]any
 	tcByIdx := map[int]map[string]any{}
 
 	rawSSE, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	totalElapsedMs := int(time.Since(started).Milliseconds())
+	out.LatencyMs = int64(totalElapsedMs)
+
 	for _, line := range strings.Split(string(rawSSE), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "data:") {
@@ -2990,7 +2998,11 @@ func (s *AntigravityService) TestAccountChat(ctx context.Context, in TestAntigra
 			errMsg, _ := errObj["message"].(string)
 			out.OK = false
 			out.Error = firstNonEmptyStrSvc(errMsg, dataPart)
+			s.recordConsoleTestUsage(ctx, acc, model, started, nil, 502, out.Error, lastUsage)
 			return out, nil
+		}
+		if uObj, ok := chunk["usage"].(map[string]any); ok && uObj != nil {
+			lastUsage = uObj
 		}
 		choices, _ := chunk["choices"].([]any)
 		for _, chItem := range choices {
@@ -3045,19 +3057,149 @@ func (s *AntigravityService) TestAccountChat(ctx context.Context, in TestAntigra
 	if !out.OK && out.Error == "" {
 		out.Error = "容器已响应但未返回可见文本或工具调用"
 	}
+	firstMs := int(latency)
+	if firstMs <= 0 {
+		firstMs = totalElapsedMs
+	}
+	statusCode := 200
+	if !out.OK {
+		statusCode = 502
+	}
+	s.recordConsoleTestUsage(ctx, acc, model, started, &firstMs, statusCode, out.Error, lastUsage)
+
 	if out.OK {
 		now := time.Now()
-		latInt := int(latency)
 		_, _ = s.db.Account.UpdateOneID(acc.ID).
 			SetLastHealthCheckAt(now).
 			SetLastHealthCheckOk(true).
 			ClearLastHealthCheckError().
-			SetLatencyMs(latInt).
+			SetLatencyMs(totalElapsedMs).
 			SetConsecutiveFailures(0).
 			ClearErrorMessage().
 			Save(ctx)
 	}
 	return out, nil
+}
+
+// SetRecorder 注入用量记录器，使控制台 AntiGravity 在线测试调用同样写入调用明细日志。
+func (s *AntigravityService) SetRecorder(r *Recorder) {
+	if s != nil {
+		s.recorder = r
+	}
+}
+
+func (s *AntigravityService) recordConsoleTestUsage(
+	ctx context.Context,
+	acc *ent.Account,
+	model string,
+	started time.Time,
+	firstTokenMs *int,
+	statusCode int,
+	errMsg string,
+	usageMap map[string]any,
+) {
+	if s == nil || s.recorder == nil || s.db == nil || acc == nil {
+		return
+	}
+	recCtx := context.WithoutCancel(ctx)
+	agLinks, _ := s.db.AccountGroup.Query().
+		Where(accountgroup.AccountIDEQ(acc.ID)).
+		All(recCtx)
+	var groupIDs []int64
+	for _, l := range agLinks {
+		if l.GroupID > 0 {
+			groupIDs = append(groupIDs, l.GroupID)
+		}
+	}
+
+	var keyRow *ent.APIKey
+	if len(groupIDs) > 0 {
+		keyRow, _ = s.db.APIKey.Query().
+			Where(apikey.DeletedAtIsNil(), apikey.GroupIDIn(groupIDs...)).
+			Order(ent.Asc(apikey.FieldID)).
+			First(recCtx)
+	}
+	if keyRow == nil {
+		keyRow, _ = s.db.APIKey.Query().
+			Where(apikey.DeletedAtIsNil()).
+			Order(ent.Asc(apikey.FieldID)).
+			First(recCtx)
+	}
+	if keyRow == nil {
+		return
+	}
+
+	var resolvedGroupID *int64
+	if len(groupIDs) > 0 {
+		gid := groupIDs[0]
+		resolvedGroupID = &gid
+	} else if keyRow.GroupID != nil {
+		gid := *keyRow.GroupID
+		resolvedGroupID = &gid
+	}
+
+	var inputTokens, outputTokens, cachedTokens, cacheCreateTokens, reasoningTokens int
+	if usageMap != nil {
+		promptTokens := int(extractExtraInt64(usageMap, "prompt_tokens"))
+		outputTokens = int(extractExtraInt64(usageMap, "completion_tokens"))
+		cachedTokens = int(extractExtraInt64(usageMap, "cached_tokens"))
+		cacheCreateTokens = int(extractExtraInt64(usageMap, "cache_creation_input_tokens"))
+		if ptd, ok := usageMap["prompt_tokens_details"].(map[string]any); ok && ptd != nil {
+			if cachedTokens == 0 {
+				cachedTokens = int(extractExtraInt64(ptd, "cached_tokens"))
+			}
+			if cacheCreateTokens == 0 {
+				cacheCreateTokens = int(extractExtraInt64(ptd, "cache_creation_tokens"))
+			}
+		}
+		if ctd, ok := usageMap["completion_tokens_details"].(map[string]any); ok && ctd != nil {
+			reasoningTokens = int(extractExtraInt64(ctd, "reasoning_tokens"))
+		}
+		if promptTokens > 0 {
+			inputTokens = promptTokens - cachedTokens
+			if inputTokens < 0 {
+				inputTokens = 0
+			}
+		} else {
+			inputTokens = int(extractExtraInt64(usageMap, "input_tokens"))
+		}
+	}
+
+	var rb [4]byte
+	_, _ = rand.Read(rb[:])
+	reqID := "agy-test-" + hex.EncodeToString(rb[:])
+	durMs := int(time.Since(started).Milliseconds())
+	if durMs < 0 {
+		durMs = 0
+	}
+	rateMult := acc.RateMultiplier
+	if rateMult <= 0 {
+		rateMult = 1
+	}
+
+	rec := relay.UsageRecord{
+		UserID:              keyRow.UserID,
+		APIKeyID:            keyRow.ID,
+		AccountID:           acc.ID,
+		GroupID:             resolvedGroupID,
+		Platform:            domain.PlatformAntigravity,
+		RequestID:           reqID,
+		Model:               model,
+		InputTokens:         inputTokens,
+		OutputTokens:        outputTokens,
+		CacheCreationTokens: cacheCreateTokens,
+		CacheReadTokens:     cachedTokens,
+		ReasoningTokens:     reasoningTokens,
+		RateMultiplier:      rateMult,
+		Stream:              true,
+		DurationMs:          durMs,
+		FirstTokenMs:        firstTokenMs,
+		StatusCode:          statusCode,
+		ErrorMessage:        strings.TrimSpace(errMsg),
+		UserAgent:           "Analy2API-Console-Test/1.0",
+		IPAddress:           "127.0.0.1",
+	}
+	s.recorder.RecordWithMeta(recCtx, rec, domain.PlatformAntigravity, reasoningTokens)
 }
 
 // UpgradeManagedContainersOnStartup 在服务端启动后异步检测内置单账号容器镜像与运行中容器：
