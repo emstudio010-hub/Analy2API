@@ -107,16 +107,20 @@ func buildIsolatedCLIEnv(spec NodeSpec) []string {
 			"XDG_CONFIG_HOME="+filepath.Join(authDir, ".config"),
 		)
 		if adcPath, projID := EnsureIsolatedADCFile(authDir); adcPath != "" {
-			filtered = append(filtered,
-				"AGY_ADC_AUTH=1",
-				"GOOGLE_APPLICATION_CREDENTIALS="+adcPath,
-			)
-			if effProj := firstNonEmptyStr(spec.ProjectID, projID); effProj != "" {
+			effProj := strings.TrimSpace(firstNonEmptyStr(spec.ProjectID, projID))
+			if effProj != "" && !strings.EqualFold(effProj, DefaultAGYProjectID) {
+				// 仅在绑定真实企业级 GCP 项目时启用 AGY_ADC_AUTH；个人 Free/Pro OAuth 账号走消费级存储与 v1internal 通道
 				filtered = append(filtered,
+					"AGY_ADC_AUTH=1",
+					"GOOGLE_APPLICATION_CREDENTIALS="+adcPath,
 					"ANTIGRAVITY_PROJECT_ID="+effProj,
 					"GOOGLE_CLOUD_PROJECT="+effProj,
 				)
+			} else {
+				filtered = append(filtered, "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1")
 			}
+		} else {
+			filtered = append(filtered, "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1")
 		}
 	}
 	if proxy != "" && !clearProxy {

@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	// DefaultCLIVersion 是 AntiGravity CLI 官方客户端默认版本号（可通过 ANTIGRAVITY_USER_AGENT_VERSION 环境变量覆盖）。
-	DefaultCLIVersion = "2.9.1"
+	// DefaultCLIVersion 是 AntiGravity 官方客户端默认协议版本号（可通过 ANTIGRAVITY_USER_AGENT_VERSION 环境变量覆盖）。
+	DefaultCLIVersion = "1.26.10"
 
 	// AntigravityUserAgentVersionEnv 允许运行时覆盖 AntiGravity CLI User-Agent 版本号。
 	AntigravityUserAgentVersionEnv = "ANTIGRAVITY_USER_AGENT_VERSION"
@@ -39,8 +39,8 @@ func EffectiveCLIVersion() string {
 	return DefaultCLIVersion
 }
 
-// BuildCLIUserAgent 构造严格符合官方 AntiGravity CLI 客户端格式的 User-Agent：
-// `antigravity/<version> <os>/<arch>`（绝不附加任何自定义后缀或网关标识）。
+// BuildCLIUserAgent 构造严格符合官方 AntiGravity 客户端格式的 User-Agent：
+// `antigravity/hub/<version> (<os>/<arch>)`（绝不附加任何自定义后缀或网关标识）。
 func BuildCLIUserAgent(version, osName, arch string) string {
 	v := strings.TrimSpace(version)
 	if !cliVersionRe.MatchString(v) {
@@ -48,13 +48,13 @@ func BuildCLIUserAgent(version, osName, arch string) string {
 	}
 	o := strings.ToLower(strings.TrimSpace(osName))
 	if o == "" {
-		o = "windows"
+		o = "linux"
 	}
 	a := strings.ToLower(strings.TrimSpace(arch))
 	if a == "" {
 		a = "amd64"
 	}
-	return fmt.Sprintf("antigravity/%s %s/%s", v, o, a)
+	return fmt.Sprintf("antigravity/hub/%s (%s/%s)", v, o, a)
 }
 
 // NodeFingerprint 描述单个 AntiGravity 容器/CLI 节点专属的隔离客户端身份。
@@ -151,7 +151,7 @@ func NormalizeNodeFingerprint(fp NodeFingerprint, fallbackSeed string) NodeFinge
 	}
 	// 严禁对外发送旧版 CLIProxyAPI/... 或附带 fp_ 后缀的非真实 AntiGravity CLI User-Agent
 	lowerUA := strings.ToLower(strings.TrimSpace(fp.UserAgent))
-	if !strings.HasPrefix(lowerUA, "antigravity/") || strings.Contains(lowerUA, "fp_") || strings.Contains(lowerUA, "cliproxy") {
+	if !strings.HasPrefix(lowerUA, "antigravity/hub/") || strings.Contains(lowerUA, "fp_") || strings.Contains(lowerUA, "cliproxy") {
 		fp.UserAgent = BuildCLIUserAgent("", fp.OS, fp.Arch)
 	}
 	fp.Qimei36, fp.MachineID = workbuddy.EnsureDevice(fp.Qimei36, fp.MachineID)

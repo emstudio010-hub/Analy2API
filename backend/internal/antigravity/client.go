@@ -233,7 +233,7 @@ func (c *Client) sendNodeRequest(ctx context.Context, spec NodeSpec, method, pat
 func resolveCLIUserAgent(spec NodeSpec) string {
 	ua := strings.TrimSpace(spec.Fingerprint.UserAgent)
 	lower := strings.ToLower(ua)
-	if ua != "" && strings.HasPrefix(lower, "antigravity/") && !strings.Contains(lower, "fp_") && !strings.Contains(lower, "cliproxy") {
+	if ua != "" && strings.HasPrefix(lower, "antigravity/hub/") && !strings.Contains(lower, "fp_") && !strings.Contains(lower, "cliproxy") {
 		return ua
 	}
 	return BuildCLIUserAgent("", spec.Fingerprint.OS, spec.Fingerprint.Arch)

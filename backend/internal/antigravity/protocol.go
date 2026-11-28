@@ -41,6 +41,7 @@ const (
 	AntigravityOAuthClientSecretEnv = "ANTIGRAVITY_OAUTH_CLIENT_SECRET"
 	AntigravityProdBaseURL          = "https://cloudcode-pa.googleapis.com"
 	AntigravityDailyBaseURL         = "https://daily-cloudcode-pa.googleapis.com"
+	DefaultAGYProjectID             = "aicode-consumers"
 
 	// DummyThoughtSignature 用于 Gemini 3 跳过历史工具调用 thought_signature 校验
 	DummyThoughtSignature = "skip_thought_signature_validator"
@@ -300,6 +301,27 @@ func PrepareOpenAIPayloadForCLI(openaiBody []byte) ([]byte, error) {
 //   - 构建 contents（支持多轮 text / image / assistant tool_calls -> functionCall / tool -> functionResponse）
 //   - 构建 tools[].functionDeclarations（经 CleanJSONSchema 清洗）与 toolConfig.functionCallingConfig.mode = "VALIDATED"
 //   - 构建确定性 sessionId（"-<int64>"）
+// ResolveV1InternalModel 将 CLI 推理档位别名（如 gemini-3.8-flash-low/medium/high）映射为 v1internal 真实模型名与 thinkingLevel。
+func ResolveV1InternalModel(rawModel string) (string, string) {
+	m := strings.TrimSpace(rawModel)
+	switch strings.ToLower(m) {
+	case "gemini-3.8-flash-low":
+		return "gemini-3.8-flash-tiered", "LOW"
+	case "gemini-3.8-flash-medium", "gemini-3.8-flash":
+		return "gemini-3.8-flash-tiered", "MEDIUM"
+	case "gemini-3.8-flash-high":
+		return "gemini-3.8-flash-tiered", "HIGH"
+	case "gemini-3-flash-preview":
+		return "gemini-3-flash", ""
+	case "gemini-3.1-flash-lite-preview":
+		return "gemini-3.1-flash-lite", ""
+	case "gemini-3.1-flash-image-preview":
+		return "gemini-3.1-flash-image", ""
+	default:
+		return m, ""
+	}
+}
+
 func BuildV1InternalRequest(openaiBody []byte, projectID, modelOverride, sessionID string) ([]byte, error) {
 	sanitized, err := SanitizeOpenAIPayload(openaiBody)
 	if err != nil {
@@ -317,8 +339,10 @@ func BuildV1InternalRequest(openaiBody []byte, projectID, modelOverride, session
 		model = strings.TrimSpace(model)
 	}
 	if model == "" {
-		model = "gemini-2.5-flash"
+		model = "gemini-3.8-flash-tiered"
 	}
+	var inferredThinkingLevel string
+	model, inferredThinkingLevel = ResolveV1InternalModel(model)
 	allowDummyThought := strings.HasPrefix(strings.ToLower(model), "gemini-")
 
 	var (
@@ -476,6 +500,14 @@ func BuildV1InternalRequest(openaiBody []byte, projectID, modelOverride, session
 		genCfg["stopSequences"] = stop
 	} else if stopStr, ok := reqMap["stop"].(string); ok && stopStr != "" {
 		genCfg["stopSequences"] = []string{stopStr}
+	}
+	if inferredThinkingLevel != "" {
+		if _, exists := genCfg["thinkingConfig"]; !exists {
+			genCfg["thinkingConfig"] = map[string]any{
+				"thinkingLevel":   inferredThinkingLevel,
+				"includeThoughts": true,
+			}
+		}
 	}
 
 	// 构建 tools[].functionDeclarations
@@ -1058,7 +1090,7 @@ func LoadCodeAssist(ctx context.Context, httpClient *http.Client, baseURL, acces
 	}
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
-		base = AntigravityProdBaseURL
+		base = AntigravityDailyBaseURL
 	}
 	ua := strings.TrimSpace(userAgent)
 	if ua == "" {
@@ -1165,7 +1197,7 @@ func FetchAntigravityQuotaAndModels(
 	}
 	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if base == "" {
-		base = AntigravityProdBaseURL
+		base = AntigravityDailyBaseURL
 	}
 	ua := strings.TrimSpace(userAgent)
 	if ua == "" {
@@ -1224,6 +1256,7 @@ func FetchAntigravityQuotaAndModels(
 	var pctCount int
 	var minPct float64 = 101
 	var earliestReset string
+	var flashTieredItem *ModelQuotaItem
 
 	for modelID, meta := range parsed.Models {
 		id := strings.TrimSpace(modelID)
@@ -1239,6 +1272,14 @@ func FetchAntigravityQuotaAndModels(
 			mCopy[k] = v
 		}
 		mCopy["id"] = id
+		if dn, _ := mCopy["displayName"].(string); strings.TrimSpace(dn) == "" {
+			switch lowerID {
+			case "gemini-3.8-flash-tiered":
+				mCopy["displayName"] = "Gemini 3.8 Flash (Tiered)"
+			case "gemini-4-hydrogen-sonar":
+				mCopy["displayName"] = "Gemini 4 Hydrogen Sonar"
+			}
+		}
 		inferred, ok := InferModelItem(mCopy)
 		if !ok {
 			continue
@@ -1287,6 +1328,34 @@ func FetchAntigravityQuotaAndModels(
 			}
 		}
 		out.Models = append(out.Models, qi)
+		if lowerID == "gemini-3.8-flash-tiered" {
+			copied := qi
+			flashTieredItem = &copied
+		}
+	}
+
+	// 若上游返回 gemini-3.8-flash-tiered，自动展开官方 CLI 推理档位别名（low / medium / high），调用时映射至对应 thinkingLevel
+	if flashTieredItem != nil {
+		existing := make(map[string]struct{}, len(out.Models))
+		for _, m := range out.Models {
+			existing[strings.ToLower(m.ID)] = struct{}{}
+		}
+		for _, alias := range []struct {
+			id   string
+			name string
+		}{
+			{"gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"},
+			{"gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"},
+			{"gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"},
+		} {
+			if _, has := existing[alias.id]; !has {
+				aliasItem := *flashTieredItem
+				aliasItem.ID = alias.id
+				aliasItem.Name = alias.name
+				aliasItem.Source = "merged"
+				out.Models = append(out.Models, aliasItem)
+			}
+		}
 	}
 
 	sortModelQuotaItems(out.Models)

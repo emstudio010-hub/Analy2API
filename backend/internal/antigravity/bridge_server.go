@@ -218,8 +218,9 @@ func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConf
 			modelsMu.Unlock()
 
 			if len(models) == 0 {
-				fetched, err := ListModelsViaCLI(r.Context(), curSpec)
-				if err != nil || len(fetched) == 0 {
+				var fetched []ModelItem
+				var err error
+				if _, hasCred := loadFirstValidAccountFromDir(curSpec.AuthDir, curSpec.ProxyURL); hasCred {
 					if qStatus, qErr := fetchBridgeQuotaAndModels(r.Context(), curSpec, bridgePool, &credMu, &cachedTok, &cachedTokExp, &cachedProjID); qErr == nil && qStatus != nil && len(qStatus.Models) > 0 {
 						for _, qm := range qStatus.Models {
 							fetched = append(fetched, ModelItem{
@@ -233,6 +234,15 @@ func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConf
 								SupportsToolCall:  qm.SupportsToolCall,
 							})
 						}
+					} else {
+						err = qErr
+					}
+				}
+				if len(fetched) == 0 {
+					var cliErr error
+					fetched, cliErr = ListModelsViaCLI(r.Context(), curSpec)
+					if cliErr != nil && err == nil {
+						err = cliErr
 					}
 				}
 				if len(fetched) == 0 {
@@ -708,7 +718,7 @@ func shouldFallbackToBridgeV1Internal(cliErr error, spec NodeSpec) bool {
 		return false
 	}
 	msg := strings.ToLower(cliErr.Error())
-	isMissingOrKeyring := strings.Contains(msg, "未找到真实的 antigravity cli") ||
+	isHeadlessOrAuthFallback := strings.Contains(msg, "未找到真实的 antigravity cli") ||
 		strings.Contains(msg, "executable file not found") ||
 		strings.Contains(msg, "no such file or directory") ||
 		strings.Contains(msg, "cannot find the file") ||
@@ -717,9 +727,15 @@ func shouldFallbackToBridgeV1Internal(cliErr error, spec NodeSpec) bool {
 		strings.Contains(msg, "dbus") ||
 		strings.Contains(msg, "not logged in") ||
 		strings.Contains(msg, "please sign in") ||
+		strings.Contains(msg, "authentication") ||
 		strings.Contains(msg, "failed to retrieve token") ||
-		strings.Contains(msg, "unauthenticated")
-	if !isMissingOrKeyring {
+		strings.Contains(msg, "unauthenticated") ||
+		strings.Contains(msg, "agent platform api") ||
+		strings.Contains(msg, "aiplatform.googleapis.com") ||
+		strings.Contains(msg, "invalid model selection") ||
+		strings.Contains(msg, "not recognized as a known model") ||
+		strings.Contains(msg, "plan model not specified")
+	if !isHeadlessOrAuthFallback {
 		return false
 	}
 	_, ok := loadFirstValidAccountFromDir(spec.AuthDir, spec.ProxyURL)
@@ -914,7 +930,7 @@ func chatStreamViaBridgeV1Internal(
 
 	baseForStream := upstreamBase
 	if baseForStream == "" {
-		baseForStream = AntigravityProdBaseURL
+		baseForStream = AntigravityDailyBaseURL
 	}
 	targetURL := baseForStream + "/v1internal:streamGenerateContent?alt=sse"
 	resp, err := netx.DoWithEOFRetry(ctx, httpCli, func() (*http.Request, error) {
@@ -956,17 +972,7 @@ func fetchBridgeQuotaAndModels(
 	cachedProjID *string,
 ) (*AccountQuotaStatus, error) {
 	cliBin, cliBinErr := ResolveAgyCLIBinary(spec.CLIBinary)
-	var cliModels []ModelItem
-	if cliBinErr == nil {
-		mCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		cliModels, _ = ListModelsViaCLI(mCtx, spec)
-		cancel()
-	}
-
 	conv, hasCred := loadFirstValidAccountFromDir(spec.AuthDir, spec.ProxyURL)
-	if !hasCred && len(cliModels) == 0 {
-		return nil, errors.New("容器隔离目录尚未写入有效 OAuth 凭证")
-	}
 
 	var status *AccountQuotaStatus
 	var quotaErr error
@@ -1027,6 +1033,17 @@ func fetchBridgeQuotaAndModels(
 		}
 	}
 
+	var cliModels []ModelItem
+	isEnterpriseGCP := status != nil && status.ProjectID != "" && !strings.EqualFold(status.ProjectID, DefaultAGYProjectID)
+	if cliBinErr == nil && (status == nil || len(status.Models) == 0 || isEnterpriseGCP) {
+		mCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		cliModels, _ = ListModelsViaCLI(mCtx, spec)
+		cancel()
+	}
+	if !hasCred && len(cliModels) == 0 {
+		return nil, errors.New("容器隔离目录尚未写入有效 OAuth 凭证")
+	}
+
 	if status == nil {
 		if len(cliModels) == 0 && quotaErr != nil {
 			return nil, quotaErr
@@ -1043,14 +1060,14 @@ func fetchBridgeQuotaAndModels(
 	}
 
 	status.CLIBinary = cliBin
-	status.CLIReady = cliBinErr == nil && len(cliModels) > 0
-	if status.CLIReady {
+	status.CLIReady = cliBinErr == nil
+	if status.CLIReady && isEnterpriseGCP {
 		status.Driver = "real-agy-cli"
 	} else {
-		status.Driver = "container-http2-v1internal"
+		status.Driver = "agy-container-v1internal"
 	}
 
-	// 将真实 `agy models` 输出的模型列表与 v1internal 返回的各模型配额融合，确保两边支持的最新模型一个不漏
+	// 仅在真实企业 GCP 项目或 v1internal 未返回目录时合并 CLI 列表，确保 Free/Pro 个人账号只展示该套餐 100% 真实可调用模型
 	if len(cliModels) > 0 {
 		byID := make(map[string]int, len(status.Models))
 		for i, m := range status.Models {
