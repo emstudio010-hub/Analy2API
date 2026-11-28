@@ -2272,8 +2272,10 @@ func (s *AntigravityService) upsertConvertedAccountToPool(
 		return nil, false, err
 	}
 
+	// 注意：Google OAuth 的 conv.ExpiresAt 是 1 小时短效 access_token 刷新时间（已保存在 creds.auth_bundle 内），
+	// 只要持有长期有效的 RefreshToken，绝不能将其写入 Account.ExpiresAt 硬过期字段，否则 1 小时后调度器会误判账号过期。
 	var expPtr *time.Time
-	if conv.ExpiresAt != "" {
+	if strings.TrimSpace(conv.RefreshToken) == "" && conv.ExpiresAt != "" {
 		if parsed, pErr := time.Parse(time.RFC3339, conv.ExpiresAt); pErr == nil {
 			expPtr = &parsed
 		}
@@ -2307,7 +2309,9 @@ func (s *AntigravityService) upsertConvertedAccountToPool(
 		if conv.RawProxy != "" {
 			upd = upd.SetProxyURL(conv.RawProxy)
 		}
-		if expPtr != nil {
+		if strings.TrimSpace(conv.RefreshToken) != "" {
+			upd = upd.ClearExpiresAt()
+		} else if expPtr != nil {
 			upd = upd.SetExpiresAt(*expPtr)
 		}
 		saved, err = upd.Save(ctx)
@@ -2530,7 +2534,9 @@ func (s *AntigravityService) enrichSyncedAccountBundle(
 		extra["project_id"] = conv.ProjectID
 	}
 	upd := acc.Update().SetCredentials(creds).SetExtra(extra)
-	if conv.ExpiresAt != "" {
+	if strings.TrimSpace(conv.RefreshToken) != "" {
+		upd = upd.ClearExpiresAt()
+	} else if conv.ExpiresAt != "" {
 		if parsed, pErr := time.Parse(time.RFC3339, conv.ExpiresAt); pErr == nil {
 			upd = upd.SetExpiresAt(parsed)
 		}
@@ -3059,6 +3065,22 @@ func (s *AntigravityService) TestAccountChat(ctx context.Context, in TestAntigra
 func (s *AntigravityService) UpgradeManagedContainersOnStartup(ctx context.Context) {
 	if s == nil || s.db == nil {
 		return
+	}
+	// 自动修复历史版本将 OAuth 1 小时短效 access_token TTL 误写入 Account.ExpiresAt 导致 1 小时后调度器跳过账号的问题
+	if staleAccs, qErr := s.db.Account.Query().
+		Where(
+			account.DeletedAtIsNil(),
+			account.ExpiresAtNotNil(),
+			account.PlatformEQ(domain.PlatformAntigravity),
+		).
+		All(ctx); qErr == nil {
+		for _, a := range staleAccs {
+			hasRT := s.decryptAccountCredField(a.Credentials, "refresh_token_encrypted", "refresh_token") != ""
+			hasNode := extractExtraInt64(a.Extra, "node_id") > 0
+			if hasRT || hasNode {
+				_, _ = s.db.Account.UpdateOneID(a.ID).ClearExpiresAt().Save(ctx)
+			}
+		}
 	}
 	env := s.DetectEnv(ctx)
 	if !env.DockerAvailable {

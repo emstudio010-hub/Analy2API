@@ -347,8 +347,15 @@ func (s *AccountService) pushSingleAccount(
 	}
 
 	var expiresAt *time.Time
-	if expStr := firstNonEmptyPush(item.ExpiresAt, mapStringField(authMap, "expires_at", "expiry")); expStr != "" {
-		if parsed, err := time.Parse(time.RFC3339, expStr); err == nil {
+	if strings.TrimSpace(refreshToken) == "" {
+		if expStr := firstNonEmptyPush(item.ExpiresAt, mapStringField(authMap, "expires_at", "expiry")); expStr != "" {
+			if parsed, err := time.Parse(time.RFC3339, expStr); err == nil {
+				expiresAt = &parsed
+			}
+		}
+	} else if expStr := strings.TrimSpace(item.ExpiresAt); expStr != "" {
+		// 若账号含长期 refresh_token，仅在推送方显式指定顶层 item.ExpiresAt（且非短效 2h 内 token TTL）时记录硬过期
+		if parsed, err := time.Parse(time.RFC3339, expStr); err == nil && parsed.After(time.Now().Add(24*time.Hour)) {
 			expiresAt = &parsed
 		}
 	}

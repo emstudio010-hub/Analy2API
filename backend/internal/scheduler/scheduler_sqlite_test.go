@@ -2,9 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"cmd2api/internal/config"
 	"cmd2api/internal/db"
@@ -127,5 +129,28 @@ func TestMultiPlatformSchedulerAcquireAndTargets(t *testing.T) {
 	defer ocLease.Release()
 	if ocLease.Account.ID != ocAcc.ID || ocLease.ProxyURL != "http://10.20.0.2:8080" || ocLease.BaseURL != domain.OpenCodeBaseURLGo {
 		t.Fatalf("unexpected opencode lease: %+v", ocLease)
+	}
+
+	// 3. 回归验证：OAuth 账号即使历史遗留了已过期的短效 access_token expires_at，只要持有 refresh_token 或容器节点仍可正常调度；
+	//    而无 refresh_token 的普通硬过期 Key 仍会被正确拦截。
+	past := time.Now().Add(-2 * time.Hour)
+	_, err = client.Account.UpdateOneID(agyAcc.ID).SetExpiresAt(past).Save(ctx)
+	if err != nil {
+		t.Fatalf("set past expires_at on agyAcc: %v", err)
+	}
+	sched.Invalidate()
+	agyLeaseAfterTTL, err := sched.Acquire(ctx, agyGrp.ID)
+	if err != nil {
+		t.Fatalf("expected OAuth/container agy account with past access_token expiry to remain schedulable, got: %v", err)
+	}
+	agyLeaseAfterTTL.Release()
+
+	_, err = client.Account.UpdateOneID(ccAcc.ID).SetExpiresAt(past).Save(ctx)
+	if err != nil {
+		t.Fatalf("set past expires_at on ccAcc: %v", err)
+	}
+	sched.Invalidate()
+	if _, err := sched.Acquire(ctx, ccGrp.ID); !errors.Is(err, ErrNoAccountAvailable) {
+		t.Fatalf("expected hard-expired static key account to fail with ErrNoAccountAvailable, got: %v", err)
 	}
 }

@@ -342,11 +342,6 @@ func (s *Scheduler) Acquire(ctx context.Context, groupID int64, excludeIDs ...in
 				account.OverloadUntilIsNil(),
 				account.OverloadUntilLT(now),
 			),
-			// 已过期的跳过。
-			account.Or(
-				account.ExpiresAtIsNil(),
-				account.ExpiresAtGT(now),
-			),
 		)
 
 	if len(excludeIDs) > 0 {
@@ -370,6 +365,7 @@ func (s *Scheduler) Acquire(ctx context.Context, groupID int64, excludeIDs ...in
 	}
 
 	var lastErr error
+	var eligibleCount int
 	preferred, exhausted := splitByWindow(accounts, now)
 	s.sortByPriorityAndMemLastUsed(preferred)
 	s.sortByPriorityAndMemLastUsed(exhausted)
@@ -381,17 +377,23 @@ func (s *Scheduler) Acquire(ctx context.Context, groupID int64, excludeIDs ...in
 
 	for _, bucket := range [][]*ent.Account{preferred, exhausted} {
 		for _, acc := range bucket {
-			if !s.limiter.tryAcquire(acc.ID, acc.Concurrency) {
-				continue
-			}
-
 			creds, err := s.credentials(acc)
 			if err != nil {
-				s.limiter.release(acc.ID)
 				lastErr = fmt.Errorf("账号 %d(%s) 的凭证无法解密: %w", acc.ID, acc.Name, err)
 				if s.logger != nil {
 					s.logger.Error("凭证解密失败", "account_id", acc.ID, "account_name", acc.Name, "err", err)
 				}
+				continue
+			}
+
+			// 仅当账号既没有可自动续期的 OAuth refresh_token、也未绑定本地容器节点时，才把 expires_at 视为硬过期时间拦截；
+			// 避免把 OAuth 短效 1 小时 access_token 缓存过期时间误判为账号永久失效导致「分组内没有可用账号」。
+			if acc.ExpiresAt != nil && !acc.ExpiresAt.After(now) && strings.TrimSpace(creds.RefreshToken) == "" && creds.NodeID <= 0 {
+				continue
+			}
+			eligibleCount++
+
+			if !s.limiter.tryAcquire(acc.ID, acc.Concurrency) {
 				continue
 			}
 
@@ -433,8 +435,11 @@ func (s *Scheduler) Acquire(ctx context.Context, groupID int64, excludeIDs ...in
 	if lastErr != nil {
 		return nil, lastErr
 	}
+	if eligibleCount == 0 {
+		return nil, ErrNoAccountAvailable
+	}
 	return nil, fmt.Errorf("%w（%s 平台的 %d 个候选账号并发均已达上限）",
-		ErrNoAccountAvailable, platform, len(accounts))
+		ErrNoAccountAvailable, platform, eligibleCount)
 }
 
 func resolveEffectiveAccountPlatform(rawAccPlatform, groupPlatform string) string {
