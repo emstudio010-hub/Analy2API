@@ -1235,12 +1235,23 @@ async function copyErrorDetail(text: string): Promise<void> {
                   <div class="flex flex-wrap items-center justify-between gap-1.5">
                     <div class="flex flex-wrap items-center gap-1.5">
                       <Badge
-                        :tone="row.account.balance?.fetched_at ? quotaTone(resolveAccount5h(row.account)?.pct ?? row.account.balance.remaining) : 'neutral'"
+                        :tone="
+                          (row.account.balance?.plan_id || '').includes('pro') ||
+                          (row.account.balance?.plan_id || '').includes('ultra')
+                            ? 'accent'
+                            : row.account.balance?.fetched_at
+                              ? quotaTone(resolveAccount5h(row.account)?.pct ?? row.account.balance.remaining)
+                              : 'neutral'
+                        "
                         dot
                       >
                         {{
-                          row.account.balance?.plan_id ||
                           row.account.balance?.plan_name ||
+                          (row.account.balance?.plan_id === 'g1-pro-tier'
+                            ? 'Google AI Pro'
+                            : row.account.balance?.plan_id === 'g1-ultra-tier'
+                              ? 'Google AI Ultra'
+                              : row.account.balance?.plan_id) ||
                           (row.account.balance?.fetched_at ? 'Google AI' : '待查额度')
                         }}
                       </Badge>
@@ -1648,7 +1659,7 @@ async function copyErrorDetail(text: string): Promise<void> {
                 v-else
                 class="rounded border border-dashed border-line/70 bg-surface/60 px-2.5 py-1.5 text-2xs text-subtle"
               >
-                周额度：当前套餐下该模型组仅受 5 小时滚动限额约束（无独立周卡点）
+                周额度充足（Google 仅返回更接近上限的窗口；当前周剩余比例高于上方 5h 窗口）
               </div>
             </div>
           </div>

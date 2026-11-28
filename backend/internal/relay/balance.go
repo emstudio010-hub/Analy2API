@@ -40,7 +40,7 @@ var commandCodePlanCredits = map[string]float64{
 	"teams-pro":           40,
 }
 
-// commandCodePlanNames 是套餐标识对应的展示名。
+// commandCodePlanNames 是套餐标识对应的展示名（含 Command Code 与 Google AntiGravity 订阅层级）。
 var commandCodePlanNames = map[string]string{
 	"individual-go":       "Go",
 	"individual-goat":     "GOAT",
@@ -50,6 +50,10 @@ var commandCodePlanNames = map[string]string{
 	"individual-max":      "Max",
 	"individual-ultra":    "Ultra",
 	"teams-pro":           "Teams Pro",
+	"g1-pro-tier":         "Google AI Pro",
+	"g1-ultra-tier":       "Google AI Ultra",
+	"standard-tier":       "Enterprise Standard",
+	"free-tier":           "Free",
 }
 
 // PlanCredits 返回套餐的月度总额。第二个返回值为 false 表示这个套餐不认识。

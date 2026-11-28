@@ -36,7 +36,7 @@ import (
 var (
 	// AppName、Version、GitCommit 与 BuildTime 支持在发行编译阶段通过 -ldflags 注入。
 	AppName   = "Analy2API"
-	Version   = "1.2.6"
+	Version   = "1.2.7"
 	GitCommit = "dev"
 	BuildTime = ""
 )

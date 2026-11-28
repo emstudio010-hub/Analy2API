@@ -197,7 +197,8 @@ func TestFetchAntigravityQuota5hAndWeeklySummary(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1internal:loadCodeAssist":
-			_, _ = w.Write([]byte(`{"cloudaicompanionProject":"aicode-consumers","currentTier":{"id":"g1-pro-tier","name":"Google AI Pro"}}`))
+			// 模拟真实 Google One AI Pro 响应：currentTier 为 free-tier，真实会员等级位于 paidTier
+			_, _ = w.Write([]byte(`{"cloudaicompanionProject":"aicode-consumers","currentTier":{"id":"free-tier","name":"Antigravity"},"paidTier":{"id":"g1-pro-tier","name":"Google AI Pro"}}`))
 		case "/v1internal:retrieveUserQuotaSummary":
 			_, _ = w.Write([]byte(`{
 				"groups":[
@@ -227,6 +228,9 @@ func TestFetchAntigravityQuota5hAndWeeklySummary(t *testing.T) {
 	status, err := FetchAntigravityQuotaAndModels(context.Background(), srv.Client(), srv.URL, "ya29.test", "", "")
 	if err != nil {
 		t.Fatalf("FetchAntigravityQuotaAndModels error: %v", err)
+	}
+	if status.TierID != "g1-pro-tier" || status.TierName != "Google AI Pro" {
+		t.Fatalf("expected paidTier Google AI Pro (g1-pro-tier) to override free-tier, got tier_id=%q tier_name=%q", status.TierID, status.TierName)
 	}
 	if status.FiveHour == nil || status.FiveHour.RemainingPct == nil || *status.FiveHour.RemainingPct != 96.4 || status.FiveHour.ResetTime != "2026-11-28T10:06:35Z" {
 		t.Fatalf("unexpected FiveHour summary: %+v", status.FiveHour)

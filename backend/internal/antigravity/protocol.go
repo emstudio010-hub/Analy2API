@@ -33,6 +33,7 @@ const (
 	OfficialOAuthClientID           = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
 	OfficialOAuthDefaultRedirectURI = "http://localhost:51121/oauth-callback"
 	OfficialOAuthScopes             = "https://www.googleapis.com/auth/cloud-platform " +
+		"https://www.googleapis.com/auth/aicode " +
 		"https://www.googleapis.com/auth/userinfo.email " +
 		"https://www.googleapis.com/auth/userinfo.profile " +
 		"https://www.googleapis.com/auth/cclog " +
@@ -1128,10 +1129,12 @@ func LoadCodeAssist(ctx context.Context, httpClient *http.Client, baseURL, acces
 	}
 
 	body, _ := json.Marshal(map[string]any{
+		"mode": "FULL_ELIGIBILITY_CHECK",
 		"metadata": map[string]any{
 			"ideType":    "ANTIGRAVITY",
 			"ideVersion": EffectiveCLIVersion(),
 			"ideName":    "Antigravity",
+			"pluginType": "GEMINI",
 		},
 	})
 	resp, err := netx.DoWithEOFRetry(ctx, httpClient, func() (*http.Request, error) {
@@ -1160,6 +1163,10 @@ func LoadCodeAssist(ctx context.Context, httpClient *http.Client, baseURL, acces
 			ID   string `json:"id"`
 			Name string `json:"name"`
 		} `json:"currentTier"`
+		PaidTier *struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"paidTier"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, err
@@ -1167,9 +1174,25 @@ func LoadCodeAssist(ctx context.Context, httpClient *http.Client, baseURL, acces
 	res := &CodeAssistProjectResult{
 		ProjectID: strings.TrimSpace(parsed.CloudAICompanionProject),
 	}
-	if parsed.CurrentTier != nil {
+	// Google One AI Pro / Ultra 个人付费订阅在 loadCodeAssist 中固定通过 paidTier 返回（此时 currentTier 仍为 GCP 侧的 "free-tier"）；
+	// 必须优先读取 paidTier 才能准确识别 Google AI Pro ("g1-pro-tier") 与 Google AI Ultra ("g1-ultra-tier")。
+	if parsed.PaidTier != nil && strings.TrimSpace(parsed.PaidTier.ID) != "" {
+		res.TierID = strings.TrimSpace(parsed.PaidTier.ID)
+		res.TierName = strings.TrimSpace(parsed.PaidTier.Name)
+		if res.TierName == "" {
+			switch strings.ToLower(res.TierID) {
+			case "g1-pro-tier":
+				res.TierName = "Google AI Pro"
+			case "g1-ultra-tier":
+				res.TierName = "Google AI Ultra"
+			}
+		}
+	} else if parsed.CurrentTier != nil {
 		res.TierID = strings.TrimSpace(parsed.CurrentTier.ID)
 		res.TierName = strings.TrimSpace(parsed.CurrentTier.Name)
+		if strings.EqualFold(res.TierID, "free-tier") && (res.TierName == "" || strings.EqualFold(res.TierName, "Antigravity")) {
+			res.TierName = "Free"
+		}
 	}
 	return res, nil
 }
