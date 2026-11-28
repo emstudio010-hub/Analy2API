@@ -2042,6 +2042,7 @@ export interface AntigravityQuotaWindowBucket {
   remaining_pct?: number | null
   reset_time?: string
   exhausted?: boolean
+  disabled?: boolean
   description?: string
 }
 

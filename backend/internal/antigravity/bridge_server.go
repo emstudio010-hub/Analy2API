@@ -816,8 +816,12 @@ func loadFirstValidAccountFromDir(authDir, proxyURL string) (ConvertedAGYAccount
 	return ConvertedAGYAccount{}, false
 }
 
-// chatStreamViaBridgeV1Internal 在单账号独立容器内直接通过 HTTP/2 + 独立代理出口驱动 Google Cloud Code Assist v1internal 流式接口：
-// 当容器内未安装桌面版 agy CLI 或无 Linux GNOME Keyring 时无缝接管，100% 保持「1 账号 = 1 容器 = 1 独立 IP = 1 指纹」与提示词拦截接续管线。
+var bridgeTierByAuthDir sync.Map // map[string]string: authDir -> tierID (e.g. "g1-ultra-tier" / "g1-pro-tier")
+
+// chatStreamViaBridgeV1Internal 在单账号独立容器内直接通过 HTTP/2 + 独立代理出口驱动 Google AI Code (`aicode.googleapis.com/v1alpha`)
+// 与 Cloud Code Assist (`v1internal`) 流式接口：
+//   - 对 Claude 5.5、Gemini 4 新模型及 Gemini 3.8 系列优先走 `aicode.googleapis.com/v1alpha:streamGenerateContent?alt=sse`；
+//   - 若旧账号 OAuth 令牌尚未包含 `aicode` scope（返回 403）或共享模型回退，自动无缝降级至 `v1internal:streamGenerateContent?alt=sse`。
 func chatStreamViaBridgeV1Internal(
 	ctx context.Context,
 	spec NodeSpec,
@@ -902,11 +906,23 @@ func chatStreamViaBridgeV1Internal(
 		return nil, errors.New("容器内凭证缺少可用 access_token 且无法刷新")
 	}
 
-	if projID == "" {
+	var cachedTier string
+	if v, ok := bridgeTierByAuthDir.Load(strings.TrimSpace(spec.AuthDir)); ok {
+		cachedTier, _ = v.(string)
+	}
+	if projID == "" || cachedTier == "" {
 		caCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		if ca, caErr := LoadCodeAssist(caCtx, httpCli, upstreamBase, accessTok, ua); caErr == nil && ca != nil && ca.ProjectID != "" {
-			projID = ca.ProjectID
-			*cachedProjID = projID
+		if ca, caErr := LoadCodeAssist(caCtx, httpCli, upstreamBase, accessTok, ua); caErr == nil && ca != nil {
+			if ca.ProjectID != "" && projID == "" {
+				projID = ca.ProjectID
+				*cachedProjID = projID
+			}
+			if ca.TierID != "" {
+				cachedTier = ca.TierID
+				if strings.TrimSpace(spec.AuthDir) != "" {
+					bridgeTierByAuthDir.Store(strings.TrimSpace(spec.AuthDir), cachedTier)
+				}
+			}
 		} else if caErr != nil && logger != nil {
 			logger.Warn("容器内自动获取 CodeAssist project_id 告警", "err", caErr)
 		}
@@ -922,6 +938,28 @@ func chatStreamViaBridgeV1Internal(
 		Model string `json:"model"`
 	}
 	_ = json.Unmarshal(sanitizedBody, &modelProbe)
+
+	// 新一代 AI Code 引擎优先路由（当未自定义非 Google 测试桩 AGY_UPSTREAM_BASE_URL 时启用）
+	canUseAICode := (upstreamBase == "" || strings.Contains(strings.ToLower(upstreamBase), "googleapis.com") || os.Getenv(AntigravityAICodeBaseURLEnv) != "")
+	if canUseAICode && ShouldPreferAICodeForModel(modelProbe.Model) {
+		aicodeResp, _, aicodeErr := StreamAICodeGenerateContent(
+			ctx, httpCli, "", accessTok, cachedTier, ua, sanitizedBody, modelProbe.Model, sessionID,
+		)
+		if aicodeErr == nil && aicodeResp != nil {
+			aicodeResp.Header.Set("X-Agy-Prompt-Mode", ResolvePromptBlendMode(spec))
+			return aicodeResp, nil
+		}
+		if IsAICodeExclusiveModel(modelProbe.Model) {
+			var apiErr *APIError
+			if errors.As(aicodeErr, &apiErr) && apiErr.Status == http.StatusForbidden {
+				return nil, fmt.Errorf("调用新模型 %q 需要 Google AI Code (aicode) 授权权限：请重新使用最新 OAuth 链接授权该账号后再试（原始响应：%s）", modelProbe.Model, apiErr.Message)
+			}
+			return nil, aicodeErr
+		}
+		if logger != nil {
+			logger.Info("aicode 流式接口回退至 v1internal", "model", modelProbe.Model, "err", aicodeErr)
+		}
+	}
 
 	v1Body, err := BuildV1InternalRequest(sanitizedBody, projID, modelProbe.Model, sessionID)
 	if err != nil {
@@ -1022,13 +1060,18 @@ func fetchBridgeQuotaAndModels(
 		if accessTok != "" {
 			upstreamBase := strings.TrimRight(strings.TrimSpace(os.Getenv("AGY_UPSTREAM_BASE_URL")), "/")
 			ua := BuildCLIUserAgent("", spec.Fingerprint.OS, spec.Fingerprint.Arch)
-			qCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			qCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 			status, quotaErr = FetchAntigravityQuotaAndModels(qCtx, httpCli, upstreamBase, accessTok, projID, ua)
 			cancel()
-			if status != nil && status.ProjectID != "" {
-				credMu.Lock()
-				*cachedProjID = status.ProjectID
-				credMu.Unlock()
+			if status != nil {
+				if status.ProjectID != "" {
+					credMu.Lock()
+					*cachedProjID = status.ProjectID
+					credMu.Unlock()
+				}
+				if status.TierID != "" && strings.TrimSpace(spec.AuthDir) != "" {
+					bridgeTierByAuthDir.Store(strings.TrimSpace(spec.AuthDir), status.TierID)
+				}
 			}
 		}
 	}
@@ -1061,9 +1104,19 @@ func fetchBridgeQuotaAndModels(
 
 	status.CLIBinary = cliBin
 	status.CLIReady = cliBinErr == nil
-	if status.CLIReady && isEnterpriseGCP {
+	hasAICodeModels := false
+	for _, m := range status.Models {
+		if m.Source == "aicode" || strings.HasPrefix(strings.ToLower(m.ID), "claude-opus-5") || strings.HasPrefix(strings.ToLower(m.ID), "claude-sonnet-5") {
+			hasAICodeModels = true
+			break
+		}
+	}
+	switch {
+	case status.CLIReady && isEnterpriseGCP:
 		status.Driver = "real-agy-cli"
-	} else {
+	case hasAICodeModels:
+		status.Driver = "agy-container-aicode"
+	default:
 		status.Driver = "agy-container-v1internal"
 	}
 

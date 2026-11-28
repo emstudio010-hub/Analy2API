@@ -2,7 +2,7 @@
 # 每个容器仅挂载单个账号凭证目录与独立出口代理，以 `analy2api agy-bridge` 对外提供标准 /v1 接口。
 FROM debian:bookworm-slim
 
-LABEL io.analy2api.image.rev="v1.2.7-agy-cli"
+LABEL io.analy2api.image.rev="v1.2.8-agy-cli"
 
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""

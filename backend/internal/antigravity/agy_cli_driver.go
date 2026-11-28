@@ -87,7 +87,7 @@ func buildIsolatedCLIEnv(spec NodeSpec) []string {
 			continue
 		}
 		k := strings.ToUpper(kv[:eq])
-		if authDir != "" && (k == "HOME" || k == "USERPROFILE" || k == "XDG_CONFIG_HOME") {
+		if authDir != "" && (k == "HOME" || k == "USERPROFILE" || k == "XDG_CONFIG_HOME" || k == "AGY_ADC_AUTH" || k == "GOOGLE_APPLICATION_CREDENTIALS" || k == "ANTIGRAVITY_PROJECT_ID" || k == "GOOGLE_CLOUD_PROJECT") {
 			continue
 		}
 		if (proxy != "" || clearProxy) && (k == "HTTP_PROXY" || k == "HTTPS_PROXY" || k == "ALL_PROXY") {
@@ -860,6 +860,10 @@ func streamAgyNDJSONToOpenAISSEAttempt(
 			"prompt_tokens_details": map[string]any{
 				"cached_tokens": u.CacheReadTokens,
 			},
+			"completion_tokens_details": map[string]any{
+				"reasoning_tokens": u.ThinkingTokens,
+			},
+			"cached_tokens": u.CacheReadTokens,
 		}
 	}
 

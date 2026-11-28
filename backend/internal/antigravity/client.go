@@ -1018,6 +1018,12 @@ func DefaultModels() []ModelItem {
 		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
 		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
 		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-opus-5-5-high", Name: "Claude Opus 5.5 (High)", Vendor: "anthropic", ContextWindow: 1000000, MaxOutputTokens: 128000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-opus-5-5-medium", Name: "Claude Opus 5.5 (Medium)", Vendor: "anthropic", ContextWindow: 1000000, MaxOutputTokens: 128000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-opus-5-5-low", Name: "Claude Opus 5.5 (Low)", Vendor: "anthropic", ContextWindow: 1000000, MaxOutputTokens: 128000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-sonnet-5-5-high", Name: "Claude Sonnet 5.5 (High)", Vendor: "anthropic", ContextWindow: 1000000, MaxOutputTokens: 128000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-sonnet-5-5-medium", Name: "Claude Sonnet 5.5 (Medium)", Vendor: "anthropic", ContextWindow: 1000000, MaxOutputTokens: 128000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-sonnet-5-5-low", Name: "Claude Sonnet 5.5 (Low)", Vendor: "anthropic", ContextWindow: 1000000, MaxOutputTokens: 128000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
 		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6 (Thinking)", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
 		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 (Thinking)", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
 		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)", Vendor: "openai", ContextWindow: 131072, MaxOutputTokens: 32768, SupportsImages: false, SupportsReasoning: true, SupportsToolCall: true},
@@ -1164,6 +1170,9 @@ func defaultModelLimits(lowerID, vendor string) (ctxWin int, maxOut int) {
 		}
 		return 1048576, 32768
 	case "anthropic":
+		if strings.Contains(lowerID, "-5") {
+			return 1000000, 128000
+		}
 		if strings.Contains(lowerID, "-4") || strings.Contains(lowerID, "3-7") || strings.Contains(lowerID, "3.7") {
 			return 200000, 64000
 		}
@@ -1219,7 +1228,7 @@ func inferSupportsReasoning(lowerID, vendor string, m map[string]any) bool {
 	case "google":
 		return strings.HasPrefix(lowerID, "gemini-2.5") || strings.HasPrefix(lowerID, "gemini-3") || strings.HasPrefix(lowerID, "gemini-4") || strings.Contains(lowerID, "orchestrator")
 	case "anthropic":
-		return strings.Contains(lowerID, "-4") || strings.Contains(lowerID, "3-7") || strings.Contains(lowerID, "3.7")
+		return strings.Contains(lowerID, "-5") || strings.Contains(lowerID, "-4") || strings.Contains(lowerID, "3-7") || strings.Contains(lowerID, "3.7")
 	case "openai":
 		return strings.HasPrefix(lowerID, "gpt-oss") || strings.HasPrefix(lowerID, "gpt-5") || strings.Contains(lowerID, "codex") ||
 			strings.HasPrefix(lowerID, "o1") || strings.HasPrefix(lowerID, "o3") || strings.HasPrefix(lowerID, "o4")

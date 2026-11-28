@@ -235,11 +235,15 @@ func TestFetchAntigravityQuota5hAndWeeklySummary(t *testing.T) {
 	if status.FiveHour == nil || status.FiveHour.RemainingPct == nil || *status.FiveHour.RemainingPct != 96.4 || status.FiveHour.ResetTime != "2026-11-28T10:06:35Z" {
 		t.Fatalf("unexpected FiveHour summary: %+v", status.FiveHour)
 	}
-	if status.Weekly == nil || status.Weekly.RemainingPct == nil || *status.Weekly.RemainingPct != 98.9 || status.Weekly.ResetTime != "2026-12-05T05:06:39Z" {
-		t.Fatalf("unexpected Weekly summary: %+v", status.Weekly)
+	// 默认主额度严格只展示 Gemini 模型组额度，不混入 Claude/GPT (3p-weekly) 窗口；3p-weekly 保留在 QuotaGroups[1] 中
+	if status.Weekly != nil {
+		t.Fatalf("expected account default Weekly not to be polluted by 3p-weekly when Gemini has no weekly cap, got %+v", status.Weekly)
 	}
 	if len(status.QuotaGroups) != 2 {
 		t.Fatalf("expected 2 quota groups (synthesized Gemini + explicit Claude/GPT), got %d", len(status.QuotaGroups))
+	}
+	if status.QuotaGroups[1].Weekly == nil || status.QuotaGroups[1].Weekly.RemainingPct == nil || *status.QuotaGroups[1].Weekly.RemainingPct != 98.9 {
+		t.Fatalf("unexpected Claude/GPT group Weekly summary: %+v", status.QuotaGroups[1].Weekly)
 	}
 }
 
@@ -338,5 +342,187 @@ func TestGoogleDesktopOAuthRedirectAndBridgeHeadlessFallback(t *testing.T) {
 	}
 	if !strings.Contains(string(bodyBytes), "headless container ok") || !strings.Contains(string(bodyBytes), "[DONE]") {
 		t.Fatalf("unexpected bridge SSE output: %s", string(bodyBytes))
+	}
+}
+
+func TestAICodeCatalogDefaultGeminiQuotaAndStream(t *testing.T) {
+	aicodeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1alpha:fetchLicenses":
+			_, _ = w.Write([]byte(`{"licenses":[{"userTier":"g1-ultra-tier","tierDisplayName":"Google AI Ultra"}]}`))
+		case "/v1alpha:fetchQuotaStatus":
+			// 模拟真实 Ultra 账号场景：Gemini 组 100% 正常，而 3P (Claude/GPT) 组周额度耗尽 (proto3 省略 remainingFraction:0) 且 5h 被标记 disabled:true
+			_, _ = w.Write([]byte(`{
+				"buckets": [
+					{"remainingFraction": 1, "resetTime": "2026-11-28T13:00:00Z", "model": {"modelId": "gemini-3.8-flash", "displayName": "Gemini 3.8 Flash"}},
+					{"remainingFraction": 1, "resetTime": "2026-11-28T13:00:00Z", "model": {"modelId": "claude-sonnet-5-5", "displayName": "Claude Sonnet 5.5"}}
+				],
+				"quotaSummary": {
+					"groups": [
+						{
+							"displayName": "Claude and GPT models",
+							"buckets": [
+								{"bucketId": "3p-weekly", "refreshWindowLabel": "weekly", "resetTime": "2026-12-04T14:53:56Z"},
+								{"bucketId": "3p-5h", "refreshWindowLabel": "5h", "remainingFraction": 1, "disabled": true}
+							]
+						},
+						{
+							"displayName": "Gemini Models",
+							"buckets": [
+								{"bucketId": "gemini-weekly", "refreshWindowLabel": "weekly", "remainingFraction": 1, "resetTime": "2026-12-05T07:53:42Z"},
+								{"bucketId": "gemini-5h", "refreshWindowLabel": "5h", "remainingFraction": 1, "resetTime": "2026-11-28T13:00:00Z"}
+							]
+						}
+					]
+				}
+			}`))
+		case "/v1alpha:fetchConfig":
+			_, _ = w.Write([]byte(`{
+				"availableExperiences": [
+					{
+						"name": "claude-opus-5-5-high",
+						"model": {
+							"modelId": "claude-opus-5-5",
+							"displayName": "Claude Opus 5.5 (High)",
+							"inputTokenLimit": 1000000,
+							"outputTokenLimit": 128000,
+							"supportedFeatures": ["FUNCTION_CALLING", "IMAGE_INPUT", "THINKING", "THINKING_LEVEL"],
+							"modelProvider": "ANTHROPIC"
+						}
+					},
+					{
+						"name": "claude-sonnet-5-5-medium",
+						"model": {
+							"modelId": "claude-sonnet-5-5",
+							"displayName": "Claude Sonnet 5.5 (Medium)",
+							"inputTokenLimit": 1000000,
+							"outputTokenLimit": 128000,
+							"supportedFeatures": ["FUNCTION_CALLING", "IMAGE_INPUT", "THINKING", "THINKING_LEVEL"],
+							"modelProvider": "ANTHROPIC"
+						}
+					},
+					{
+						"name": "gemini-4-neon-high",
+						"model": {
+							"modelId": "gemini-4-neon",
+							"displayName": "Gemini 4 Neon (High)",
+							"inputTokenLimit": 1048576,
+							"outputTokenLimit": 65536,
+							"supportedFeatures": ["FUNCTION_CALLING", "IMAGE_INPUT", "THINKING", "THINKING_LEVEL"],
+							"modelProvider": "GOOGLE"
+						}
+					},
+					{
+						"name": "gemini-3.8-flash-low",
+						"model": {
+							"modelId": "gemini-3.8-flash",
+							"displayName": "Gemini 3.8 Flash (Low)",
+							"inputTokenLimit": 1048576,
+							"outputTokenLimit": 65536,
+							"supportedFeatures": ["FUNCTION_CALLING", "IMAGE_INPUT", "THINKING"],
+							"modelProvider": "GOOGLE"
+						}
+					}
+				]
+			}`))
+		case "/v1alpha:streamGenerateContent":
+			rawReq, _ := io.ReadAll(r.Body)
+			var reqMap map[string]any
+			_ = json.Unmarshal(rawReq, &reqMap)
+			ac, _ := reqMap["aicode"].(map[string]any)
+			ent, _ := reqMap["entitlement"].(map[string]any)
+			if ac["experience"] != "claude-sonnet-5-5-high" || ent["userTier"] != "g1-ultra-tier" {
+				http.Error(w, "unexpected experience or entitlement", http.StatusBadRequest)
+				return
+			}
+			tc, _ := reqMap["toolConfig"].(map[string]any)
+			fcc, _ := tc["functionCallingConfig"].(map[string]any)
+			if fcc["mode"] != "AUTO" {
+				http.Error(w, "expected mode=AUTO on aicode", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+			_, _ = w.Write([]byte("data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":\"ultra aicode ok\"}]}}]}\n\ndata: {\"candidates\":[{\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":20,\"candidatesTokenCount\":5,\"totalTokenCount\":25}}\n\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer aicodeSrv.Close()
+
+	ccpaSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1internal:loadCodeAssist":
+			_, _ = w.Write([]byte(`{"cloudaicompanionProject":"aicode-consumers","currentTier":{"id":"free-tier"},"paidTier":{"id":"g1-ultra-tier","name":"Google AI Ultra"}}`))
+		case "/v1internal:fetchAvailableModels":
+			_, _ = w.Write([]byte(`{
+				"models": {
+					"gemini-3.8-flash-tiered": {"quotaInfo": {"remainingFraction": 0.889, "resetTime": "2026-11-28T13:00:00Z"}},
+					"claude-sonnet-4-6": {"displayName": "Claude Sonnet 4.6 (Thinking)", "quotaInfo": {"remainingFraction": 1.0, "resetTime": "2026-11-28T13:00:00Z"}}
+				}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ccpaSrv.Close()
+
+	t.Setenv(AntigravityAICodeBaseURLEnv, aicodeSrv.URL)
+	httpCli := &http.Client{Transport: &http.Transport{}}
+
+	status, err := FetchAntigravityQuotaAndModels(context.Background(), httpCli, ccpaSrv.URL, "ya29.ultra_tok", "", "")
+	if err != nil {
+		t.Fatalf("FetchAntigravityQuotaAndModels failed: %v", err)
+	}
+	if status.TierID != "g1-ultra-tier" || status.TierName != "Google AI Ultra" {
+		t.Fatalf("expected Google AI Ultra, got %q / %q", status.TierID, status.TierName)
+	}
+	if len(status.QuotaGroups) != 2 || !strings.Contains(status.QuotaGroups[0].GroupName, "Gemini") {
+		t.Fatalf("expected Gemini group sorted first, got %+v", status.QuotaGroups)
+	}
+	// 验证默认账号额度严格取自 Gemini 组（5h=88.9%, Weekly=100%），绝不被 Claude 3p-weekly=0% 污染
+	if status.FiveHour == nil || status.FiveHour.RemainingPct == nil || *status.FiveHour.RemainingPct != 88.9 {
+		t.Fatalf("expected Gemini 5h remaining 88.9%%, got %+v", status.FiveHour)
+	}
+	if status.Weekly == nil || status.Weekly.RemainingPct == nil || *status.Weekly.RemainingPct != 100.0 {
+		t.Fatalf("expected Gemini Weekly remaining 100%%, got %+v", status.Weekly)
+	}
+	if status.MinRemainingPct == nil || *status.MinRemainingPct != 88.9 {
+		t.Fatalf("expected default MinRemainingPct=88.9%% (Gemini), got %v", status.MinRemainingPct)
+	}
+	// 验证 3P 组 disabled:true 的 5h 桶不会生成虚假的 100% FiveHour 指针，且 3p-weekly 正确解析为 0%
+	claudeGrp := status.QuotaGroups[1]
+	if claudeGrp.FiveHour != nil {
+		t.Fatalf("expected disabled 3p-5h bucket to be excluded from FiveHour pointer, got %+v", claudeGrp.FiveHour)
+	}
+	if claudeGrp.Weekly == nil || claudeGrp.Weekly.RemainingPct == nil || *claudeGrp.Weekly.RemainingPct != 0 || !claudeGrp.Weekly.Exhausted {
+		t.Fatalf("expected 3p-weekly exhausted 0%%, got %+v", claudeGrp.Weekly)
+	}
+
+	foundModels := map[string]bool{}
+	for _, m := range status.Models {
+		foundModels[m.ID] = true
+	}
+	for _, want := range []string{"claude-opus-5-5-high", "claude-sonnet-5-5-medium", "gemini-4-neon-high", "gemini-3.8-flash-low"} {
+		if !foundModels[want] {
+			t.Fatalf("missing expected model %q in %v", want, foundModels)
+		}
+	}
+
+	// 验证 StreamAICodeGenerateContent 支持别名 claude-sonnet-5.5 -> claude-sonnet-5-5-high + tools mode=AUTO
+	openaiReq := []byte(`{
+		"model": "claude-sonnet-5.5",
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [{"type": "function", "function": {"name": "ping", "parameters": {"type": "object"}}}]
+	}`)
+	streamResp, _, sErr := StreamAICodeGenerateContent(context.Background(), httpCli, aicodeSrv.URL, "ya29.ultra_tok", "g1-ultra-tier", "", openaiReq, "claude-sonnet-5.5", "sess-1")
+	if sErr != nil {
+		t.Fatalf("StreamAICodeGenerateContent failed: %v", sErr)
+	}
+	defer streamResp.Body.Close()
+	sseBytes, _ := io.ReadAll(streamResp.Body)
+	if !strings.Contains(string(sseBytes), "ultra aicode ok") || !strings.Contains(string(sseBytes), "[DONE]") {
+		t.Fatalf("unexpected aicode SSE output: %s", string(sseBytes))
 	}
 }

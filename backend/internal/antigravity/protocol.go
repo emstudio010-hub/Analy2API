@@ -18,6 +18,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cmd2api/internal/netx"
@@ -1206,10 +1207,108 @@ type QuotaWindowBucket struct {
 	RemainingPct      *float64 `json:"remaining_pct,omitempty"`      // 0.0 ~ 100.0
 	ResetTime         string   `json:"reset_time,omitempty"`         // RFC3339
 	Exhausted         bool     `json:"exhausted"`
+	Disabled          bool     `json:"disabled,omitempty"`
 	Description       string   `json:"description,omitempty"`
 }
 
-// QuotaGroupSummary 描述一组共享 5h 与周额度的模型组（来自官方 v1internal:retrieveUserQuotaSummary）。
+type rawQuotaBucketJSON struct {
+	BucketID           string `json:"bucketId"`
+	DisplayName        string `json:"displayName"`
+	Window             string `json:"window"`
+	RefreshWindowLabel string `json:"refreshWindowLabel"`
+	ResetTime          string `json:"resetTime"`
+	Description        string `json:"description"`
+	RemainingFraction  any    `json:"remainingFraction"`
+	IsExhausted        bool   `json:"isExhausted"`
+	Disabled           bool   `json:"disabled"`
+}
+
+type rawQuotaGroupJSON struct {
+	DisplayName string               `json:"displayName"`
+	Description string               `json:"description"`
+	Buckets     []rawQuotaBucketJSON `json:"buckets"`
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+func roundPct1(fraction float64) float64 {
+	return float64(int(fraction*1000+0.5)) / 10.0
+}
+
+func isGeminiQuotaGroup(g QuotaGroupSummary) bool {
+	hay := strings.ToLower(g.GroupName + " " + g.Description)
+	for _, b := range g.Buckets {
+		hay += " " + strings.ToLower(b.BucketID)
+	}
+	return strings.Contains(hay, "gemini") || strings.Contains(hay, "1p") || strings.Contains(hay, "google")
+}
+
+func parseRawQuotaGroups(rawGroups []rawQuotaGroupJSON, proto3ZeroOmitted bool) []QuotaGroupSummary {
+	groups := make([]QuotaGroupSummary, 0, len(rawGroups))
+	for _, g := range rawGroups {
+		gs := QuotaGroupSummary{
+			GroupName:   strings.TrimSpace(g.DisplayName),
+			Description: strings.TrimSpace(g.Description),
+		}
+		for _, b := range g.Buckets {
+			win := strings.ToLower(strings.TrimSpace(firstNonEmptyStr(b.Window, b.RefreshWindowLabel)))
+			bid := strings.ToLower(strings.TrimSpace(b.BucketID))
+			switch {
+			case win == "5h" || win == "five_hour" || strings.Contains(bid, "5h"):
+				win = "5h"
+			case win == "weekly" || win == "7d" || win == "1w" || strings.Contains(bid, "weekly"):
+				win = "weekly"
+			}
+			qb := QuotaWindowBucket{
+				BucketID:    strings.TrimSpace(b.BucketID),
+				Window:      win,
+				DisplayName: strings.TrimSpace(b.DisplayName),
+				ResetTime:   strings.TrimSpace(b.ResetTime),
+				Description: strings.TrimSpace(b.Description),
+				Exhausted:   b.IsExhausted,
+				Disabled:    b.Disabled,
+			}
+			if rfVal, hasRF := parseOptionalFloat64(b.RemainingFraction); hasRF {
+				rfVal = clamp01(rfVal)
+				pct := roundPct1(rfVal)
+				qb.RemainingFraction = &rfVal
+				qb.RemainingPct = &pct
+				if !b.Disabled {
+					qb.Exhausted = qb.Exhausted || rfVal <= 0
+				}
+			} else if b.IsExhausted || (proto3ZeroOmitted && !b.Disabled && qb.ResetTime != "") {
+				zero := 0.0
+				qb.RemainingFraction = &zero
+				qb.RemainingPct = &zero
+				qb.Exhausted = true
+			}
+			gs.Buckets = append(gs.Buckets, qb)
+			// 当周限额耗尽导致 5h 桶标记 disabled: true（此时上游常填 remainingFraction: 1）时，不将其作为有效 5h 进度条，避免误导为 100%
+			if !qb.Disabled {
+				copied := qb
+				if win == "5h" && gs.FiveHour == nil {
+					gs.FiveHour = &copied
+				} else if win == "weekly" && gs.Weekly == nil {
+					gs.Weekly = &copied
+				}
+			}
+		}
+		if gs.GroupName != "" || len(gs.Buckets) > 0 {
+			groups = append(groups, gs)
+		}
+	}
+	return groups
+}
+
+// QuotaGroupSummary 描述一组共享 5h 与周额度的模型组（来自官方 aicode:fetchQuotaStatus 或 v1internal:retrieveUserQuotaSummary）。
 type QuotaGroupSummary struct {
 	GroupName   string              `json:"group_name"`
 	Description string              `json:"description,omitempty"`
@@ -1236,7 +1335,7 @@ type ModelQuotaItem struct {
 	SupportsImages       bool     `json:"supports_images"`
 	SupportsReasoning    bool     `json:"supports_reasoning"`
 	SupportsToolCall     bool     `json:"supports_tool_call"`
-	Source               string   `json:"source,omitempty"` // "agy_cli" | "v1internal" | "merged"
+	Source               string   `json:"source,omitempty"` // "aicode" | "agy_cli" | "v1internal" | "merged"
 }
 
 // AccountQuotaStatus 描述单个 AntiGravity 账号/容器的套餐层级、ProjectID、5h/周额度窗口与各模型剩余额度。
@@ -1306,76 +1405,12 @@ func RetrieveUserQuotaSummary(
 	}
 
 	var parsed struct {
-		Groups []struct {
-			DisplayName string `json:"displayName"`
-			Description string `json:"description"`
-			Buckets     []struct {
-				BucketID          string `json:"bucketId"`
-				DisplayName       string `json:"displayName"`
-				Window            string `json:"window"`
-				ResetTime         string `json:"resetTime"`
-				Description       string `json:"description"`
-				RemainingFraction any    `json:"remainingFraction"`
-				IsExhausted       bool   `json:"isExhausted"`
-			} `json:"buckets"`
-		} `json:"groups"`
+		Groups []rawQuotaGroupJSON `json:"groups"`
 	}
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		return nil, err
 	}
-
-	groups := make([]QuotaGroupSummary, 0, len(parsed.Groups))
-	for _, g := range parsed.Groups {
-		gs := QuotaGroupSummary{
-			GroupName:   strings.TrimSpace(g.DisplayName),
-			Description: strings.TrimSpace(g.Description),
-		}
-		for _, b := range g.Buckets {
-			win := strings.ToLower(strings.TrimSpace(b.Window))
-			bid := strings.ToLower(strings.TrimSpace(b.BucketID))
-			switch {
-			case win == "5h" || win == "five_hour" || strings.Contains(bid, "5h"):
-				win = "5h"
-			case win == "weekly" || win == "7d" || win == "1w" || strings.Contains(bid, "weekly"):
-				win = "weekly"
-			}
-			qb := QuotaWindowBucket{
-				BucketID:    strings.TrimSpace(b.BucketID),
-				Window:      win,
-				DisplayName: strings.TrimSpace(b.DisplayName),
-				ResetTime:   strings.TrimSpace(b.ResetTime),
-				Description: strings.TrimSpace(b.Description),
-				Exhausted:   b.IsExhausted,
-			}
-			if rfVal, hasRF := parseOptionalFloat64(b.RemainingFraction); hasRF {
-				if rfVal < 0 {
-					rfVal = 0
-				}
-				if rfVal > 1 {
-					rfVal = 1
-				}
-				pct := float64(int(rfVal*1000+0.5)) / 10.0
-				qb.RemainingFraction = &rfVal
-				qb.RemainingPct = &pct
-				qb.Exhausted = qb.Exhausted || rfVal <= 0
-			} else if b.IsExhausted {
-				zero := 0.0
-				qb.RemainingFraction = &zero
-				qb.RemainingPct = &zero
-			}
-			gs.Buckets = append(gs.Buckets, qb)
-			copied := qb
-			if win == "5h" && gs.FiveHour == nil {
-				gs.FiveHour = &copied
-			} else if win == "weekly" && gs.Weekly == nil {
-				gs.Weekly = &copied
-			}
-		}
-		if gs.GroupName != "" || len(gs.Buckets) > 0 {
-			groups = append(groups, gs)
-		}
-	}
-	return groups, nil
+	return parseRawQuotaGroups(parsed.Groups, false), nil
 }
 
 func matchQuotaGroupForModel(modelID, vendor string, groups []QuotaGroupSummary) *QuotaGroupSummary {
@@ -1404,7 +1439,7 @@ func matchQuotaGroupForModel(modelID, vendor string, groups []QuotaGroupSummary)
 }
 
 func mergeTightestBucket(dst **QuotaWindowBucket, cand *QuotaWindowBucket) {
-	if cand == nil || cand.RemainingPct == nil {
+	if cand == nil || cand.Disabled || cand.RemainingPct == nil {
 		return
 	}
 	if *dst == nil || (*dst).RemainingPct == nil || *cand.RemainingPct < *(*dst).RemainingPct ||
@@ -1420,8 +1455,23 @@ func mergeTightestBucket(dst **QuotaWindowBucket, cand *QuotaWindowBucket) {
 	}
 }
 
-// FetchAntigravityQuotaAndModels 通过 HTTP/2 调用官方 `loadCodeAssist`、`retrieveUserQuotaSummary` 与 `fetchAvailableModels`，
-// 获取当前 OAuth 账号真实的套餐层级、ProjectID、5 小时与周双窗口配额及每个模型的实时剩余额度百分比与重置时间。
+func sortQuotaGroupsGeminiFirst(groups []QuotaGroupSummary) {
+	for i := 0; i < len(groups); i++ {
+		for j := i + 1; j < len(groups); j++ {
+			gi := isGeminiQuotaGroup(groups[i])
+			gj := isGeminiQuotaGroup(groups[j])
+			if !gi && gj {
+				groups[i], groups[j] = groups[j], groups[i]
+			}
+		}
+	}
+}
+
+// FetchAntigravityQuotaAndModels 并发整合新一代 `aicode.googleapis.com/v1alpha`（`fetchLicenses` / `fetchQuotaStatus` / `fetchConfig`）
+// 与 `v1internal`（`loadCodeAssist` / `retrieveUserQuotaSummary` / `fetchAvailableModels`）：
+//   - 对具备 `aicode` OAuth 权限的 Pro / Ultra 账号自动解锁 Claude 5.5、Gemini 4 新体验模型及完整 Gemini 5h/周双窗口配额；
+//   - 账号级默认主额度（`FiveHour`、`Weekly`、`MinRemainingPct`、`AvgRemainingPct`）**默认优先取 Gemini 模型组额度**，
+//     避免第三方 Claude/GPT 周限额耗尽时误将拥有充足 Gemini 额度的账号标红或拦截调度。
 func FetchAntigravityQuotaAndModels(
 	ctx context.Context,
 	httpClient *http.Client,
@@ -1453,19 +1503,55 @@ func FetchAntigravityQuotaAndModels(
 		FetchedAt: time.Now().UTC().Format(time.RFC3339),
 	}
 
-	if ca, caErr := LoadCodeAssist(ctx, httpClient, base, tok, ua); caErr == nil && ca != nil {
-		if ca.ProjectID != "" {
-			out.ProjectID = ca.ProjectID
-		}
-		out.TierID = ca.TierID
-		out.TierName = ca.TierName
+	// 当未自定义指向第三方模拟测桩 baseURL 时，同步查询官方新一代 aicode.googleapis.com/v1alpha
+	aicodeBase := ""
+	if strings.Contains(strings.ToLower(base), "googleapis.com") {
+		aicodeBase = effectiveAICodeBaseURL("")
+	} else if envAICode := strings.TrimSpace(os.Getenv(AntigravityAICodeBaseURLEnv)); envAICode != "" {
+		aicodeBase = envAICode
 	}
 
-	if qGroups, qErr := RetrieveUserQuotaSummary(ctx, httpClient, base, tok, out.ProjectID, ua); qErr == nil && len(qGroups) > 0 {
-		out.QuotaGroups = qGroups
-		for i := range out.QuotaGroups {
-			mergeTightestBucket(&out.FiveHour, out.QuotaGroups[i].FiveHour)
-			mergeTightestBucket(&out.Weekly, out.QuotaGroups[i].Weekly)
+	var (
+		preWG     sync.WaitGroup
+		caRes     *CodeAssistProjectResult
+		aicodeRes *AICodeCatalogResult
+	)
+	preWG.Add(1)
+	go func() {
+		defer preWG.Done()
+		caRes, _ = LoadCodeAssist(ctx, httpClient, base, tok, ua)
+	}()
+	if aicodeBase != "" {
+		preWG.Add(1)
+		go func() {
+			defer preWG.Done()
+			aicodeRes, _ = FetchAICodeCatalogAndQuota(ctx, httpClient, aicodeBase, tok, ua)
+		}()
+	}
+	preWG.Wait()
+
+	if caRes != nil {
+		if caRes.ProjectID != "" {
+			out.ProjectID = caRes.ProjectID
+		}
+		out.TierID = caRes.TierID
+		out.TierName = caRes.TierName
+	}
+	if aicodeRes != nil && !aicodeRes.ScopeInsufficient {
+		if aicodeRes.TierID != "" {
+			out.TierID = aicodeRes.TierID
+		}
+		if aicodeRes.TierName != "" {
+			out.TierName = aicodeRes.TierName
+		}
+		if len(aicodeRes.QuotaGroups) > 0 {
+			out.QuotaGroups = aicodeRes.QuotaGroups
+		}
+	}
+
+	if len(out.QuotaGroups) == 0 {
+		if qGroups, qErr := RetrieveUserQuotaSummary(ctx, httpClient, base, tok, out.ProjectID, ua); qErr == nil && len(qGroups) > 0 {
+			out.QuotaGroups = qGroups
 		}
 	}
 
@@ -1485,35 +1571,43 @@ func FetchAntigravityQuotaAndModels(
 		req.Header.Set("User-Agent", ua)
 		return req, nil
 	}, 2)
-	if err != nil {
+	if err != nil && (aicodeRes == nil || len(aicodeRes.Models) == 0) {
 		return nil, err
-	}
-	defer resp.Body.Close()
-
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, fmt.Errorf("fetchAvailableModels HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	var parsed struct {
 		Models map[string]map[string]any `json:"models"`
 	}
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		return nil, fmt.Errorf("解析 fetchAvailableModels JSON 失败: %w", err)
+	if resp != nil {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode >= http.StatusBadRequest && (aicodeRes == nil || len(aicodeRes.Models) == 0) {
+			return nil, fmt.Errorf("fetchAvailableModels HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+		}
+		if resp.StatusCode < http.StatusBadRequest {
+			if uErr := json.Unmarshal(raw, &parsed); uErr != nil && (aicodeRes == nil || len(aicodeRes.Models) == 0) {
+				return nil, fmt.Errorf("解析 fetchAvailableModels JSON 失败: %w", uErr)
+			}
+		}
 	}
 
-	var sumPct float64
-	var pctCount int
-	var minPct float64 = 101
-	var earliestReset string
 	var flashTieredItem *ModelQuotaItem
 	var geminiSynthesized5h *QuotaWindowBucket
 	var geminiSynthesizedWeekly *QuotaWindowBucket
 	hasExplicitGeminiGroup := false
 	for i := range out.QuotaGroups {
-		if strings.Contains(strings.ToLower(out.QuotaGroups[i].GroupName+" "+out.QuotaGroups[i].Description), "gemini") {
+		if isGeminiQuotaGroup(out.QuotaGroups[i]) {
 			hasExplicitGeminiGroup = true
 			break
+		}
+	}
+
+	byModelID := make(map[string]int, 32)
+	if aicodeRes != nil && len(aicodeRes.Models) > 0 {
+		for _, am := range aicodeRes.Models {
+			key := strings.ToLower(am.ID)
+			byModelID[key] = len(out.Models)
+			out.Models = append(out.Models, am)
 		}
 	}
 
@@ -1557,47 +1651,42 @@ func FetchAntigravityQuotaAndModels(
 		}
 		if qRaw, ok := meta["quotaInfo"].(map[string]any); ok && qRaw != nil {
 			if rfVal, hasRF := parseOptionalFloat64(qRaw["remainingFraction"]); hasRF {
-				if rfVal < 0 {
-					rfVal = 0
-				}
-				if rfVal > 1 {
-					rfVal = 1
-				}
-				pct := float64(int(rfVal*1000+0.5)) / 10.0
+				rfVal = clamp01(rfVal)
+				pct := roundPct1(rfVal)
 				qi.RemainingFraction = &rfVal
 				qi.RemainingPct = &pct
 				qi.Exhausted = rfVal <= 0
-				sumPct += pct
-				pctCount++
-				if pct < minPct {
-					minPct = pct
-				}
 			} else if exh, ok := qRaw["isExhausted"].(bool); ok && exh {
 				zero := 0.0
 				qi.RemainingFraction = &zero
 				qi.RemainingPct = &zero
 				qi.Exhausted = true
-				pctCount++
-				minPct = 0
 			}
 			if rt, ok := qRaw["resetTime"].(string); ok && strings.TrimSpace(rt) != "" {
 				qi.ResetTime = strings.TrimSpace(rt)
-				if earliestReset == "" || qi.ResetTime < earliestReset {
-					earliestReset = qi.ResetTime
-				}
 			}
 		}
 
 		if grp := matchQuotaGroupForModel(qi.ID, qi.Vendor, out.QuotaGroups); grp != nil {
-			if grp.FiveHour != nil && grp.FiveHour.RemainingPct != nil {
+			if grp.FiveHour != nil && !grp.FiveHour.Disabled && grp.FiveHour.RemainingPct != nil {
 				v := *grp.FiveHour.RemainingPct
 				qi.FiveHourRemainingPct = &v
 				qi.FiveHourResetTime = grp.FiveHour.ResetTime
 			}
-			if grp.Weekly != nil && grp.Weekly.RemainingPct != nil {
+			if grp.Weekly != nil && !grp.Weekly.Disabled && grp.Weekly.RemainingPct != nil {
 				v := *grp.Weekly.RemainingPct
 				qi.WeeklyRemainingPct = &v
 				qi.WeeklyResetTime = grp.Weekly.ResetTime
+				// 当 v1internal 模型所在组周限额耗尽（0%）时，即便 5h 被标记 disabled:true / remainingFraction:1，该模型实际已不可用
+				if grp.Weekly.Exhausted || v <= 0 {
+					zero := 0.0
+					qi.RemainingFraction = &zero
+					qi.RemainingPct = &zero
+					qi.Exhausted = true
+					if qi.ResetTime == "" || grp.Weekly.ResetTime != "" {
+						qi.ResetTime = grp.Weekly.ResetTime
+					}
+				}
 			}
 		}
 		if qi.FiveHourRemainingPct == nil && qi.WeeklyRemainingPct == nil && qi.RemainingPct != nil {
@@ -1619,7 +1708,6 @@ func FetchAntigravityQuotaAndModels(
 				cand.DisplayName = "周额度剩余"
 				qi.WeeklyRemainingPct = &v
 				qi.WeeklyResetTime = qi.ResetTime
-				mergeTightestBucket(&out.Weekly, cand)
 				if strings.HasPrefix(lowerID, "gemini-") {
 					mergeTightestBucket(&geminiSynthesizedWeekly, cand)
 				}
@@ -1628,18 +1716,56 @@ func FetchAntigravityQuotaAndModels(
 				cand.DisplayName = "5 小时额度剩余"
 				qi.FiveHourRemainingPct = &v
 				qi.FiveHourResetTime = qi.ResetTime
-				mergeTightestBucket(&out.FiveHour, cand)
 				if strings.HasPrefix(lowerID, "gemini-") {
 					mergeTightestBucket(&geminiSynthesized5h, cand)
 				}
 			}
+		} else if strings.HasPrefix(lowerID, "gemini-") && qi.RemainingPct != nil {
+			isWeeklyWindow := false
+			if qi.ResetTime != "" {
+				if rtParsed, pErr := time.Parse(time.RFC3339, qi.ResetTime); pErr == nil && rtParsed.Sub(now) > 24*time.Hour {
+					isWeeklyWindow = true
+				}
+			}
+			v := *qi.RemainingPct
+			cand := &QuotaWindowBucket{
+				RemainingFraction: qi.RemainingFraction,
+				RemainingPct:      &v,
+				ResetTime:         qi.ResetTime,
+				Exhausted:         qi.Exhausted,
+			}
+			if isWeeklyWindow {
+				cand.Window = "weekly"
+				cand.DisplayName = "周额度剩余"
+				mergeTightestBucket(&geminiSynthesizedWeekly, cand)
+			} else {
+				cand.Window = "5h"
+				cand.DisplayName = "5 小时额度剩余"
+				mergeTightestBucket(&geminiSynthesized5h, cand)
+			}
 		}
 
-		out.Models = append(out.Models, qi)
 		if lowerID == "gemini-3.8-flash-tiered" {
 			copied := qi
 			flashTieredItem = &copied
 		}
+
+		if idx, exists := byModelID[lowerID]; exists {
+			// 若 aicode 已返回该体验模型，用 v1internal 更精确的实时滚动消费比例（如 88.9%）补充 5h 窗口
+			if qi.RemainingPct != nil && (out.Models[idx].RemainingPct == nil || *qi.RemainingPct < *out.Models[idx].RemainingPct) {
+				pct := *qi.RemainingPct
+				out.Models[idx].RemainingPct = &pct
+				out.Models[idx].FiveHourRemainingPct = &pct
+				if qi.ResetTime != "" {
+					out.Models[idx].ResetTime = qi.ResetTime
+					out.Models[idx].FiveHourResetTime = qi.ResetTime
+				}
+			}
+			out.Models[idx].Source = "merged"
+			continue
+		}
+		byModelID[lowerID] = len(out.Models)
+		out.Models = append(out.Models, qi)
 	}
 
 	if !hasExplicitGeminiGroup && (geminiSynthesized5h != nil || geminiSynthesizedWeekly != nil) {
@@ -1656,14 +1782,39 @@ func FetchAntigravityQuotaAndModels(
 			gemGroup.Buckets = append(gemGroup.Buckets, *geminiSynthesizedWeekly)
 		}
 		out.QuotaGroups = append([]QuotaGroupSummary{gemGroup}, out.QuotaGroups...)
+	} else if hasExplicitGeminiGroup && geminiSynthesized5h != nil {
+		// 若 aicode 返回了 Gemini Models 组（粒度为 100%/0%），而 v1internal 给出了更细的实时百分比（如 88.9%），取更精确的滚动剩余值
+		for i := range out.QuotaGroups {
+			if isGeminiQuotaGroup(out.QuotaGroups[i]) {
+				mergeTightestBucket(&out.QuotaGroups[i].FiveHour, geminiSynthesized5h)
+			}
+		}
 	}
 
-	// 若上游返回 gemini-3.8-flash-tiered，自动展开官方 CLI 推理档位别名（low / medium / high），调用时映射至对应 thinkingLevel
-	if flashTieredItem != nil {
-		existing := make(map[string]struct{}, len(out.Models))
-		for _, m := range out.Models {
-			existing[strings.ToLower(m.ID)] = struct{}{}
+	sortQuotaGroupsGeminiFirst(out.QuotaGroups)
+
+	// 账号默认主额度（驱动列表卡片进度条与调度器窗口）严格优先使用 Gemini 模型组的 5h 与周额度
+	var gem5h, gemWeekly *QuotaWindowBucket
+	var any5h, anyWeekly *QuotaWindowBucket
+	for i := range out.QuotaGroups {
+		g := &out.QuotaGroups[i]
+		mergeTightestBucket(&any5h, g.FiveHour)
+		mergeTightestBucket(&anyWeekly, g.Weekly)
+		if isGeminiQuotaGroup(*g) {
+			mergeTightestBucket(&gem5h, g.FiveHour)
+			mergeTightestBucket(&gemWeekly, g.Weekly)
 		}
+	}
+	if gem5h != nil || gemWeekly != nil {
+		out.FiveHour = gem5h
+		out.Weekly = gemWeekly
+	} else {
+		out.FiveHour = any5h
+		out.Weekly = anyWeekly
+	}
+
+	// 若上游返回 gemini-3.8-flash-tiered 且尚未由 aicode 展开，自动补充官方推理档位别名（low / medium / high）
+	if flashTieredItem != nil {
 		for _, alias := range []struct {
 			id   string
 			name string
@@ -1672,25 +1823,90 @@ func FetchAntigravityQuotaAndModels(
 			{"gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"},
 			{"gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"},
 		} {
-			if _, has := existing[alias.id]; !has {
+			if _, has := byModelID[alias.id]; !has {
 				aliasItem := *flashTieredItem
 				aliasItem.ID = alias.id
 				aliasItem.Name = alias.name
 				aliasItem.Source = "merged"
+				byModelID[alias.id] = len(out.Models)
 				out.Models = append(out.Models, aliasItem)
+			}
+		}
+	}
+	// 同步将 Gemini 组的 5h / 周最新剩余比例刷新到所有 gemini-* 模型条目（如 gemini-3.8-flash-low/medium/high）
+	if gem5h != nil || gemWeekly != nil {
+		for i := range out.Models {
+			if strings.HasPrefix(strings.ToLower(out.Models[i].ID), "gemini-") {
+				if gem5h != nil && gem5h.RemainingPct != nil {
+					v := *gem5h.RemainingPct
+					out.Models[i].FiveHourRemainingPct = &v
+					if gem5h.ResetTime != "" {
+						out.Models[i].FiveHourResetTime = gem5h.ResetTime
+					}
+					out.Models[i].RemainingPct = &v
+					out.Models[i].ResetTime = out.Models[i].FiveHourResetTime
+				}
+				if gemWeekly != nil && gemWeekly.RemainingPct != nil {
+					v := *gemWeekly.RemainingPct
+					out.Models[i].WeeklyRemainingPct = &v
+					if gemWeekly.ResetTime != "" {
+						out.Models[i].WeeklyResetTime = gemWeekly.ResetTime
+					}
+				}
 			}
 		}
 	}
 
 	sortModelQuotaItems(out.Models)
-	if pctCount > 0 {
-		avg := float64(int((sumPct/float64(pctCount))*10+0.5)) / 10.0
-		out.AvgRemainingPct = &avg
-		if minPct <= 100 {
-			out.MinRemainingPct = &minPct
+
+	// 汇总账号级默认剩余比例（优先汇总 Gemini 模型，保证默认展示 Gemini 模型额度）
+	var (
+		gemSum, allSum               float64
+		gemCnt, allCnt               int
+		gemMin, allMin               = 101.0, 101.0
+		gemEarliestReset, allReset   string
+	)
+	for _, m := range out.Models {
+		isGem := strings.HasPrefix(strings.ToLower(m.ID), "gemini-") || strings.EqualFold(m.Vendor, "google")
+		if m.RemainingPct != nil {
+			pct := *m.RemainingPct
+			allSum += pct
+			allCnt++
+			if pct < allMin {
+				allMin = pct
+			}
+			if isGem {
+				gemSum += pct
+				gemCnt++
+				if pct < gemMin {
+					gemMin = pct
+				}
+			}
+		}
+		if m.ResetTime != "" {
+			if allReset == "" || m.ResetTime < allReset {
+				allReset = m.ResetTime
+			}
+			if isGem && (gemEarliestReset == "" || m.ResetTime < gemEarliestReset) {
+				gemEarliestReset = m.ResetTime
+			}
 		}
 	}
-	out.EarliestResetAt = earliestReset
+	if gemCnt > 0 {
+		avg := float64(int((gemSum/float64(gemCnt))*10+0.5)) / 10.0
+		out.AvgRemainingPct = &avg
+		if gemMin <= 100 {
+			out.MinRemainingPct = &gemMin
+		}
+		out.EarliestResetAt = firstNonEmptyStr(gemEarliestReset, allReset)
+	} else if allCnt > 0 {
+		avg := float64(int((allSum/float64(allCnt))*10+0.5)) / 10.0
+		out.AvgRemainingPct = &avg
+		if allMin <= 100 {
+			out.MinRemainingPct = &allMin
+		}
+		out.EarliestResetAt = allReset
+	}
 	return out, nil
 }
 
@@ -1744,12 +1960,16 @@ func modelSortRank(id string) int {
 		return 12
 	case strings.HasPrefix(l, "gemini-4-argon"):
 		return 13
+	case strings.HasPrefix(l, "gemini-3.8-flash"):
+		return 15
+	case strings.HasPrefix(l, "claude-opus-5"):
+		return 18
+	case strings.HasPrefix(l, "claude-sonnet-5"):
+		return 19
 	case strings.HasPrefix(l, "claude-opus"):
 		return 20
 	case strings.HasPrefix(l, "claude-sonnet"):
 		return 21
-	case strings.HasPrefix(l, "gemini-3.8-flash"):
-		return 30
 	case strings.HasPrefix(l, "gemini-3"):
 		return 35
 	case strings.HasPrefix(l, "gpt-oss"):

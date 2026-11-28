@@ -22,13 +22,13 @@ import (
 )
 
 // CurrentAgyImageRev 标识当前版本内置单账号真实 agy CLI 镜像的构建修订号；升级服务端后自动检测旧镜像并重建。
-const CurrentAgyImageRev = "v1.2.7-agy-cli"
+const CurrentAgyImageRev = "v1.2.8-agy-cli"
 
 // EmbeddedAgyCLIDockerfile 内嵌 Analy2API 单账号真实 agy CLI 容器构建定义：
 // 即使部署在完全空白的 Linux 服务器（宿主机未安装 agy），只要有 Docker 即可自动构建镜像并按账号自动起独立容器；
-// 容器内内置官方 `agy` CLI 与 HTTP/2 daily-cloudcode-pa v1internal 双引擎。
+// 容器内内置官方 `agy` CLI 与 HTTP/2 aicode + daily-cloudcode-pa v1internal 引擎。
 const EmbeddedAgyCLIDockerfile = `FROM debian:bookworm-slim
-LABEL io.analy2api.image.rev="v1.2.7-agy-cli"
+LABEL io.analy2api.image.rev="v1.2.8-agy-cli"
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 ARG ALL_PROXY=""
@@ -49,9 +49,9 @@ EXPOSE 8317
 ENTRYPOINT ["/usr/local/bin/analy2api", "agy-bridge"]
 `
 
-// EmbeddedAgyCLIFallbackDockerfile 在极端受限网络无法访问 antigravity.google 安装脚本时作为降级构建底本（仍包含最新 analy2api agy-bridge v1internal 引擎）。
+// EmbeddedAgyCLIFallbackDockerfile 在极端受限网络无法访问 antigravity.google 安装脚本时作为降级构建底本（仍包含最新 analy2api agy-bridge aicode + v1internal 引擎）。
 const EmbeddedAgyCLIFallbackDockerfile = `FROM debian:bookworm-slim
-LABEL io.analy2api.image.rev="v1.2.7-bridge-only"
+LABEL io.analy2api.image.rev="v1.2.8-bridge-only"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY analy2api-linux-amd64 /usr/local/bin/analy2api
 RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api && mkdir -p /app/auths/.gemini/antigravity/conversations /app/auths/.config/gcloud
@@ -591,8 +591,7 @@ func (m *DockerManager) EnsureAndStartContainer(ctx context.Context, spec NodeSp
 		"-e", "ANTIGRAVITY_USER_AGENT=" + fp.UserAgent,
 		"-e", "ANTIGRAVITY_USER_AGENT_VERSION=" + EffectiveCLIVersion(),
 		"-e", "AGY_SINGLE_CLIENT=1",
-		"-e", "AGY_ADC_AUTH=1",
-		"-e", "GOOGLE_APPLICATION_CREDENTIALS=" + ContainerAuthDir + "/.config/gcloud/application_default_credentials.json",
+		"-e", "AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1",
 		"-e", "AGY_CLI_DISABLE_AUTO_UPDATE=true",
 		"-e", "AGY_DISABLE_AUTO_UPDATE=1",
 		"-e", "AGY_SESSION_RETENTION=" + ResolveSessionRetention(spec),
@@ -600,6 +599,12 @@ func (m *DockerManager) EnsureAndStartContainer(ctx context.Context, spec NodeSp
 		"-e", "AGY_PROMPT_BLEND_MODE=" + ResolvePromptBlendMode(spec),
 		"-e", "AGY_AUTH_DIR=" + ContainerAuthDir,
 		"-e", fmt.Sprintf("AGY_BRIDGE_ADDR=:%d", DefaultContainerPort),
+	}
+	if effProj := strings.TrimSpace(spec.ProjectID); effProj != "" && !strings.EqualFold(effProj, DefaultAGYProjectID) {
+		args = append(args,
+			"-e", "AGY_ADC_AUTH=1",
+			"-e", "GOOGLE_APPLICATION_CREDENTIALS="+ContainerAuthDir+"/.config/gcloud/application_default_credentials.json",
+		)
 	}
 	if strings.TrimSpace(spec.APIKey) != "" {
 		args = append(args, "-e", "AGY_API_KEY="+strings.TrimSpace(spec.APIKey))

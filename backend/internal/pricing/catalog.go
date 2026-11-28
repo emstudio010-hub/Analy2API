@@ -116,6 +116,7 @@ func buildOfficialCatalog() []CatalogEntry {
 		"claude-sonnet-4.5",
 		"claude-sonnet-4",
 		"claude-sonnet-5",
+		"claude-sonnet-5.5",
 		"claude-3.7-sonnet",
 		"claude-sonnet-3.7",
 		"claude-3.5-sonnet",

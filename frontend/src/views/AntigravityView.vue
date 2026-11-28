@@ -226,10 +226,32 @@ interface ResolvedQuotaWindow {
   resetAt: string | null
 }
 
-/** 提取账号 5 小时滚动额度剩余百分比与重置时间（兼容新版 balance.five_hour 与旧版单字段快照）。 */
+/** 提取账号默认 5 小时滚动额度剩余百分比与重置时间（默认优先展示 Gemini 模型组额度）。 */
 function resolveAccount5h(acc: Account | null | undefined): ResolvedQuotaWindow | null {
   const b = acc?.balance
   if (!b) return null
+  const rawPkgs = (b.packages ?? []) as unknown as Array<Record<string, unknown>>
+  const gemPkgs = rawPkgs.filter((p) => String(p.package_code || '').toLowerCase().startsWith('gemini-'))
+  if (gemPkgs.length > 0) {
+    let minPct: number | null = null
+    let resetAt: string | null = null
+    for (const p of gemPkgs) {
+      const fhRem = typeof p.five_hour_remain === 'number' ? p.five_hour_remain : p.remain
+      if (typeof fhRem === 'number' && Number.isFinite(fhRem)) {
+        if (minPct === null || fhRem < minPct) {
+          minPct = fhRem
+          const candReset = p.five_hour_reset_at ?? p.expired_at
+          if (typeof candReset === 'string' && candReset) resetAt = candReset
+        }
+      }
+    }
+    if (minPct !== null) {
+      return {
+        pct: Math.max(0, Math.min(100, minPct)),
+        resetAt: resetAt || b.five_hour?.reset_at || b.period_end || null,
+      }
+    }
+  }
   if (b.five_hour && b.five_hour.cap > 0) {
     const pct = Math.max(0, Math.min(100, ((b.five_hour.cap - b.five_hour.used) / b.five_hour.cap) * 100))
     return { pct, resetAt: b.five_hour.reset_at || b.period_end || null }
@@ -241,28 +263,36 @@ function resolveAccount5h(acc: Account | null | undefined): ResolvedQuotaWindow 
   return null
 }
 
-/** 提取账号周额度剩余百分比与重置时间。 */
+/** 提取账号默认周额度剩余百分比与重置时间（默认优先展示 Gemini 模型组周额度）。 */
 function resolveAccountWeekly(acc: Account | null | undefined): ResolvedQuotaWindow | null {
   const b = acc?.balance
   if (!b) return null
+  const rawPkgs = (b.packages ?? []) as unknown as Array<Record<string, unknown>>
+  const gemPkgs = rawPkgs.filter((p) => String(p.package_code || '').toLowerCase().startsWith('gemini-'))
+  const candidateSets = gemPkgs.length > 0 ? [gemPkgs] : [rawPkgs]
+  for (const set of candidateSets) {
+    let minPct: number | null = null
+    let resetAt: string | null = null
+    for (const p of set) {
+      const wRem = p.weekly_remain
+      if (typeof wRem === 'number' && Number.isFinite(wRem)) {
+        if (minPct === null || wRem < minPct) {
+          minPct = wRem
+          resetAt = typeof p.weekly_reset_at === 'string' && p.weekly_reset_at ? p.weekly_reset_at : resetAt
+        }
+      }
+    }
+    if (minPct !== null) {
+      return { pct: Math.max(0, Math.min(100, minPct)), resetAt }
+    }
+  }
+  // 若已有 Gemini 模型包但尚无 Gemini 周额度桶（如旧快照中 balance.weekly 来自 Claude 3P 组），不误把 Claude 周耗尽显示在默认栏
+  if (gemPkgs.length > 0) {
+    return null
+  }
   if (b.weekly && b.weekly.cap > 0) {
     const pct = Math.max(0, Math.min(100, ((b.weekly.cap - b.weekly.used) / b.weekly.cap) * 100))
     return { pct, resetAt: b.weekly.reset_at || null }
-  }
-  const rawPkgs = (b.packages ?? []) as unknown as Array<Record<string, unknown>>
-  let minPct: number | null = null
-  let resetAt: string | null = null
-  for (const p of rawPkgs) {
-    const wRem = p.weekly_remain
-    if (typeof wRem === 'number' && Number.isFinite(wRem)) {
-      if (minPct === null || wRem < minPct) {
-        minPct = wRem
-        resetAt = typeof p.weekly_reset_at === 'string' && p.weekly_reset_at ? p.weekly_reset_at : resetAt
-      }
-    }
-  }
-  if (minPct !== null) {
-    return { pct: Math.max(0, Math.min(100, minPct)), resetAt }
   }
   return null
 }
@@ -1276,13 +1306,13 @@ async function copyErrorDetail(text: string): Promise<void> {
                     </button>
                   </div>
 
-                  <!-- 5 小时滚动额度 + 重置时间 -->
+                  <!-- 默认展示 Gemini 5 小时滚动额度 + 重置时间 -->
                   <div
                     v-if="resolveAccount5h(row.account)"
                     class="rounded border border-line/70 bg-raised/35 px-2 py-1 space-y-1"
                   >
                     <div class="flex items-center justify-between gap-2 text-2xs">
-                      <span class="font-medium text-muted">5h 额度</span>
+                      <span class="font-medium text-muted">Gemini 5h 额度</span>
                       <span class="tnum font-mono font-semibold text-fg">
                         剩余 {{ formatQuotaPct(resolveAccount5h(row.account)?.pct) }}
                       </span>
@@ -1305,13 +1335,13 @@ async function copyErrorDetail(text: string): Promise<void> {
                     </div>
                   </div>
 
-                  <!-- 周滚动额度 + 重置时间 -->
+                  <!-- 默认展示 Gemini 周滚动额度 + 重置时间 -->
                   <div
                     v-if="resolveAccountWeekly(row.account)"
                     class="rounded border border-line/70 bg-raised/35 px-2 py-1 space-y-1"
                   >
                     <div class="flex items-center justify-between gap-2 text-2xs">
-                      <span class="font-medium text-muted">周额度</span>
+                      <span class="font-medium text-muted">Gemini 周额度</span>
                       <span class="tnum font-mono font-semibold text-fg">
                         剩余 {{ formatQuotaPct(resolveAccountWeekly(row.account)?.pct) }}
                       </span>
@@ -1628,6 +1658,12 @@ async function copyErrorDetail(text: string): Promise<void> {
                   <span>{{ formatDateTime(grp.five_hour.reset_time) }}</span>
                 </div>
               </div>
+              <div
+                v-else-if="grp.weekly?.exhausted || (grp.weekly?.remaining_pct !== null && grp.weekly?.remaining_pct !== undefined && grp.weekly.remaining_pct <= 0)"
+                class="rounded border border-dashed border-danger/40 bg-danger/[0.04] px-2.5 py-1.5 text-2xs text-danger"
+              >
+                5h 窗口当前暂不适用（该模型组周限额已耗尽，待下方周限额重置后自动恢复；Google AI Ultra 可消耗 AI Credits 继续调用新 aicode 模型）
+              </div>
 
               <!-- 周窗口 -->
               <div v-if="grp.weekly" class="rounded border border-line/70 bg-surface px-2.5 py-1.5 space-y-1">
@@ -1710,7 +1746,7 @@ async function copyErrorDetail(text: string): Promise<void> {
                   <div v-if="m.name && m.name !== m.id" class="text-2xs text-subtle">{{ m.name }}</div>
                 </td>
                 <td class="px-3 py-2">
-                  <Badge :tone="m.source?.includes('agy') ? 'success' : 'info'" mono>
+                  <Badge :tone="m.source === 'aicode' ? 'accent' : m.source?.includes('agy') ? 'success' : 'info'" mono>
                     {{ m.source || 'live' }}
                   </Badge>
                 </td>
