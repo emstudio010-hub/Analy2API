@@ -47,7 +47,7 @@ var (
 	dateSuffixRe = regexp.MustCompile(`(?i)-(?:(?:19|20)\d{2}-\d{2}-\d{2}|(?:19|20)\d{6}|(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])|\d{4})$`)
 
 	// 匹配常见渠道推理档位或快照变体后缀（仅在精确模型名未命中时作为回退剥离）。
-	variantSuffixRe = regexp.MustCompile(`(?i)-(?:maxthinking|nothinking|thinking|high|medium|low|latest|preview|exp|beta|00[1-9])$`)
+	variantSuffixRe = regexp.MustCompile(`(?i)-(?:maxthinking|nothinking|thinking|xhigh|high|medium|low|latest|preview|exp|beta|00[1-9])$`)
 )
 
 // officialCatalogEntries 按厂商家族维护四大平台（WorkBuddy / AntiGravity / Command Code / OpenCode）
@@ -200,12 +200,21 @@ func buildOfficialCatalog() []CatalogEntry {
 		"gpt-oss-120b",
 	)
 
-	// ---- Google Gemini 系（含 AntiGravity 主力模型）----
+	// ---- Google Gemini 系（含 AntiGravity 真实主力模型）----
+	add("google", 2.00, 12.00, 0.20, 0,
+		"gemini-4-neon",
+		"gemini-4-carbon",
+		"gemini-pro-orchestrator",
+	)
 	add("google", 1.25, 10.00, 0.125, 0,
+		"gemini-4-hydrogen",
 		"gemini-2.5-pro",
 		"gemini-3-pro",
 		"gemini-3.1-pro",
 		"gemini-3.5-pro",
+	)
+	add("google", 0.50, 3.00, 0.05, 0,
+		"gemini-4-argon",
 	)
 	add("google", 0.30, 2.50, 0.03, 0,
 		"gemini-2.5-flash",
@@ -281,6 +290,7 @@ func buildOfficialCatalog() []CatalogEntry {
 		"glm-5.1",
 		"glm-5.2",
 		"glm-5.3",
+		"glm-5.4",
 	)
 	add("zhipu", 3.00, 10.25, 0.50, 0,
 		"glm-5.2-fast",
@@ -345,8 +355,14 @@ func buildOfficialCatalog() []CatalogEntry {
 	add("moonshot", 1.90, 8.00, 0.38, 0,
 		"kimi-k2.7-code-highspeed",
 	)
+	add("moonshot", 1.20, 5.00, 0.20, 0,
+		"kimi-k2.8",
+		"kimi-k2.8-preview",
+	)
 	add("moonshot", 2.00, 10.00, 0.20, 0,
 		"kimi-k3",
+		"kimi-k3-1",
+		"kimi-k3.1-pro",
 	)
 
 	// ---- MiniMax 系 ----
@@ -387,6 +403,10 @@ func buildOfficialCatalog() []CatalogEntry {
 		"tencent-hy4-preview",
 		"hy4-preview",
 		"hy4",
+		"hy4std",
+	)
+	add("tencent", 0.08, 0.32, 0.01, 0,
+		"hy4flash",
 	)
 
 	// ---- xAI Grok 系 ----

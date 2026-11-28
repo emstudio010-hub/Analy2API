@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"cmd2api/internal/antigravity"
 	"cmd2api/internal/domain"
 	"cmd2api/internal/scheduler"
 )
@@ -115,14 +116,96 @@ func (c *Client) FetchBalance(ctx context.Context, target *scheduler.Target) Bal
 		return BalanceResult{Err: errBalanceTargetEmpty}
 	}
 	switch domain.NormalizePlatform(target.Platform) {
-	case domain.PlatformOpenCode, domain.PlatformAntigravity:
-		// OpenCode 与 AntiGravity 的账单端点暂不统一计费，按无独立余额支持返回。
+	case domain.PlatformOpenCode:
+		// OpenCode 的账单端点暂不统一计费，按无独立余额支持返回。
 		return BalanceResult{}
+	case domain.PlatformAntigravity:
+		return c.fetchAntigravityBalance(ctx, target)
 	case domain.PlatformCommandCode:
 		return c.fetchCommandCodeBalanceWithProxy(ctx, target.APIKey, target.ProxyURL)
 	default:
 		// WorkBuddy（及空平台兜底）走 WorkBuddy 账单汇总接口。
 		return c.fetchWorkBuddyBalance(ctx, target)
+	}
+}
+
+func (c *Client) fetchAntigravityBalance(ctx context.Context, target *scheduler.Target) BalanceResult {
+	fetchCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	spec := target.AntigravityNodeSpec()
+	status, err := c.Antigravity().FetchQuotaStatus(fetchCtx, spec)
+	if err != nil && strings.TrimSpace(target.RefreshToken) != "" {
+		// 当容器尚未就绪时，直接用账号解密出的 RefreshToken + 独立代理由网关侧向 Google 查询实时模型与配额
+		httpCli, cErr := c.httpClientForProxy(target.ProxyURL)
+		if cErr == nil {
+			if tokRes, rErr := antigravity.RefreshGoogleOAuthToken(fetchCtx, httpCli, "", "", target.RefreshToken, ""); rErr == nil {
+				ua := antigravity.BuildCLIUserAgent("", target.Fingerprint.OS, target.Fingerprint.Arch)
+				status, err = antigravity.FetchAntigravityQuotaAndModels(fetchCtx, httpCli, "", tokRes.AccessToken, "", ua)
+			}
+		}
+	}
+	if err != nil {
+		return BalanceResult{Supported: true, Err: err}
+	}
+	if status == nil {
+		return BalanceResult{Supported: true, Err: errors.New("未获取到 AntiGravity 配额响应")}
+	}
+
+	pkgs := make([]map[string]any, 0, len(status.Models))
+	for _, m := range status.Models {
+		rem := 100.0
+		if m.RemainingPct != nil {
+			rem = *m.RemainingPct
+		}
+		used := 100.0 - rem
+		if used < 0 {
+			used = 0
+		}
+		pkgs = append(pkgs, map[string]any{
+			"package_code":  m.ID,
+			"package_name":  m.ID,
+			"display_name":  m.Name,
+			"kind":          "model_quota_pct",
+			"total":         100.0,
+			"remain":        rem,
+			"used":          used,
+			"total_count":   100,
+			"expired_at":    m.ResetTime,
+			"expired":       m.Exhausted,
+			"expiring_soon": rem > 0 && rem <= 20,
+		})
+	}
+
+	remPct := 100.0
+	if status.AvgRemainingPct != nil {
+		remPct = *status.AvgRemainingPct
+	}
+	planID := status.TierID
+	planName := status.TierName
+	if planName == "" {
+		if planID != "" {
+			planName = planID
+		} else {
+			planName = "Google AI Code"
+		}
+	}
+	var resetPtr *time.Time
+	if status.EarliestResetAt != "" {
+		resetPtr = parseRFC3339Ptr(status.EarliestResetAt)
+	}
+
+	return BalanceResult{
+		Supported: true,
+		Balance: &Balance{
+			Remaining:    remPct,
+			TotalCredits: 100.0,
+			PlanID:       planID,
+			PlanName:     planName,
+			PeriodEnd:    resetPtr,
+			Packages:     pkgs,
+			IsPaidUser:   strings.Contains(strings.ToLower(planID+" "+planName), "pro") || strings.Contains(strings.ToLower(planID+" "+planName), "ultra"),
+		},
 	}
 }
 

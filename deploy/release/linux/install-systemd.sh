@@ -66,6 +66,12 @@ else
   if ! grep -q '^TMPDIR=' "$CONF_FILE"; then
     echo "TMPDIR=$APP_DIR/tmp" >> "$CONF_FILE"
   fi
+  if ! grep -q '^DOCKER_CONFIG=' "$CONF_FILE"; then
+    echo "DOCKER_CONFIG=$APP_DIR/tmp/.docker" >> "$CONF_FILE"
+  fi
+  # 平滑迁移旧版遗留的 AGY_PROMPT_BLEND_MODE=blend_clean，默认启用原生默认->拦截->接续管线
+  sed -i 's/^AGY_PROMPT_BLEND_MODE=blend_clean$/AGY_PROMPT_MODE=default_intercept_continue/' "$CONF_FILE" || true
+  sed -i 's/^AGY_PROMPT_BLEND_MODE=blend_sanitized$/AGY_PROMPT_MODE=default_intercept_continue/' "$CONF_FILE" || true
 fi
 
 install -m 0644 "$UNIT_SRC" "/etc/systemd/system/$SERVICE.service"

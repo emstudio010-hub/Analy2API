@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -262,23 +263,33 @@ func (h *Handler) UpdateRuntimeSettings(c *gin.Context) {
 	c.JSON(http.StatusOK, h.buildSettingsPayload(ctx))
 }
 
-// AdminListModels 返回上游可用模型列表（管理后台用，需要管理员登录）。
+// AdminListModels 返回上游可用模型列表（管理后台用，支持 ?platform= 与 ?group_id= 过滤）。
 func (h *Handler) AdminListModels(c *gin.Context) {
 	if h.relay == nil {
 		fail(c, http.StatusServiceUnavailable, "中转服务未启用")
 		return
 	}
 	ctx := c.Request.Context()
+	plat := strings.TrimSpace(c.Query("platform"))
+	if rawGID := strings.TrimSpace(c.Query("group_id")); rawGID != "" {
+		if gid, err := strconv.ParseInt(rawGID, 10, 64); err == nil && gid > 0 {
+			models, mErr := h.relay.Models(ctx, gid)
+			if mErr == nil {
+				c.JSON(http.StatusOK, gin.H{"items": models, "total": len(models)})
+				return
+			}
+		}
+	}
 
-	models, err := h.relay.PlatformModels(ctx, "")
-	if err != nil || len(models) == 0 {
+	models, err := h.relay.PlatformModels(ctx, plat)
+	if (err != nil || len(models) == 0) && plat == "" {
 		groupID, gErr := h.firstActiveGroupID(ctx)
 		if gErr == nil && groupID > 0 {
 			models, err = h.relay.Models(ctx, groupID)
 		}
 	}
 	if err != nil && len(models) == 0 {
-		h.logger.Warn("拉取模型列表失败", "err", err)
+		h.logger.Warn("拉取模型列表失败", "err", err, "platform", plat)
 		fail(c, http.StatusServiceUnavailable, "暂时无法获取模型列表，请确认账号可用")
 		return
 	}

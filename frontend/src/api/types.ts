@@ -2031,3 +2031,57 @@ export interface FilterPipelinePreviewResponse {
   final_system?: string
   stages?: FilterPipelineStage[]
 }
+
+// === Antigravity Live Models, Quota & Online Container Test ===
+
+export interface AntigravityModelQuotaItem {
+  id: string
+  name: string
+  source?: string
+  remaining_pct?: number | null
+  reset_time?: string
+  exhausted?: boolean
+  supports_images?: boolean
+}
+
+export interface AntigravityAccountModelsResponse {
+  ok: boolean
+  account_id: number
+  email: string
+  node_id?: number
+  container_name?: string
+  proxy_url?: string
+  project_id?: string
+  tier_id?: string
+  tier_name?: string
+  driver?: string
+  cli_ready?: boolean
+  avg_remaining_pct?: number | null
+  earliest_reset_at?: string
+  models: AntigravityModelQuotaItem[]
+  fetched_at?: string
+  warning?: string
+}
+
+export interface TestAntigravityAccountPayload {
+  model?: string
+  system_prompt?: string
+  prompt?: string
+  test_tool_call?: boolean
+}
+
+export interface TestAntigravityAccountResponse {
+  ok: boolean
+  account_id: number
+  node_id?: number
+  container_name?: string
+  model: string
+  reply: string
+  reasoning?: string
+  tool_calls?: Array<Record<string, unknown>>
+  driver?: string
+  prompt_mode?: string
+  latency_ms: number
+  proxy_url?: string
+  error?: string
+}

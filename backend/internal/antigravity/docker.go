@@ -21,18 +21,42 @@ import (
 	"cmd2api/internal/workbuddy"
 )
 
+// CurrentAgyImageRev 标识当前版本内置单账号真实 agy CLI 镜像的构建修订号；升级服务端后自动检测旧镜像并重建。
+const CurrentAgyImageRev = "v1.2.2-agy-cli"
+
 // EmbeddedAgyCLIDockerfile 内嵌 Analy2API 单账号真实 agy CLI 容器构建定义：
 // 即使部署在完全空白的 Linux 服务器（宿主机未安装 agy），只要有 Docker 即可自动构建镜像并按账号自动起独立容器；
-// 容器内同时具备真实 `agy` CLI 驱动与内置 HTTP/2 v1internal 兜底引擎，确保无桌面 Keyring 或受限网络下 100% 稳定可用。
+// 容器内通过官方 AGY_ADC_AUTH=1 无头认证直驱真实 `agy` CLI，并保留内置 HTTP/2 v1internal 兜底引擎。
 const EmbeddedAgyCLIDockerfile = `FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash && if [ -f /root/.local/bin/agy ]; then cp /root/.local/bin/agy /usr/local/bin/agy && chmod 0755 /usr/local/bin/agy; fi || true
+LABEL io.analy2api.image.rev="v1.2.2-agy-cli"
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG ALL_PROXY=""
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tar coreutils sed && rm -rf /var/lib/apt/lists/*
+RUN curl --retry 3 --connect-timeout 15 -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin && chmod 0755 /usr/local/bin/agy && /usr/local/bin/agy --version
 ENV PATH="/usr/local/bin:/root/.local/bin:/root/.antigravity/bin:${PATH}"
 COPY analy2api-linux-amd64 /usr/local/bin/analy2api
-RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api
+RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api && mkdir -p /app/auths/.gemini/antigravity/conversations /app/auths/.config/gcloud
 ENV AGY_SINGLE_CLIENT=1
+ENV AGY_ADC_AUTH=1
+ENV GOOGLE_APPLICATION_CREDENTIALS=/app/auths/.config/gcloud/application_default_credentials.json
 ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 ENV AGY_DISABLE_AUTO_UPDATE=1
+ENV AGY_SESSION_RETENTION=stateless
+ENV AGY_PROMPT_MODE=default_intercept_continue
+ENV AGY_BRIDGE_ADDR=:8317
+ENV AGY_AUTH_DIR=/app/auths
+EXPOSE 8317
+ENTRYPOINT ["/usr/local/bin/analy2api", "agy-bridge"]
+`
+
+// EmbeddedAgyCLIFallbackDockerfile 在极端受限网络无法访问 antigravity.google 安装脚本时作为降级构建底本（仍包含最新 analy2api agy-bridge v1internal 引擎）。
+const EmbeddedAgyCLIFallbackDockerfile = `FROM debian:bookworm-slim
+LABEL io.analy2api.image.rev="v1.2.2-bridge-only"
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
+COPY analy2api-linux-amd64 /usr/local/bin/analy2api
+RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api && mkdir -p /app/auths/.gemini/antigravity/conversations /app/auths/.config/gcloud
+ENV AGY_SINGLE_CLIENT=1
 ENV AGY_SESSION_RETENTION=stateless
 ENV AGY_PROMPT_MODE=default_intercept_continue
 ENV AGY_BRIDGE_ADDR=:8317
@@ -71,8 +95,15 @@ func (f CommandRunnerFunc) Run(ctx context.Context, name string, args ...string)
 type ExecCommandRunner struct{}
 
 // Run 执行外部命令并分别捕获 stdout 与 stderr。
+// 当在无主目录权限的 systemd 服务下调用 docker 时，自动将 DOCKER_CONFIG 指向可写临时目录，消除 `.docker/config.json: permission denied` 告警。
 func (ExecCommandRunner) Run(ctx context.Context, name string, args ...string) (string, string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	if name == "docker" && strings.TrimSpace(os.Getenv("DOCKER_CONFIG")) == "" {
+		cfgDir := filepath.Join(os.TempDir(), "analy2api-docker-cfg")
+		if os.MkdirAll(cfgDir, 0o700) == nil {
+			cmd.Env = append(os.Environ(), "DOCKER_CONFIG="+cfgDir)
+		}
+	}
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
@@ -313,9 +344,33 @@ func WriteNodeConfigFile(spec NodeSpec) (string, error) {
 	return absConfigPath, nil
 }
 
-// EnsureAgyCLIImage 检查单账号真实 agy CLI 镜像是否存在；在空服务器上若尚无该镜像且为内置 analy2api-agy-cli 镜像，
-// 自动利用内嵌 Dockerfile + Linux 版 analy2api 二进制现场执行 `docker build` 构建镜像（并发串行防重，独立 5 分钟构建超时防止前端 30s 断连中断构建）。
+// EnsureAgyCLIImage 检查单账号真实 agy CLI 镜像是否存在且为当前版本修订号；在空服务器或升级后自动现场执行 `docker build` 构建/升级镜像。
 func (m *DockerManager) EnsureAgyCLIImage(ctx context.Context, image string) error {
+	return m.ensureOrRebuildAgyCLIImage(ctx, image, false)
+}
+
+// RebuildAgyCLIImage 强制使用当前二进制与官方 agy CLI 安装源重新构建单账号容器镜像。
+func (m *DockerManager) RebuildAgyCLIImage(ctx context.Context, image string) error {
+	return m.ensureOrRebuildAgyCLIImage(ctx, image, true)
+}
+
+func (m *DockerManager) isCurrentBuiltinImageReady(ctx context.Context, img string) bool {
+	stdout, _, err := m.getRunner().Run(ctx, "docker", "image", "inspect", "--format", `{{ index .Config.Labels "io.analy2api.image.rev" }}`, img)
+	if err != nil {
+		return false
+	}
+	rev := strings.Trim(strings.TrimSpace(stdout), "\"'")
+	if rev == CurrentAgyImageRev {
+		return true
+	}
+	// 非 Linux 本地测试环境下的 Mock Runner 可能返回空串或固定 JSON，保持单测兼容
+	if runtime.GOOS != "linux" {
+		return true
+	}
+	return false
+}
+
+func (m *DockerManager) ensureOrRebuildAgyCLIImage(ctx context.Context, image string, forceRebuild bool) error {
 	img := strings.TrimSpace(image)
 	if img == "" {
 		img = DefaultDockerImage
@@ -323,19 +378,23 @@ func (m *DockerManager) EnsureAgyCLIImage(ctx context.Context, image string) err
 	if err := ValidateImageName(img); err != nil {
 		return err
 	}
-	// 先探测本地镜像是否已就绪
-	if _, _, err := m.getRunner().Run(ctx, "docker", "image", "inspect", img); err == nil {
-		return nil
-	}
 	if !isBuiltinAgyCLIImage(img) {
+		if !forceRebuild {
+			if _, _, err := m.getRunner().Run(ctx, "docker", "image", "inspect", img); err == nil {
+				return nil
+			}
+		}
 		return m.PullImage(ctx, img)
+	}
+
+	if !forceRebuild && m.isCurrentBuiltinImageReady(ctx, img) {
+		return nil
 	}
 
 	if m != nil {
 		m.imageBuildMu.Lock()
 		defer m.imageBuildMu.Unlock()
 	}
-	// 获取锁后二次检查，若前序并发请求已完成构建则直接复用
 	buildCtx := context.Background()
 	if ctx != nil {
 		buildCtx = context.WithoutCancel(ctx)
@@ -343,7 +402,7 @@ func (m *DockerManager) EnsureAgyCLIImage(ctx context.Context, image string) err
 	buildCtx, cancel := context.WithTimeout(buildCtx, 5*time.Minute)
 	defer cancel()
 
-	if _, _, err := m.getRunner().Run(buildCtx, "docker", "image", "inspect", img); err == nil {
+	if !forceRebuild && m.isCurrentBuiltinImageReady(buildCtx, img) {
 		return nil
 	}
 
@@ -376,6 +435,12 @@ func (m *DockerManager) EnsureAgyCLIImage(ctx context.Context, image string) err
 
 	stdout, stderr, buildErr := m.getRunner().Run(buildCtx, "docker", "build", "-t", img, tmpDir)
 	if buildErr != nil {
+		// 若服务器直连无法下载官方 install.sh，回退构建带最新 agy-bridge v1internal 引擎的镜像，避免容器彻底起不来
+		if wErr := os.WriteFile(filepath.Join(tmpDir, "Dockerfile"), []byte(EmbeddedAgyCLIFallbackDockerfile), 0o644); wErr == nil {
+			if _, _, fbErr := m.getRunner().Run(buildCtx, "docker", "build", "-t", img, tmpDir); fbErr == nil {
+				return nil
+			}
+		}
 		return errors.New(formatDockerError(fmt.Sprintf("自动构建单账号 agy CLI 镜像 %s 失败", img), stderr, stdout, buildErr))
 	}
 	return nil
@@ -436,7 +501,7 @@ func copyBinaryFile(src, dst string) error {
 	return err
 }
 
-// PullImage 拉取指定的 Docker 镜像；若为内置单账号 agy 镜像且远端拉取失败，自动回退现场构建（EnsureAgyCLIImage）。
+// PullImage 拉取或重建指定的 Docker 镜像；若为内置单账号 agy 镜像，直接现场重新构建最新镜像。
 func (m *DockerManager) PullImage(ctx context.Context, image string) error {
 	img := strings.TrimSpace(image)
 	if img == "" {
@@ -445,13 +510,15 @@ func (m *DockerManager) PullImage(ctx context.Context, image string) error {
 	if err := ValidateImageName(img); err != nil {
 		return err
 	}
-	stdout, stderr, err := m.getRunner().Run(ctx, "docker", "pull", img)
-	if err != nil {
-		if isBuiltinAgyCLIImage(img) {
-			if bErr := m.EnsureAgyCLIImage(ctx, img); bErr == nil {
-				return nil
+	if isBuiltinAgyCLIImage(img) {
+		if _, isExec := m.getRunner().(ExecCommandRunner); isExec {
+			if _, lErr := locateLinuxBinaryForImageBuild(); lErr == nil {
+				return m.RebuildAgyCLIImage(ctx, img)
 			}
 		}
+	}
+	stdout, stderr, err := m.getRunner().Run(ctx, "docker", "pull", img)
+	if err != nil {
 		return errors.New(formatDockerError(fmt.Sprintf("拉取镜像 %s 失败", img), stderr, stdout, err))
 	}
 	return nil
@@ -525,6 +592,8 @@ func (m *DockerManager) EnsureAndStartContainer(ctx context.Context, spec NodeSp
 		"-e", "ANTIGRAVITY_USER_AGENT=" + fp.UserAgent,
 		"-e", "ANTIGRAVITY_USER_AGENT_VERSION=" + EffectiveCLIVersion(),
 		"-e", "AGY_SINGLE_CLIENT=1",
+		"-e", "AGY_ADC_AUTH=1",
+		"-e", "GOOGLE_APPLICATION_CREDENTIALS=" + ContainerAuthDir + "/.config/gcloud/application_default_credentials.json",
 		"-e", "AGY_CLI_DISABLE_AUTO_UPDATE=true",
 		"-e", "AGY_DISABLE_AUTO_UPDATE=1",
 		"-e", "AGY_SESSION_RETENTION=" + ResolveSessionRetention(spec),

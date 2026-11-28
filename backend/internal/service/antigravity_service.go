@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"path/filepath"
@@ -1314,9 +1315,9 @@ func (s *AntigravityService) resolveOrEnsureAntigravityGroups(ctx context.Contex
 
 	createdGrp, err := s.db.Group.Create().
 		SetName(groupName).
-		SetDescription("AntiGravity 容器节点默认调度分组（默认关闭额外提示词注入，原样透传下游提示词）").
+		SetDescription("默认 AntiGravity 容器池分组").
 		SetPlatform(domain.PlatformAntigravity).
-		SetPromptInjectMode(domain.PromptModeOff).
+		SetPromptInjectMode(domain.PromptModeAppendGlobal).
 		SetRateMultiplier(1.0).
 		SetStatus(domain.StatusActive).
 		Save(ctx)
@@ -2680,4 +2681,423 @@ func firstNonEmptyStrSvc(vals ...string) string {
 		}
 	}
 	return ""
+}
+
+// AntigravityAccountModelsOutput 描述单个 AntiGravity 账号支持的模型、套餐层级与各模型实时额度输出。
+type AntigravityAccountModelsOutput struct {
+	OK              bool                         `json:"ok"`
+	AccountID       int64                        `json:"account_id"`
+	Email           string                       `json:"email,omitempty"`
+	NodeID          int64                        `json:"node_id,omitempty"`
+	ContainerName   string                       `json:"container_name,omitempty"`
+	ProxyURL        string                       `json:"proxy_url,omitempty"`
+	ProjectID       string                       `json:"project_id,omitempty"`
+	TierID          string                       `json:"tier_id,omitempty"`
+	TierName        string                       `json:"tier_name,omitempty"`
+	Driver          string                       `json:"driver,omitempty"`
+	CLIReady        bool                         `json:"cli_ready"`
+	AvgRemainingPct *float64                     `json:"avg_remaining_pct,omitempty"`
+	EarliestResetAt string                       `json:"earliest_reset_at,omitempty"`
+	Models          []antigravity.ModelQuotaItem `json:"models"`
+	FetchedAt       string                       `json:"fetched_at"`
+	Warning         string                       `json:"warning,omitempty"`
+}
+
+// GetAccountModelsAndQuota 查询指定 AntiGravity 账号绑定容器的实时可用模型清单、套餐层级与各模型剩余额度百分比，并顺带写回账号余额快照。
+func (s *AntigravityService) GetAccountModelsAndQuota(ctx context.Context, accountID int64) (*AntigravityAccountModelsOutput, error) {
+	acc, err := s.db.Account.Query().
+		Where(account.IDEQ(accountID), account.DeletedAtIsNil()).
+		Only(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("查询账号 #%d 失败: %w", accountID, err)
+	}
+	nodeID := extractExtraInt64(acc.Extra, "node_id")
+	var row *ent.ContainerNode
+	if nodeID > 0 {
+		row, _ = s.getNodeRow(ctx, nodeID)
+	}
+	if row == nil {
+		// 扫描 bound_account_id 兜底匹配
+		allNodes, _ := s.db.ContainerNode.Query().All(ctx)
+		for _, n := range allNodes {
+			if extractExtraInt64(n.Extra, "bound_account_id") == acc.ID {
+				row = n
+				nodeID = n.ID
+				break
+			}
+		}
+	}
+
+	var spec antigravity.NodeSpec
+	var containerName string
+	if row != nil {
+		spec = s.nodeSpec(row)
+		containerName = spec.EffectiveContainerName()
+		// 顺便补齐旧容器挂载目录中的 ADC client_secret，使运行中容器无需重导入即可用上 AGY_ADC_AUTH=1
+		if strings.TrimSpace(spec.AuthDir) != "" {
+			_, _ = antigravity.EnsureIsolatedADCFile(spec.AuthDir)
+		}
+	} else {
+		spec = antigravity.NodeSpec{
+			Name:     acc.Name,
+			Mode:     antigravity.ModeDirectCLI,
+			ProxyURL: acc.ProxyURL,
+			AuthDir:  extractExtraString(acc.Extra, "auth_dir"),
+		}
+	}
+
+	status, qErr := s.agClient.FetchQuotaStatus(ctx, spec)
+	if qErr != nil {
+		refreshTok := s.decryptAccountCredField(acc.Credentials, "refresh_token_encrypted", "refresh_token")
+		clientID := firstNonEmptyStrSvc(extractExtraString(acc.Credentials, "client_id"), extractExtraString(acc.Extra, "client_id"))
+		clientSec := s.decryptAccountCredField(acc.Credentials, "client_secret_encrypted", "client_secret")
+		projID := firstNonEmptyStrSvc(extractExtraString(acc.Credentials, "project_id"), extractExtraString(acc.Extra, "project_id"))
+		if refreshTok != "" {
+			httpCli, cErr := s.agClient.ProxyPool().Client(strings.TrimSpace(acc.ProxyURL))
+			if cErr == nil {
+				if tokRes, rErr := antigravity.RefreshGoogleOAuthToken(ctx, httpCli, clientID, clientSec, refreshTok, ""); rErr == nil {
+					ua := antigravity.BuildCLIUserAgent("", spec.Fingerprint.OS, spec.Fingerprint.Arch)
+					status, qErr = antigravity.FetchAntigravityQuotaAndModels(ctx, httpCli, "", tokRes.AccessToken, projID, ua)
+				}
+			}
+		}
+	}
+	if qErr != nil {
+		return nil, qErr
+	}
+
+	// 同步将额度快照持久化到 Account 表，使账号列表与 AntiGravity 列表刷新页面后依然直接可见额度
+	if status != nil {
+		rem := 100.0
+		if status.AvgRemainingPct != nil {
+			rem = *status.AvgRemainingPct
+		}
+		pkgs := make([]map[string]any, 0, len(status.Models))
+		for _, m := range status.Models {
+			mRem := 100.0
+			if m.RemainingPct != nil {
+				mRem = *m.RemainingPct
+			}
+			mUsed := 100.0 - mRem
+			if mUsed < 0 {
+				mUsed = 0
+			}
+			pkgs = append(pkgs, map[string]any{
+				"package_code": m.ID,
+				"package_name": m.ID,
+				"display_name": m.Name,
+				"kind":         "model_quota_pct",
+				"total":        100.0,
+				"remain":       mRem,
+				"used":         mUsed,
+				"total_count":  100,
+				"expired_at":   m.ResetTime,
+				"expired":      m.Exhausted,
+			})
+		}
+		planName := firstNonEmptyStrSvc(status.TierName, status.TierID, "Google AI Code")
+		upd := s.db.Account.UpdateOneID(acc.ID).
+			SetBalanceFetchedAt(time.Now()).
+			ClearBalanceError().
+			SetBalanceRemaining(rem).
+			SetBalanceTotalCredits(100.0).
+			SetBalancePackages(pkgs).
+			SetBalancePlanID(firstNonEmptyStrSvc(status.TierID, planName))
+		if status.EarliestResetAt != "" {
+			if t, tErr := time.Parse(time.RFC3339, status.EarliestResetAt); tErr == nil {
+				upd = upd.SetBalancePeriodEnd(t)
+			}
+		}
+		_, _ = upd.Save(ctx)
+	}
+
+	return &AntigravityAccountModelsOutput{
+		OK:              true,
+		AccountID:       acc.ID,
+		Email:           firstNonEmptyStrSvc(acc.Email, acc.Name),
+		NodeID:          nodeID,
+		ContainerName:   containerName,
+		ProxyURL:        workbuddy.RedactProxyURL(acc.ProxyURL),
+		ProjectID:       status.ProjectID,
+		TierID:          status.TierID,
+		TierName:        status.TierName,
+		Driver:          status.Driver,
+		CLIReady:        status.CLIReady,
+		AvgRemainingPct: status.AvgRemainingPct,
+		EarliestResetAt: status.EarliestResetAt,
+		Models:          status.Models,
+		FetchedAt:       status.FetchedAt,
+		Warning:         status.Warning,
+	}, nil
+}
+
+// TestAntigravityAccountInput 描述针对单个 AntiGravity 账号/容器发起在线测试调用的入参。
+type TestAntigravityAccountInput struct {
+	AccountID    int64
+	Model        string
+	SystemPrompt string
+	Prompt       string
+	TestToolCall bool
+}
+
+// TestAntigravityAccountOutput 描述单容器在线测试调用的详细返回结果。
+type TestAntigravityAccountOutput struct {
+	OK            bool             `json:"ok"`
+	AccountID     int64            `json:"account_id"`
+	NodeID        int64            `json:"node_id,omitempty"`
+	ContainerName string           `json:"container_name,omitempty"`
+	Model         string           `json:"model"`
+	Reply         string           `json:"reply"`
+	Reasoning     string           `json:"reasoning,omitempty"`
+	ToolCalls     []map[string]any `json:"tool_calls,omitempty"`
+	Driver        string           `json:"driver,omitempty"`
+	PromptMode    string           `json:"prompt_mode,omitempty"`
+	LatencyMs     int64            `json:"latency_ms"`
+	ProxyURL      string           `json:"proxy_url,omitempty"`
+	Error         string           `json:"error,omitempty"`
+}
+
+// TestAccountChat 直接穿透至单个 AntiGravity 账号绑定的 1:1 容器执行一次真实对话（或工具调用）验证。
+func (s *AntigravityService) TestAccountChat(ctx context.Context, in TestAntigravityAccountInput) (*TestAntigravityAccountOutput, error) {
+	acc, err := s.db.Account.Query().
+		Where(account.IDEQ(in.AccountID), account.DeletedAtIsNil()).
+		Only(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("查询账号 #%d 失败: %w", in.AccountID, err)
+	}
+	nodeID := extractExtraInt64(acc.Extra, "node_id")
+	var row *ent.ContainerNode
+	if nodeID > 0 {
+		row, _ = s.getNodeRow(ctx, nodeID)
+	}
+	if row == nil {
+		return nil, fmt.Errorf("账号 #%d 尚未绑定专属容器，请先点击自愈启动或补配容器", acc.ID)
+	}
+	spec := s.nodeSpec(row)
+	if strings.TrimSpace(spec.AuthDir) != "" {
+		_, _ = antigravity.EnsureIsolatedADCFile(spec.AuthDir)
+	}
+
+	model := strings.TrimSpace(in.Model)
+	if model == "" {
+		if mList, mErr := s.agClient.Models(ctx, spec); mErr == nil && len(mList) > 0 {
+			model = mList[0].ID
+			for _, pref := range []string{"gemini-3.8-flash-low", "gemini-4-argon-low", "gemini-3.8-flash-medium", "flash"} {
+				for _, m := range mList {
+					if strings.Contains(strings.ToLower(m.ID), pref) {
+						model = m.ID
+						break
+					}
+				}
+				if strings.Contains(strings.ToLower(model), pref) {
+					break
+				}
+			}
+		} else {
+			model = "gemini-3.8-flash-low"
+		}
+	}
+
+	promptText := strings.TrimSpace(in.Prompt)
+	if promptText == "" {
+		if in.TestToolCall {
+			promptText = "Call the get_gateway_ping tool with target=\"cmd2api\" right now. Do not answer in prose before calling the tool."
+		} else {
+			promptText = "请用一句话简短回复：当前节点连通正常，并报出 7 * 8 的结果。"
+		}
+	}
+
+	msgs := make([]map[string]any, 0, 2)
+	if sys := strings.TrimSpace(in.SystemPrompt); sys != "" {
+		msgs = append(msgs, map[string]any{"role": "system", "content": sys})
+	}
+	msgs = append(msgs, map[string]any{"role": "user", "content": promptText})
+
+	reqMap := map[string]any{
+		"model":    model,
+		"messages": msgs,
+		"stream":   true,
+	}
+	if in.TestToolCall {
+		reqMap["tools"] = []map[string]any{
+			{
+				"type": "function",
+				"function": map[string]any{
+					"name":        "get_gateway_ping",
+					"description": "Verify gateway tool calling round-trip",
+					"parameters": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"target": map[string]any{"type": "string"},
+						},
+						"required": []string{"target"},
+					},
+				},
+			},
+		}
+	}
+
+	payload, _ := json.Marshal(reqMap)
+	started := time.Now()
+	testCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	resp, _, chatErr := s.agClient.ChatStreamWithSession(testCtx, spec, payload, "")
+	latency := time.Since(started).Milliseconds()
+	out := &TestAntigravityAccountOutput{
+		AccountID:     acc.ID,
+		NodeID:        row.ID,
+		ContainerName: spec.EffectiveContainerName(),
+		Model:         model,
+		LatencyMs:     latency,
+		ProxyURL:      workbuddy.RedactProxyURL(row.ProxyURL),
+	}
+	if chatErr != nil {
+		out.OK = false
+		out.Error = chatErr.Error()
+		return out, nil
+	}
+	defer resp.Body.Close()
+
+	out.Driver = resp.Header.Get("X-Agy-Driver")
+	out.PromptMode = firstNonEmptyStrSvc(resp.Header.Get("X-Agy-Prompt-Mode"), resp.Header.Get("X-Agy-Prompt-Blend-Mode"))
+
+	var replyBuf, reasonBuf strings.Builder
+	var toolCalls []map[string]any
+	tcByIdx := map[int]map[string]any{}
+
+	rawSSE, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	for _, line := range strings.Split(string(rawSSE), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "data:") {
+			continue
+		}
+		dataPart := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+		if dataPart == "" || dataPart == "[DONE]" {
+			continue
+		}
+		var chunk map[string]any
+		if json.Unmarshal([]byte(dataPart), &chunk) != nil {
+			continue
+		}
+		if errObj, ok := chunk["error"].(map[string]any); ok && errObj != nil {
+			errMsg, _ := errObj["message"].(string)
+			out.OK = false
+			out.Error = firstNonEmptyStrSvc(errMsg, dataPart)
+			return out, nil
+		}
+		choices, _ := chunk["choices"].([]any)
+		for _, chItem := range choices {
+			ch, _ := chItem.(map[string]any)
+			delta, _ := ch["delta"].(map[string]any)
+			if delta == nil {
+				continue
+			}
+			if c, ok := delta["content"].(string); ok {
+				replyBuf.WriteString(c)
+			}
+			if rc, ok := delta["reasoning_content"].(string); ok {
+				reasonBuf.WriteString(rc)
+			}
+			if tcs, ok := delta["tool_calls"].([]any); ok {
+				for _, tcRaw := range tcs {
+					tc, _ := tcRaw.(map[string]any)
+					if tc == nil {
+						continue
+					}
+					idx := int(extractExtraInt64(tc, "index"))
+					cur, exists := tcByIdx[idx]
+					if !exists {
+						cur = map[string]any{"id": "", "name": "", "arguments": ""}
+						tcByIdx[idx] = cur
+					}
+					if idStr, ok := tc["id"].(string); ok && idStr != "" {
+						cur["id"] = idStr
+					}
+					if fn, ok := tc["function"].(map[string]any); ok && fn != nil {
+						if nStr, ok := fn["name"].(string); ok && nStr != "" {
+							cur["name"] = nStr
+						}
+						if aStr, ok := fn["arguments"].(string); ok && aStr != "" {
+							cur["arguments"] = fmt.Sprint(cur["arguments"]) + aStr
+						}
+					}
+				}
+			}
+		}
+	}
+	for i := 0; i < len(tcByIdx); i++ {
+		if item, ok := tcByIdx[i]; ok {
+			toolCalls = append(toolCalls, item)
+		}
+	}
+
+	out.Reply = strings.TrimSpace(replyBuf.String())
+	out.Reasoning = strings.TrimSpace(reasonBuf.String())
+	out.ToolCalls = toolCalls
+	out.OK = out.Reply != "" || len(out.ToolCalls) > 0 || out.Reasoning != ""
+	if !out.OK && out.Error == "" {
+		out.Error = "容器已响应但未返回可见文本或工具调用"
+	}
+	if out.OK {
+		now := time.Now()
+		latInt := int(latency)
+		_, _ = s.db.Account.UpdateOneID(acc.ID).
+			SetLastHealthCheckAt(now).
+			SetLastHealthCheckOk(true).
+			ClearLastHealthCheckError().
+			SetLatencyMs(latInt).
+			SetConsecutiveFailures(0).
+			ClearErrorMessage().
+			Save(ctx)
+	}
+	return out, nil
+}
+
+// UpgradeManagedContainersOnStartup 在服务端启动后异步检测内置单账号容器镜像与运行中容器：
+// 若刚完成版本升级（旧容器缺失最新镜像标签或隔离目录缺失 ADC client_secret），自动补全 ADC 凭证并滚动重建容器，零手工干预。
+func (s *AntigravityService) UpgradeManagedContainersOnStartup(ctx context.Context) {
+	if s == nil || s.db == nil {
+		return
+	}
+	env := s.DetectEnv(ctx)
+	if !env.DockerAvailable {
+		return
+	}
+	rows, err := s.db.ContainerNode.Query().All(ctx)
+	if err != nil || len(rows) == 0 {
+		return
+	}
+
+	var localRows []*ent.ContainerNode
+	for _, r := range rows {
+		if r.Mode == domain.ContainerModeLocalDocker {
+			if strings.TrimSpace(r.AuthDir) != "" {
+				_, _ = antigravity.EnsureIsolatedADCFile(r.AuthDir)
+			}
+			localRows = append(localRows, r)
+		}
+	}
+	if len(localRows) == 0 {
+		return
+	}
+
+	if err := s.docker.EnsureAgyCLIImage(ctx, s.defaultImage); err != nil {
+		s.logger.Warn("启动期自检升级单账号 agy 镜像失败", "err", err)
+		return
+	}
+
+	for _, r := range localRows {
+		if ctx.Err() != nil {
+			return
+		}
+		if r.Status != "running" {
+			continue
+		}
+		if _, rErr := s.RunNodeAction(ctx, r.ID, "start"); rErr != nil {
+			s.logger.Warn("启动期滚动刷新单账号容器失败", "node_id", r.ID, "err", rErr)
+		} else {
+			s.logger.Info("启动期已同步刷新单账号 agy 容器", "node_id", r.ID, "container", r.ContainerName)
+		}
+	}
 }

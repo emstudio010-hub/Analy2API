@@ -220,6 +220,22 @@ func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConf
 			if len(models) == 0 {
 				fetched, err := ListModelsViaCLI(r.Context(), curSpec)
 				if err != nil || len(fetched) == 0 {
+					if qStatus, qErr := fetchBridgeQuotaAndModels(r.Context(), curSpec, bridgePool, &credMu, &cachedTok, &cachedTokExp, &cachedProjID); qErr == nil && qStatus != nil && len(qStatus.Models) > 0 {
+						for _, qm := range qStatus.Models {
+							fetched = append(fetched, ModelItem{
+								ID:                qm.ID,
+								Name:              qm.Name,
+								Vendor:            qm.Vendor,
+								ContextWindow:     qm.ContextWindow,
+								MaxOutputTokens:   qm.MaxOutputTokens,
+								SupportsImages:    qm.SupportsImages,
+								SupportsReasoning: qm.SupportsReasoning,
+								SupportsToolCall:  qm.SupportsToolCall,
+							})
+						}
+					}
+				}
+				if len(fetched) == 0 {
 					logger.Warn("agy models 调用回退内置列表", "err", err)
 					models = DefaultModels()
 				} else {
@@ -358,6 +374,27 @@ func NewAgyBridgeHandlerWithContext(lifecycleCtx context.Context, cfg BridgeConf
 				break
 			}
 		}
+	})
+
+	// 查询单容器内绑定账号的实时套餐层级、可用模型与各模型剩余配额
+	mux.HandleFunc("/v0/management/quota", func(w http.ResponseWriter, r *http.Request) {
+		curSpec := getBaseSpec()
+		if !checkAuth(r, curSpec.ManagementKey, "X-Management-Key") && !checkAuth(r, curSpec.APIKey, "") {
+			http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, `{"error":{"message":"method not allowed"}}`, http.StatusMethodNotAllowed)
+			return
+		}
+		status, err := fetchBridgeQuotaAndModels(r.Context(), curSpec, bridgePool, &credMu, &cachedTok, &cachedTokExp, &cachedProjID)
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(status)
 	})
 
 	// 查询 / 热切换单容器内的 AGY 提示词运行管线模式与预览
@@ -907,4 +944,170 @@ func chatStreamViaBridgeV1Internal(
 	outResp.Header.Set("Content-Type", "text/event-stream; charset=utf-8")
 	outResp.Header.Set("X-Agy-Prompt-Mode", ResolvePromptBlendMode(spec))
 	return outResp, nil
+}
+
+func fetchBridgeQuotaAndModels(
+	ctx context.Context,
+	spec NodeSpec,
+	pool *workbuddy.ProxyPool,
+	credMu *sync.Mutex,
+	cachedTok *string,
+	cachedTokExp *time.Time,
+	cachedProjID *string,
+) (*AccountQuotaStatus, error) {
+	cliBin, cliBinErr := ResolveAgyCLIBinary(spec.CLIBinary)
+	var cliModels []ModelItem
+	if cliBinErr == nil {
+		mCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		cliModels, _ = ListModelsViaCLI(mCtx, spec)
+		cancel()
+	}
+
+	conv, hasCred := loadFirstValidAccountFromDir(spec.AuthDir, spec.ProxyURL)
+	if !hasCred && len(cliModels) == 0 {
+		return nil, errors.New("容器隔离目录尚未写入有效 OAuth 凭证")
+	}
+
+	var status *AccountQuotaStatus
+	var quotaErr error
+	if hasCred {
+		proxyAddr := strings.TrimSpace(spec.ProxyURL)
+		if proxyAddr == "" {
+			proxyAddr = firstNonEmptyStr(os.Getenv("AGY_PROXY_URL"), os.Getenv("HTTPS_PROXY"), os.Getenv("HTTP_PROXY"), os.Getenv("ALL_PROXY"))
+		}
+		var httpCli *http.Client
+		if pool != nil {
+			httpCli, _ = pool.Client(proxyAddr)
+		}
+		if httpCli == nil {
+			httpCli = netx.NewHTTP2Client(25 * time.Second)
+		}
+
+		credMu.Lock()
+		accessTok := *cachedTok
+		projID := *cachedProjID
+		needRefresh := accessTok == "" || (!cachedTokExp.IsZero() && time.Now().Add(2*time.Minute).After(*cachedTokExp))
+		if accessTok == "" && conv.AccessToken != "" && !conv.Expired {
+			accessTok = conv.AccessToken
+			needRefresh = conv.RefreshToken != "" && conv.ExpiryDateMs <= 0
+		}
+		if projID == "" && conv.ProjectID != "" {
+			projID = conv.ProjectID
+			*cachedProjID = projID
+		}
+		tokenEndpoint := strings.TrimSpace(os.Getenv("AGY_OAUTH_TOKEN_URL"))
+		if needRefresh && conv.RefreshToken != "" {
+			refCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			if tokRes, rErr := RefreshGoogleOAuthToken(refCtx, httpCli, conv.ClientID, conv.ClientSecret, conv.RefreshToken, tokenEndpoint); rErr == nil {
+				accessTok = tokRes.AccessToken
+				exp := time.Now().Add(55 * time.Minute)
+				if tokRes.ExpiresIn > 0 {
+					exp = time.Now().Add(time.Duration(tokRes.ExpiresIn) * time.Second)
+				}
+				*cachedTok = accessTok
+				*cachedTokExp = exp
+			} else {
+				quotaErr = rErr
+			}
+			cancel()
+		}
+		credMu.Unlock()
+
+		if accessTok != "" {
+			upstreamBase := strings.TrimRight(strings.TrimSpace(os.Getenv("AGY_UPSTREAM_BASE_URL")), "/")
+			ua := BuildCLIUserAgent("", spec.Fingerprint.OS, spec.Fingerprint.Arch)
+			qCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			status, quotaErr = FetchAntigravityQuotaAndModels(qCtx, httpCli, upstreamBase, accessTok, projID, ua)
+			cancel()
+			if status != nil && status.ProjectID != "" {
+				credMu.Lock()
+				*cachedProjID = status.ProjectID
+				credMu.Unlock()
+			}
+		}
+	}
+
+	if status == nil {
+		if len(cliModels) == 0 && quotaErr != nil {
+			return nil, quotaErr
+		}
+		status = &AccountQuotaStatus{
+			OK:        true,
+			ProjectID: conv.ProjectID,
+			Models:    []ModelQuotaItem{},
+			FetchedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		if quotaErr != nil {
+			status.Warning = quotaErr.Error()
+		}
+	}
+
+	status.CLIBinary = cliBin
+	status.CLIReady = cliBinErr == nil && len(cliModels) > 0
+	if status.CLIReady {
+		status.Driver = "real-agy-cli"
+	} else {
+		status.Driver = "container-http2-v1internal"
+	}
+
+	// 将真实 `agy models` 输出的模型列表与 v1internal 返回的各模型配额融合，确保两边支持的最新模型一个不漏
+	if len(cliModels) > 0 {
+		byID := make(map[string]int, len(status.Models))
+		for i, m := range status.Models {
+			byID[strings.ToLower(m.ID)] = i
+		}
+		for _, cm := range cliModels {
+			key := strings.ToLower(cm.ID)
+			if idx, exists := byID[key]; exists {
+				if cm.Name != "" {
+					status.Models[idx].Name = cm.Name
+				}
+				status.Models[idx].Source = "merged"
+				continue
+			}
+			qItem := ModelQuotaItem{
+				ID:                cm.ID,
+				Name:              cm.Name,
+				Vendor:            cm.Vendor,
+				ContextWindow:     cm.ContextWindow,
+				MaxOutputTokens:   cm.MaxOutputTokens,
+				SupportsImages:    cm.SupportsImages,
+				SupportsReasoning: cm.SupportsReasoning,
+				SupportsToolCall:  cm.SupportsToolCall,
+				Source:            "agy_cli",
+			}
+			// 对同家族推理档位变体（如 gemini-3.8-flash-high 对应 gemini-3.8-flash）自动继承家族配额窗口
+			inheritFamilyQuota(&qItem, status.Models)
+			status.Models = append(status.Models, qItem)
+		}
+		sortModelQuotaItems(status.Models)
+	}
+	return status, nil
+}
+
+func inheritFamilyQuota(dst *ModelQuotaItem, pool []ModelQuotaItem) {
+	if dst == nil || dst.RemainingPct != nil || len(pool) == 0 {
+		return
+	}
+	stem := strings.ToLower(dst.ID)
+	for _, suf := range []string{"-xhigh", "-high", "-medium", "-low", "-thinking"} {
+		stem = strings.TrimSuffix(stem, suf)
+	}
+	for _, cand := range pool {
+		if cand.RemainingPct == nil {
+			continue
+		}
+		cl := strings.ToLower(cand.ID)
+		if cl == stem || strings.HasPrefix(cl, stem) || strings.HasPrefix(stem, cl) {
+			pct := *cand.RemainingPct
+			dst.RemainingPct = &pct
+			if cand.RemainingFraction != nil {
+				rf := *cand.RemainingFraction
+				dst.RemainingFraction = &rf
+			}
+			dst.ResetTime = cand.ResetTime
+			dst.Exhausted = cand.Exhausted
+			return
+		}
+	}
 }

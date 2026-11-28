@@ -1,5 +1,5 @@
 ============================================================
-  Analy2API v1.2.1 — Windows (amd64) 发行包快速指南
+  Analy2API v1.2.2 — Windows (amd64) 发行包快速指南
 ============================================================
 
 1. 零配置一键启动
@@ -23,5 +23,5 @@
    - Codex Responses:http://127.0.0.1:8080/v1/responses
 
 5. AntiGravity (AGY) 默认策略（可通过 .env 调节）
-   - AGY_SESSION_RETENTION=stateless   每轮请求结束自动清理磁盘会话，零磁盘占用
-   - AGY_PROMPT_BLEND_MODE=blend_clean 净化版 AGY 原生底本 + 后接下游提示词
+   - AGY_SESSION_RETENTION=stateless              每轮请求结束自动清理磁盘会话，零磁盘占用
+   - AGY_PROMPT_MODE=default_intercept_continue   默认提示词 -> 双向拦截 -> 下游接续

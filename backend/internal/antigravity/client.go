@@ -923,9 +923,9 @@ func (c *Client) ChatStreamWithSession(ctx context.Context, spec NodeSpec, opena
 	if strings.TrimSpace(spec.SessionRetention) != "" {
 		hdrs.Set("X-Agy-Session-Retention", NormalizeSessionRetention(spec.SessionRetention))
 	}
-	if strings.TrimSpace(spec.PromptBlendMode) != "" {
-		hdrs.Set("X-Agy-Prompt-Blend-Mode", NormalizePromptBlendMode(spec.PromptBlendMode))
-	}
+	effMode := ResolvePromptBlendMode(spec)
+	hdrs.Set("X-Agy-Prompt-Mode", effMode)
+	hdrs.Set("X-Agy-Prompt-Blend-Mode", effMode)
 
 	resp, err := c.sendNodeRequest(ctx, spec, http.MethodPost, "/v1/chat/completions", patchedBody, hdrs)
 	if err != nil {
@@ -973,19 +973,56 @@ func ensureStreamingPayload(openaiBody []byte) ([]byte, error) {
 	return encoded, nil
 }
 
-// DefaultModels 返回 AntiGravity / CLIProxyAPI 权威旗舰兜底模型目录。
+// FetchQuotaStatus 查询单个 AntiGravity 容器或节点的实时套餐层级、支持模型与各模型剩余额度百分比。
+func (c *Client) FetchQuotaStatus(ctx context.Context, spec NodeSpec) (*AccountQuotaStatus, error) {
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 25*time.Second)
+		defer cancel()
+	}
+
+	if !IsLocalCLITarget(spec) && !IsNativeV1InternalTarget(spec) {
+		raw, _, err := c.doJSONRequest(ctx, spec, http.MethodGet, "/v0/management/quota", nil, managementHeaders(spec))
+		if err == nil && len(bytes.TrimSpace(raw)) > 0 {
+			var status AccountQuotaStatus
+			if json.Unmarshal(raw, &status) == nil && (status.OK || len(status.Models) > 0) {
+				return &status, nil
+			}
+		}
+	}
+
+	// 兜底：当容器尚未重启到包含 /v0/management/quota 的新镜像或处于停止状态时，直接用本地隔离目录凭证经节点专属代理查询 Google
+	var credMu sync.Mutex
+	var tok, proj string
+	var tokExp time.Time
+	return fetchBridgeQuotaAndModels(ctx, spec, c.pool, &credMu, &tok, &tokExp, &proj)
+}
+
+// DefaultModels 返回真实官方 AntiGravity CLI (`agy`) 当前支持的权威模型目录（严禁编造虚构模型名）。
 func DefaultModels() []ModelItem {
 	base := []ModelItem{
+		{ID: "gemini-4-neon-high", Name: "Gemini 4 Neon (High)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-neon-xhigh", Name: "Gemini 4 Neon (XHigh)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-neon-medium", Name: "Gemini 4 Neon (Medium)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-neon-low", Name: "Gemini 4 Neon (Low)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-carbon-high", Name: "Gemini 4 Carbon (High)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-carbon-medium", Name: "Gemini 4 Carbon (Medium)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-carbon-low", Name: "Gemini 4 Carbon (Low)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-hydrogen-high", Name: "Gemini 4 Hydrogen (High)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-hydrogen-xhigh", Name: "Gemini 4 Hydrogen (XHigh)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-hydrogen-medium", Name: "Gemini 4 Hydrogen (Medium)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-hydrogen-low", Name: "Gemini 4 Hydrogen (Low)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-argon-high", Name: "Gemini 4 Argon (High)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-argon-medium", Name: "Gemini 4 Argon (Medium)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-4-argon-low", Name: "Gemini 4 Argon (Low)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-3.8-flash-high", Name: "Gemini 3.8 Flash (High)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-3.8-flash-medium", Name: "Gemini 3.8 Flash (Medium)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gemini-3.8-flash-low", Name: "Gemini 3.8 Flash (Low)", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6 (Thinking)", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "claude-opus-4-6-thinking", Name: "Claude Opus 4.6 (Thinking)", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
+		{ID: "gpt-oss-120b-medium", Name: "GPT-OSS 120B (Medium)", Vendor: "openai", ContextWindow: 131072, MaxOutputTokens: 32768, SupportsImages: false, SupportsReasoning: true, SupportsToolCall: true},
 		{ID: "gemini-2.5-pro", Name: "Gemini 2.5 Pro", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
 		{ID: "gemini-2.5-flash", Name: "Gemini 2.5 Flash", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "gemini-3.1-pro", Name: "Gemini 3.1 Pro", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "gemini-3.5-flash", Name: "Gemini 3.5 Flash", Vendor: "google", ContextWindow: 1048576, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "claude-sonnet-4-6", Name: "Claude Sonnet 4.6", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "claude-opus-4-6", Name: "Claude Opus 4.6", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "claude-sonnet-4-5", Name: "Claude Sonnet 4.5", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "claude-haiku-4-5", Name: "Claude Haiku 4.5", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 64000, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "gpt-5", Name: "GPT-5", Vendor: "openai", ContextWindow: 400000, MaxOutputTokens: 32768, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
-		{ID: "gpt-5.3-codex", Name: "GPT-5.3 Codex", Vendor: "openai", ContextWindow: 400000, MaxOutputTokens: 65536, SupportsImages: true, SupportsReasoning: true, SupportsToolCall: true},
 	}
 	out := make([]ModelItem, len(base))
 	copy(out, base)
@@ -1122,7 +1159,7 @@ func inferModelVendor(modelID, rawVendor string) string {
 func defaultModelLimits(lowerID, vendor string) (ctxWin int, maxOut int) {
 	switch vendor {
 	case "google":
-		if strings.HasPrefix(lowerID, "gemini-2") || strings.HasPrefix(lowerID, "gemini-3") || strings.Contains(lowerID, "1.5-pro") {
+		if strings.HasPrefix(lowerID, "gemini-2") || strings.HasPrefix(lowerID, "gemini-3") || strings.HasPrefix(lowerID, "gemini-4") || strings.Contains(lowerID, "1.5-pro") {
 			return 1048576, 65536
 		}
 		return 1048576, 32768
@@ -1180,11 +1217,11 @@ func inferSupportsReasoning(lowerID, vendor string, m map[string]any) bool {
 	}
 	switch vendor {
 	case "google":
-		return strings.HasPrefix(lowerID, "gemini-2.5") || strings.HasPrefix(lowerID, "gemini-3")
+		return strings.HasPrefix(lowerID, "gemini-2.5") || strings.HasPrefix(lowerID, "gemini-3") || strings.HasPrefix(lowerID, "gemini-4") || strings.Contains(lowerID, "orchestrator")
 	case "anthropic":
 		return strings.Contains(lowerID, "-4") || strings.Contains(lowerID, "3-7") || strings.Contains(lowerID, "3.7")
 	case "openai":
-		return strings.HasPrefix(lowerID, "gpt-5") || strings.Contains(lowerID, "codex") ||
+		return strings.HasPrefix(lowerID, "gpt-oss") || strings.HasPrefix(lowerID, "gpt-5") || strings.Contains(lowerID, "codex") ||
 			strings.HasPrefix(lowerID, "o1") || strings.HasPrefix(lowerID, "o3") || strings.HasPrefix(lowerID, "o4")
 	case "deepseek":
 		return strings.Contains(lowerID, "r1") || strings.Contains(lowerID, "v4")

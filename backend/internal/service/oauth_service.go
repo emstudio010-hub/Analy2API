@@ -1061,11 +1061,9 @@ func (s *OAuthService) resolveOrEnsurePlatformGroup(ctx context.Context, platfor
 		SetName(name).
 		SetDescription(platform + " OAuth 默认调度分组").
 		SetPlatform(platform).
+		SetPromptInjectMode(domain.PromptModeAppendGlobal).
 		SetRateMultiplier(1.0).
 		SetStatus(domain.StatusActive)
-	if platform == domain.PlatformAntigravity {
-		createBuilder = createBuilder.SetPromptInjectMode(domain.PromptModeOff)
-	}
 	created, cErr := createBuilder.Save(ctx)
 	if cErr != nil {
 		return nil, fmt.Errorf("自动创建 %s 默认分组失败: %w", platform, cErr)

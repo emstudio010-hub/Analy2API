@@ -1111,3 +1111,257 @@ func LoadCodeAssist(ctx context.Context, httpClient *http.Client, baseURL, acces
 	}
 	return res, nil
 }
+
+// ModelQuotaItem 描述单个 AntiGravity 模型的实时支持状态与剩余配额。
+type ModelQuotaItem struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	Vendor            string   `json:"vendor,omitempty"`
+	RemainingFraction *float64 `json:"remaining_fraction,omitempty"` // 0.0 ~ 1.0
+	RemainingPct      *float64 `json:"remaining_pct,omitempty"`      // 0.0 ~ 100.0
+	ResetTime         string   `json:"reset_time,omitempty"`
+	Exhausted         bool     `json:"exhausted"`
+	ContextWindow     int      `json:"context_window,omitempty"`
+	MaxOutputTokens   int      `json:"max_output_tokens,omitempty"`
+	SupportsImages    bool     `json:"supports_images"`
+	SupportsReasoning bool     `json:"supports_reasoning"`
+	SupportsToolCall  bool     `json:"supports_tool_call"`
+	Source            string   `json:"source,omitempty"` // "agy_cli" | "v1internal" | "merged"
+}
+
+// AccountQuotaStatus 描述单个 AntiGravity 账号/容器的套餐层级、ProjectID、实时模型列表与各模型剩余额度。
+type AccountQuotaStatus struct {
+	OK               bool             `json:"ok"`
+	ProjectID        string           `json:"project_id,omitempty"`
+	TierID           string           `json:"tier_id,omitempty"`
+	TierName         string           `json:"tier_name,omitempty"`
+	CLIReady         bool             `json:"cli_ready"`
+	CLIBinary        string           `json:"cli_binary,omitempty"`
+	Driver           string           `json:"driver,omitempty"`
+	AvgRemainingPct  *float64         `json:"avg_remaining_pct,omitempty"`
+	MinRemainingPct  *float64         `json:"min_remaining_pct,omitempty"`
+	EarliestResetAt  string           `json:"earliest_reset_at,omitempty"`
+	Models           []ModelQuotaItem `json:"models"`
+	FetchedAt        string           `json:"fetched_at"`
+	Warning          string           `json:"warning,omitempty"`
+}
+
+// FetchAntigravityQuotaAndModels 通过 HTTP/2 调用官方 `loadCodeAssist` 与 `fetchAvailableModels`，
+// 获取当前 OAuth 账号真实的套餐层级（Free / Pro / Ultra）、ProjectID、可用模型目录与每个模型的实时剩余额度百分比及重置时间。
+func FetchAntigravityQuotaAndModels(
+	ctx context.Context,
+	httpClient *http.Client,
+	baseURL string,
+	accessToken string,
+	projectID string,
+	userAgent string,
+) (*AccountQuotaStatus, error) {
+	tok := strings.TrimSpace(accessToken)
+	if tok == "" {
+		return nil, errors.New("access_token 不能为空")
+	}
+	if httpClient == nil {
+		httpClient = netx.NewHTTP2Client(25 * time.Second)
+	}
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if base == "" {
+		base = AntigravityProdBaseURL
+	}
+	ua := strings.TrimSpace(userAgent)
+	if ua == "" {
+		ua = BuildCLIUserAgent("", "", "")
+	}
+
+	out := &AccountQuotaStatus{
+		OK:        true,
+		ProjectID: strings.TrimSpace(projectID),
+		Models:    []ModelQuotaItem{},
+		FetchedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	if ca, caErr := LoadCodeAssist(ctx, httpClient, base, tok, ua); caErr == nil && ca != nil {
+		if ca.ProjectID != "" {
+			out.ProjectID = ca.ProjectID
+		}
+		out.TierID = ca.TierID
+		out.TierName = ca.TierName
+	}
+
+	reqMap := map[string]any{}
+	if out.ProjectID != "" {
+		reqMap["project"] = out.ProjectID
+	}
+	reqBytes, _ := json.Marshal(reqMap)
+
+	resp, err := netx.DoWithEOFRetry(ctx, httpClient, func() (*http.Request, error) {
+		req, rErr := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v1internal:fetchAvailableModels", bytes.NewReader(reqBytes))
+		if rErr != nil {
+			return nil, rErr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("User-Agent", ua)
+		return req, nil
+	}, 2)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, fmt.Errorf("fetchAvailableModels HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
+	}
+
+	var parsed struct {
+		Models map[string]map[string]any `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return nil, fmt.Errorf("解析 fetchAvailableModels JSON 失败: %w", err)
+	}
+
+	var sumPct float64
+	var pctCount int
+	var minPct float64 = 101
+	var earliestReset string
+
+	for modelID, meta := range parsed.Models {
+		id := strings.TrimSpace(modelID)
+		if id == "" || meta == nil {
+			continue
+		}
+		lowerID := strings.ToLower(id)
+		if strings.Contains(lowerID, "embedding") || strings.Contains(lowerID, "tab_") || strings.Contains(lowerID, "autocomplete") {
+			continue
+		}
+		mCopy := make(map[string]any, len(meta)+1)
+		for k, v := range meta {
+			mCopy[k] = v
+		}
+		mCopy["id"] = id
+		inferred, ok := InferModelItem(mCopy)
+		if !ok {
+			continue
+		}
+		qi := ModelQuotaItem{
+			ID:                inferred.ID,
+			Name:              inferred.Name,
+			Vendor:            inferred.Vendor,
+			ContextWindow:     inferred.ContextWindow,
+			MaxOutputTokens:   inferred.MaxOutputTokens,
+			SupportsImages:    inferred.SupportsImages,
+			SupportsReasoning: inferred.SupportsReasoning,
+			SupportsToolCall:  inferred.SupportsToolCall,
+			Source:            "v1internal",
+		}
+		if qRaw, ok := meta["quotaInfo"].(map[string]any); ok && qRaw != nil {
+			if rfVal, hasRF := parseOptionalFloat64(qRaw["remainingFraction"]); hasRF {
+				if rfVal < 0 {
+					rfVal = 0
+				}
+				if rfVal > 1 {
+					rfVal = 1
+				}
+				pct := float64(int(rfVal*1000+0.5)) / 10.0
+				qi.RemainingFraction = &rfVal
+				qi.RemainingPct = &pct
+				qi.Exhausted = rfVal <= 0
+				sumPct += pct
+				pctCount++
+				if pct < minPct {
+					minPct = pct
+				}
+			} else if exh, ok := qRaw["isExhausted"].(bool); ok && exh {
+				zero := 0.0
+				qi.RemainingFraction = &zero
+				qi.RemainingPct = &zero
+				qi.Exhausted = true
+				pctCount++
+				minPct = 0
+			}
+			if rt, ok := qRaw["resetTime"].(string); ok && strings.TrimSpace(rt) != "" {
+				qi.ResetTime = strings.TrimSpace(rt)
+				if earliestReset == "" || qi.ResetTime < earliestReset {
+					earliestReset = qi.ResetTime
+				}
+			}
+		}
+		out.Models = append(out.Models, qi)
+	}
+
+	sortModelQuotaItems(out.Models)
+	if pctCount > 0 {
+		avg := float64(int((sumPct/float64(pctCount))*10+0.5)) / 10.0
+		out.AvgRemainingPct = &avg
+		if minPct <= 100 {
+			out.MinRemainingPct = &minPct
+		}
+	}
+	out.EarliestResetAt = earliestReset
+	return out, nil
+}
+
+func parseOptionalFloat64(v any) (float64, bool) {
+	switch typed := v.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case json.Number:
+		f, err := typed.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func sortModelQuotaItems(items []ModelQuotaItem) {
+	for i := 0; i < len(items); i++ {
+		for j := i + 1; j < len(items); j++ {
+			ri := modelSortRank(items[i].ID)
+			rj := modelSortRank(items[j].ID)
+			if ri != rj {
+				if rj < ri {
+					items[i], items[j] = items[j], items[i]
+				}
+				continue
+			}
+			if items[j].ID < items[i].ID {
+				items[i], items[j] = items[j], items[i]
+			}
+		}
+	}
+}
+
+func modelSortRank(id string) int {
+	l := strings.ToLower(id)
+	switch {
+	case strings.HasPrefix(l, "gemini-4-neon"):
+		return 10
+	case strings.HasPrefix(l, "gemini-4-carbon"):
+		return 11
+	case strings.HasPrefix(l, "gemini-4-hydrogen"):
+		return 12
+	case strings.HasPrefix(l, "gemini-4-argon"):
+		return 13
+	case strings.HasPrefix(l, "claude-opus"):
+		return 20
+	case strings.HasPrefix(l, "claude-sonnet"):
+		return 21
+	case strings.HasPrefix(l, "gemini-3.8-flash"):
+		return 30
+	case strings.HasPrefix(l, "gemini-3"):
+		return 35
+	case strings.HasPrefix(l, "gpt-oss"):
+		return 40
+	default:
+		return 50
+	}
+}

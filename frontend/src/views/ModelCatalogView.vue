@@ -728,7 +728,7 @@ onBeforeUnmount(() => {
           <span>{{ priceError }}</span>
         </p>
 
-        <Field label="模型 ID (model)" required :hint="editingRow ? '精确绑定此模型标识' : '例如 claude-sonnet-4-6 或 gpt-5.3-codex'">
+        <Field label="模型 ID (model)" required :hint="editingRow ? '精确绑定此模型标识' : '例如 claude-sonnet-4-6 或 gemini-4-neon-high'">
           <Input
             v-model="priceForm.model"
             mono

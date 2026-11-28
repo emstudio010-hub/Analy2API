@@ -36,7 +36,7 @@ import (
 var (
 	// AppName、Version、GitCommit 与 BuildTime 支持在发行编译阶段通过 -ldflags 注入。
 	AppName   = "Analy2API"
-	Version   = "1.2.1"
+	Version   = "1.2.2"
 	GitCommit = "dev"
 	BuildTime = ""
 )
@@ -228,6 +228,7 @@ func run() error {
 
 	go cronService.Start(ctx)
 	go proxyPoolService.Start(ctx)
+	go antigravityService.UpgradeManagedContainersOnStartup(ctx)
 
 	h := handler.New(client, vault, issuer, sched, relayService, accountService, cfg, logger, filterService)
 	h.SetCronService(cronService)

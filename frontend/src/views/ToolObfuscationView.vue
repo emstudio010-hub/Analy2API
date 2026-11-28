@@ -534,7 +534,7 @@ const SAMPLE_JSON_BY_PROTO: Record<'openai' | 'anthropic' | 'responses', string>
   ),
   responses: JSON.stringify(
     {
-      model: 'gpt-5.3-codex',
+      model: 'gemini-4-neon-high',
       tools: [
         {
           type: 'function',

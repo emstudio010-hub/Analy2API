@@ -1222,3 +1222,57 @@ func (h *Handler) PreviewAntigravityPromptModes(c *gin.Context) {
 	preview := antigravity.PreviewPromptModeWithUser(targetMode, req.DownstreamSystem, req.UserMessage, hasTools)
 	c.JSON(http.StatusOK, preview)
 }
+
+// GetAntigravityAccountModels 查询单个 AntiGravity 账号支持的模型、套餐层级与各模型实时剩余额度（GET /api/antigravity/accounts/:id/models）。
+func (h *Handler) GetAntigravityAccountModels(c *gin.Context) {
+	ag := h.antigravitySvc()
+	if ag == nil {
+		fail(c, http.StatusServiceUnavailable, "AntiGravity 服务未启用")
+		return
+	}
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	out, err := ag.GetAccountModelsAndQuota(c.Request.Context(), id)
+	if err != nil {
+		fail(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+type testAntigravityAccountChatRequest struct {
+	Model        string `json:"model"`
+	SystemPrompt string `json:"system_prompt"`
+	Prompt       string `json:"prompt"`
+	TestToolCall bool   `json:"test_tool_call"`
+}
+
+// TestAntigravityAccountChat 直接测试单个 AntiGravity 账号专属容器的对话与工具调用能力（POST /api/antigravity/accounts/:id/test）。
+func (h *Handler) TestAntigravityAccountChat(c *gin.Context) {
+	ag := h.antigravitySvc()
+	if ag == nil {
+		fail(c, http.StatusServiceUnavailable, "AntiGravity 服务未启用")
+		return
+	}
+	id, ok := pathID(c)
+	if !ok {
+		return
+	}
+	var req testAntigravityAccountChatRequest
+	_ = c.ShouldBindJSON(&req)
+
+	out, err := ag.TestAccountChat(c.Request.Context(), service.TestAntigravityAccountInput{
+		AccountID:    id,
+		Model:        req.Model,
+		SystemPrompt: req.SystemPrompt,
+		Prompt:       req.Prompt,
+		TestToolCall: req.TestToolCall,
+	})
+	if err != nil {
+		fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, out)
+}

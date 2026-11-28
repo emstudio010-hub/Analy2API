@@ -120,6 +120,17 @@ func (s *PromptService) EnsureSeeded(ctx context.Context) error {
 	if err := s.ensureSettingDefault(ctx, SettingKeyGlobalPromptContent, prompt.DefaultGlobalPrompt(), "全局底线系统提示词正文"); err != nil {
 		return err
 	}
+	// 平滑迁移旧版自动创建的 antigravity 默认分组：若仍处于旧默认文案且未手写分组提示词，自动对齐为 append_global，避免 WB 开了而 AGY 没开
+	_, _ = s.db.Group.Update().
+		Where(
+			group.DeletedAtIsNil(),
+			group.PlatformEQ(domain.PlatformAntigravity),
+			group.PromptInjectModeEQ(domain.PromptModeOff),
+			group.DescriptionContains("默认关闭额外提示词注入"),
+		).
+		SetPromptInjectMode(domain.PromptModeAppendGlobal).
+		SetDescription("默认 AntiGravity 容器池分组").
+		Save(ctx)
 	return s.ReloadEngine(ctx)
 }
 

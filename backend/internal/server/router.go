@@ -101,6 +101,8 @@ func NewRouter(opts Options) *gin.Engine {
 			admin.POST("/antigravity/oauth/callback", h.CompleteAntigravityDirectOAuthCallback)
 			admin.POST("/antigravity/accounts/:id/provision-container", h.ProvisionAntigravityAccountContainer)
 			admin.POST("/antigravity/accounts/:id/swap-ip", h.SwapAntigravityAccountIP)
+			admin.GET("/antigravity/accounts/:id/models", h.GetAntigravityAccountModels)
+			admin.POST("/antigravity/accounts/:id/test", h.TestAntigravityAccountChat)
 			admin.POST("/antigravity/accounts/convert", h.ConvertAntigravityAccounts)
 			admin.GET("/antigravity/prompt-modes", h.GetAntigravityPromptModes)
 			admin.PUT("/antigravity/prompt-modes", h.UpdateAntigravityPromptModes)

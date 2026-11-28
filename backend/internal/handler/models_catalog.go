@@ -149,34 +149,8 @@ func (h *Handler) GetModelCatalog(c *gin.Context) {
 		}
 	}
 
-	// 1. 先灌入四平台内置基准目录，保证无账号或离线环境下目录依然完整可读。
-	for _, wm := range workbuddy.DefaultModels() {
-		addModel(domain.PlatformWorkBuddy, relay.Model{
-			ID:                wm.ID,
-			Name:              wm.Name,
-			Vendor:            wm.Vendor,
-			ContextWindow:     wm.ContextWindow,
-			MaxOutputTokens:   wm.MaxOutputTokens,
-			SupportsImages:    wm.SupportsImages,
-			SupportsReasoning: wm.SupportsReasoning,
-			SupportsToolCall:  wm.SupportsToolCall,
-		})
-	}
-	for _, am := range antigravity.DefaultModels() {
-		addModel(domain.PlatformAntigravity, relay.Model{
-			ID:                am.ID,
-			Name:              am.Name,
-			Vendor:            am.Vendor,
-			ContextWindow:     am.ContextWindow,
-			MaxOutputTokens:   am.MaxOutputTokens,
-			SupportsImages:    am.SupportsImages,
-			SupportsReasoning: am.SupportsReasoning,
-			SupportsToolCall:  am.SupportsToolCall,
-		})
-	}
-	seedCommandAndOpenCodeCatalog(addModel)
-
-	// 2. 若 relay 服务已注入，从各平台动态拉取实时模型列表合并叠加。
+	// 1. 优先从已配置活跃账号的平台实时拉取真实支持的模型列表，避免塞入无关或虚构的静态模型名。
+	liveLoaded := map[string]bool{}
 	if h.relay != nil {
 		fetchTimeout := 10 * time.Second
 		if refresh {
@@ -184,6 +158,10 @@ func (h *Handler) GetModelCatalog(c *gin.Context) {
 		}
 		for _, p := range allPlatforms {
 			if filterPlat != "" && p != filterPlat {
+				continue
+			}
+			// 仅对当前已有活跃账号的平台（或用户显式筛选的平台）拉取实时模型
+			if activeAccByPlat[p] == 0 && filterPlat == "" {
 				continue
 			}
 			pCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
@@ -195,9 +173,46 @@ func (h *Handler) GetModelCatalog(c *gin.Context) {
 				}
 				continue
 			}
-			for _, lm := range liveModels {
-				addModel(p, lm)
+			if len(liveModels) > 0 {
+				liveLoaded[p] = true
+				for _, lm := range liveModels {
+					addModel(p, lm)
+				}
 			}
+		}
+	}
+
+	// 2. 兜底基准：仅当尚无任何实时模型返回（如全新空库离线环境）或显式按某平台查看时，补充真实官方兜底模型。
+	totalActiveAccounts := 0
+	for _, cnt := range activeAccByPlat {
+		totalActiveAccounts += cnt
+	}
+	if !liveLoaded[domain.PlatformWorkBuddy] && (totalActiveAccounts == 0 || activeAccByPlat[domain.PlatformWorkBuddy] > 0 || filterPlat == domain.PlatformWorkBuddy) {
+		for _, wm := range workbuddy.DefaultModels() {
+			addModel(domain.PlatformWorkBuddy, relay.Model{
+				ID:                wm.ID,
+				Name:              wm.Name,
+				Vendor:            wm.Vendor,
+				ContextWindow:     wm.ContextWindow,
+				MaxOutputTokens:   wm.MaxOutputTokens,
+				SupportsImages:    wm.SupportsImages,
+				SupportsReasoning: wm.SupportsReasoning,
+				SupportsToolCall:  wm.SupportsToolCall,
+			})
+		}
+	}
+	if !liveLoaded[domain.PlatformAntigravity] && (totalActiveAccounts == 0 || activeAccByPlat[domain.PlatformAntigravity] > 0 || filterPlat == domain.PlatformAntigravity) {
+		for _, am := range antigravity.DefaultModels() {
+			addModel(domain.PlatformAntigravity, relay.Model{
+				ID:                am.ID,
+				Name:              am.Name,
+				Vendor:            am.Vendor,
+				ContextWindow:     am.ContextWindow,
+				MaxOutputTokens:   am.MaxOutputTokens,
+				SupportsImages:    am.SupportsImages,
+				SupportsReasoning: am.SupportsReasoning,
+				SupportsToolCall:  am.SupportsToolCall,
+			})
 		}
 	}
 

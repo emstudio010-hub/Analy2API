@@ -146,7 +146,7 @@ curl -N "${origin}/v1/messages" \\
       note: '支持推理思考块透传、工具调用与 instructions 自动风控清洗。',
       snippet: `# 1. ~/.codex/config.toml
 model_provider = "analy2api"
-model = "gpt-5.3-codex"
+model = "gemini-4-neon-high"
 
 [model_providers.analy2api]
 name = "Analy2API Gateway"
@@ -162,7 +162,7 @@ codex
 curl -sS "${origin}/v1/responses" \\
   -H "Authorization: Bearer ${key}" \\
   -H "Content-Type: application/json" \\
-  -d '{"model":"gpt-5.3-codex","input":"Write a quick sort in Go","stream":false}'`,
+  -d '{"model":"gemini-4-neon-high","input":"Write a quick sort in Go","stream":false}'`,
     }
   }
 

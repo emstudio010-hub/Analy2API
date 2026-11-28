@@ -433,6 +433,8 @@ func WriteIsolatedAGYAuthFiles(authDir string, acc ConvertedAGYAccount, primaryA
 		}
 		written = append(written, rel)
 	}
+	// 预创建 agy CLI 启动时检查的会话目录，避免首轮日志打印目录不存在告警
+	_ = os.MkdirAll(filepath.Join(absDir, ".gemini", "antigravity", "conversations"), 0o755)
 	return written, nil
 }
 
@@ -2192,12 +2194,17 @@ func rebuildAccountAGYFiles(acc *ConvertedAGYAccount, usedFilenames map[string]i
 		"auth.json":                    mustMarshalPrettyJSON(canonicalAuth),
 	}
 
-	// 4. `.config/gcloud/application_default_credentials.json` — 标准 Google ADC 凭证（供 XDG_CONFIG_HOME / ADC 链路识别）
+	// 4. `.config/gcloud/application_default_credentials.json` — 标准 Google ADC 凭证（供无头容器 AGY_ADC_AUTH=1 原生登录直读）
 	if acc.RefreshToken != "" {
+		effCID := firstNonEmptyAdapterStr(acc.ClientID, OfficialOAuthClientID)
+		effCSec := strings.TrimSpace(acc.ClientSecret)
+		if effCSec == "" && effCID == OfficialOAuthClientID {
+			effCSec = EffectiveOAuthClientSecret()
+		}
 		adc := map[string]any{
 			"type":          "authorized_user",
-			"client_id":     firstNonEmptyAdapterStr(acc.ClientID, OfficialOAuthClientID),
-			"client_secret": acc.ClientSecret,
+			"client_id":     effCID,
+			"client_secret": effCSec,
 			"refresh_token": acc.RefreshToken,
 		}
 		if acc.ProjectID != "" {

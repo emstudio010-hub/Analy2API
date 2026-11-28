@@ -100,12 +100,24 @@ func buildIsolatedCLIEnv(spec NodeSpec) []string {
 		if abs, err := filepath.Abs(authDir); err == nil {
 			authDir = abs
 		}
-		_ = os.MkdirAll(authDir, 0o755)
+		_ = os.MkdirAll(filepath.Join(authDir, ".gemini", "antigravity", "conversations"), 0o755)
 		filtered = append(filtered,
 			"HOME="+authDir,
 			"USERPROFILE="+authDir,
 			"XDG_CONFIG_HOME="+filepath.Join(authDir, ".config"),
 		)
+		if adcPath, projID := EnsureIsolatedADCFile(authDir); adcPath != "" {
+			filtered = append(filtered,
+				"AGY_ADC_AUTH=1",
+				"GOOGLE_APPLICATION_CREDENTIALS="+adcPath,
+			)
+			if effProj := firstNonEmptyStr(spec.ProjectID, projID); effProj != "" {
+				filtered = append(filtered,
+					"ANTIGRAVITY_PROJECT_ID="+effProj,
+					"GOOGLE_CLOUD_PROJECT="+effProj,
+				)
+			}
+		}
 	}
 	if proxy != "" && !clearProxy {
 		filtered = append(filtered,
@@ -129,6 +141,63 @@ func buildIsolatedCLIEnv(spec NodeSpec) []string {
 	)
 	// 强制 agy CLI Go 运行时始终启用 HTTP/2 客户端连接 Google（移除宿主机可能残留的 http2client=0）
 	return netx.EnsureGODEBUGHTTP2(filtered)
+}
+
+// EnsureIsolatedADCFile 确保隔离目录中存在可供无头 agy CLI (`AGY_ADC_AUTH=1`) 直接刷新的标准 ADC 文件：
+// 若旧容器挂载目录中尚未生成该文件或其 client_secret 为空，会自动从同目录 auth JSON 补全并原子落盘。
+func EnsureIsolatedADCFile(authDir string) (string, string) {
+	dir := strings.TrimSpace(authDir)
+	if dir == "" || isHostPersonalGeminiOrHomeDir(dir) {
+		return "", ""
+	}
+	adcPath := filepath.Join(dir, ".config", "gcloud", "application_default_credentials.json")
+	if raw, err := os.ReadFile(adcPath); err == nil && len(raw) > 0 {
+		var m map[string]any
+		if json.Unmarshal(raw, &m) == nil && m != nil {
+			rt, _ := m["refresh_token"].(string)
+			cs, _ := m["client_secret"].(string)
+			cid, _ := m["client_id"].(string)
+			qp, _ := m["quota_project_id"].(string)
+			if strings.TrimSpace(rt) != "" && strings.TrimSpace(cs) != "" {
+				return adcPath, strings.TrimSpace(qp)
+			}
+			if strings.TrimSpace(rt) != "" && (cid == "" || cid == OfficialOAuthClientID) {
+				m["type"] = "authorized_user"
+				m["client_id"] = OfficialOAuthClientID
+				m["client_secret"] = EffectiveOAuthClientSecret()
+				if fixed, mErr := json.MarshalIndent(m, "", "  "); mErr == nil {
+					_ = os.MkdirAll(filepath.Dir(adcPath), 0o755)
+					_ = atomicWriteFile(adcPath, fixed, 0o600)
+					return adcPath, strings.TrimSpace(qp)
+				}
+			}
+		}
+	}
+
+	// 从 authDir 下的 *.json 或 .gemini/oauth_creds.json 自动合成 ADC 文件
+	if conv, ok := loadFirstValidAccountFromDir(dir, ""); ok && conv.RefreshToken != "" {
+		effCID := firstNonEmptyStr(conv.ClientID, OfficialOAuthClientID)
+		effCSec := strings.TrimSpace(conv.ClientSecret)
+		if effCSec == "" && effCID == OfficialOAuthClientID {
+			effCSec = EffectiveOAuthClientSecret()
+		}
+		adc := map[string]any{
+			"type":          "authorized_user",
+			"client_id":     effCID,
+			"client_secret": effCSec,
+			"refresh_token": conv.RefreshToken,
+		}
+		if conv.ProjectID != "" {
+			adc["quota_project_id"] = conv.ProjectID
+		}
+		if encoded, mErr := json.MarshalIndent(adc, "", "  "); mErr == nil {
+			_ = os.MkdirAll(filepath.Dir(adcPath), 0o755)
+			if atomicWriteFile(adcPath, encoded, 0o600) == nil {
+				return adcPath, conv.ProjectID
+			}
+		}
+	}
+	return "", ""
 }
 
 // ListModelsViaCLI 调用真实 `agy models` 命令解析当前 CLI 客户端的真实可用模型列表。

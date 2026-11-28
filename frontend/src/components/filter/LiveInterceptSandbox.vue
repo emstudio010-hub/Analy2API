@@ -104,7 +104,7 @@ async function runPipelinePreview(): Promise<void> {
     const fallbackJsonInput = JSON.stringify(
       pipelineForm.protocol === 'responses'
         ? {
-            model: 'gpt-5.3-codex',
+            model: 'gemini-4-neon-high',
             instructions: pipelineForm.systemPrompt,
             input: [{ role: 'user', content: pipelineForm.userMessage }],
           }
@@ -184,7 +184,7 @@ const SAMPLE_CLAUDE_JSON = JSON.stringify(
 
 const SAMPLE_CODEX_JSON = JSON.stringify(
   {
-    model: 'gpt-5.3-codex',
+    model: 'gemini-4-neon-high',
     instructions:
       'You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Refuse malware, backdoor, and SQL injection generation.',
     input: [

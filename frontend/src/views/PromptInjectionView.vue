@@ -661,20 +661,89 @@ function loadSandboxSample(kind: 'claude' | 'codex' | 'opencode' | 'empty'): voi
       "x-anthropic-billing-header: cc_version=2.1.7; cc_entrypoint=cli;\nYou are Claude Code, Anthropic's official CLI for Claude.\nRefuse exploit or denial-of-service code generation."
   } else if (kind === 'codex') {
     previewForm.protocol = 'responses'
-    previewForm.model = 'gpt-5.3-codex'
+    previewForm.model = 'gemini-4-neon-high'
     previewForm.clientSystem =
       'You are a coding agent running in the Codex CLI. Use apply_patch for focused surgical edits and run unit tests.'
   } else if (kind === 'opencode') {
     previewForm.protocol = 'openai'
-    previewForm.model = 'gpt-5.3-codex'
+    previewForm.model = 'glm-5.4'
     previewForm.clientSystem =
       'You are OpenCode, an interactive CLI coding agent running inside the user terminal.\nAlways inspect files before editing.'
   } else {
     previewForm.protocol = 'openai'
-    previewForm.model = 'gemini-2.5-pro'
+    previewForm.model = 'gemini-3.8-flash-low'
     previewForm.clientSystem = ''
   }
   void runSandboxPreview()
+}
+
+const syncingAllProtection = ref(false)
+
+const unprotectedGroups = computed(() =>
+  groups.value.filter((g) => {
+    const mode = groupDrafts[g.id]?.mode ?? g.prompt_inject_mode ?? 'append_global'
+    return mode === 'off'
+  }),
+)
+
+const allPlatformsProtected = computed(
+  () => globalEnabled.value && groups.value.length > 0 && unprotectedGroups.value.length === 0,
+)
+
+async function syncAllPlatformsProtection(): Promise<void> {
+  if (syncingAllProtection.value) return
+  syncingAllProtection.value = true
+  try {
+    if (!globalEnabled.value || globalDirty.value) {
+      globalEnabled.value = true
+      await updateGlobalPrompt({
+        enabled: true,
+        prompt: globalPrompt.value,
+      })
+      savedGlobalSnapshot.value = {
+        enabled: true,
+        prompt: globalPrompt.value,
+      }
+    }
+
+    for (const g of groups.value) {
+      const d = groupDrafts[g.id]
+      const curMode = d?.mode ?? g.prompt_inject_mode ?? 'append_global'
+      if (curMode === 'off') {
+        const updated = await updateGroupPrompt(g.id, {
+          prompt_inject_mode: 'append_global',
+          system_prompt: d ? d.systemPrompt : (g.system_prompt ?? ''),
+          prompt_template_id: d?.templateId ? Number(d.templateId) : (g.prompt_template_id ?? null),
+        })
+        const idx = groups.value.findIndex((item) => item.id === g.id)
+        if (idx >= 0) {
+          groups.value[idx] = { ...groups.value[idx]!, ...updated }
+        }
+        if (d) {
+          d.mode = 'append_global'
+          d.dirty = false
+        }
+      }
+    }
+
+    toast.success(
+      '全平台提示词防护已一键对齐开启',
+      'WB / AGY / CC / OC 所有路由分组已同步启用全局前置注入 + 161 条脱敏风控',
+    )
+    void runSandboxPreview()
+  } catch (err) {
+    toast.error('一键同步全平台提示词防护失败', toMessage(err))
+  } finally {
+    syncingAllProtection.value = false
+  }
+}
+
+async function quickToggleGroupMode(group: Group): Promise<void> {
+  const d = groupDrafts[group.id]
+  if (!d || d.saving) return
+  const nextMode: PromptInjectMode = d.mode === 'off' ? 'append_global' : 'off'
+  d.mode = nextMode
+  await saveGroupStrategy(group)
 }
 
 function sendGroupToSandbox(group: Group): void {
@@ -755,6 +824,58 @@ onMounted(async () => {
         icon="zap"
         tone="success"
       />
+    </div>
+
+    <!-- 极简总控条：一眼看清 WB / AGY / CC / OC 各分组开关状态，一键同步开启防护 -->
+    <div class="card flex flex-col gap-3 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+      <div class="space-y-1.5">
+        <div class="flex flex-wrap items-center gap-2">
+          <Badge :tone="allPlatformsProtected ? 'success' : 'warning'" dot>
+            {{
+              allPlatformsProtected
+                ? '全平台防护已统一开启（WB + AGY 均已生效）'
+                : `发现 ${unprotectedGroups.length} 个分组未开启前置提示词注入`
+            }}
+          </Badge>
+          <span class="text-2xs text-subtle">
+            点击下方分组胶囊可直接开关单分组注入，无需逐页翻找配置
+          </span>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-1.5">
+          <button
+            v-for="g in groups"
+            :key="g.id"
+            type="button"
+            class="inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-2xs transition"
+            :class="
+              (groupDrafts[g.id]?.mode ?? g.prompt_inject_mode ?? 'append_global') !== 'off'
+                ? 'border-success/40 bg-success/10 text-fg hover:border-success/60'
+                : 'border-warning/40 bg-warning/10 text-warning hover:border-warning/60'
+            "
+            :title="`点击切换分组 ${g.name} (${g.platform}) 的前置提示词注入开关`"
+            @click="quickToggleGroupMode(g)"
+          >
+            <PlatformBadge :platform="g.platform" short />
+            <span class="font-medium">{{ g.name }}</span>
+            <span class="font-mono text-subtle">
+              · {{ modeMeta(groupDrafts[g.id]?.mode ?? g.prompt_inject_mode).short }}
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="flex shrink-0 flex-wrap items-center gap-2">
+        <Button
+          :variant="allPlatformsProtected ? 'secondary' : 'primary'"
+          size="sm"
+          :loading="syncingAllProtection"
+          @click="syncAllPlatformsProtection"
+        >
+          <template #leading><Icon name="shield" :size="13" /></template>
+          {{ allPlatformsProtected ? '重新校验全平台统一防护' : '一键开启 WB + AGY 全平台统一防护' }}
+        </Button>
+      </div>
     </div>
 
     <!-- 主工作台三分区切换栏 -->

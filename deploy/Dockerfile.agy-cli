@@ -1,27 +1,31 @@
-# Analy2API — Single Isolated Real AntiGravity CLI (`agy`) Client Container Image
-# 1 Container = 1 Real `agy` CLI client = 1 Proxy IP = 1 Device Fingerprint = 1 Account
-#
-# Build example (after compiling analy2api-linux-amd64):
-#   docker build -f deploy/Dockerfile.agy-cli -t analy2api-agy-cli:latest .
+# Analy2API 单账号真实 AntiGravity CLI (agy) 隔离容器镜像
+# 每个容器仅挂载单个账号凭证目录与独立出口代理，以 `analy2api agy-bridge` 对外提供标准 /v1 接口。
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+LABEL io.analy2api.image.rev="v1.2.2-agy-cli"
 
-# Install official Google Antigravity CLI (`agy`) inside the container (with automatic binary promotion to /usr/local/bin)
-RUN curl -fsSL https://antigravity.google/cli/install.sh | bash \
-    && if [ -f /root/.local/bin/agy ]; then cp /root/.local/bin/agy /usr/local/bin/agy && chmod 0755 /usr/local/bin/agy; fi \
-    || true
+ARG HTTP_PROXY=""
+ARG HTTPS_PROXY=""
+ARG ALL_PROXY=""
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl git tar coreutils sed && \
+    rm -rf /var/lib/apt/lists/*
+
+# 安装官方 Linux 版 agy CLI 至 /usr/local/bin/agy 并强校验可执行性
+RUN curl --retry 3 --connect-timeout 15 -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin && \
+    chmod 0755 /usr/local/bin/agy && \
+    /usr/local/bin/agy --version
+
 ENV PATH="/usr/local/bin:/root/.local/bin:/root/.antigravity/bin:${PATH}"
 
-# Copy Analy2API binary (provides the `analy2api agy-bridge` single-client HTTP bridge + HTTP/2 v1internal fallback)
 COPY analy2api-linux-amd64 /usr/local/bin/analy2api
-RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api
+RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api && \
+    mkdir -p /app/auths/.gemini/antigravity/conversations /app/auths/.config/gcloud
 
 ENV AGY_SINGLE_CLIENT=1
+ENV AGY_ADC_AUTH=1
+ENV GOOGLE_APPLICATION_CREDENTIALS=/app/auths/.config/gcloud/application_default_credentials.json
 ENV AGY_CLI_DISABLE_AUTO_UPDATE=true
 ENV AGY_DISABLE_AUTO_UPDATE=1
 ENV AGY_SESSION_RETENTION=stateless
@@ -30,5 +34,4 @@ ENV AGY_BRIDGE_ADDR=:8317
 ENV AGY_AUTH_DIR=/app/auths
 
 EXPOSE 8317
-
 ENTRYPOINT ["/usr/local/bin/analy2api", "agy-bridge"]

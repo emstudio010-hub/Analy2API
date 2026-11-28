@@ -344,6 +344,8 @@ export const antigravityApi = {
   syncAccounts: syncAntigravityAccounts,
   rotateFingerprint: rotateAntigravityFingerprint,
   checkIP: checkAntigravityNodeExitIP,
+  accountModels: fetchAntigravityAccountModels,
+  testAccount: testAntigravityAccountChat,
 }
 
 // ---- 全平台统一 OAuth 会话与回调闭环 API (/oauth/...) ----
@@ -702,11 +704,25 @@ import type {
   AgyInterceptContinuePreview,
   AgyPromptMode,
   AgyPromptModesResponse,
+  AntigravityAccountModelsResponse,
   AntigravityConvertAccountsPayload,
   AntigravityConvertAccountsResponse,
   PreviewAgyPromptModePayload,
+  TestAntigravityAccountPayload,
+  TestAntigravityAccountResponse,
   UpdateAgyPromptModePayload,
 } from './types'
+
+export function fetchAntigravityAccountModels(accountId: number) {
+  return getLong<AntigravityAccountModelsResponse>(`/antigravity/accounts/${accountId}/models`)
+}
+
+export function testAntigravityAccountChat(
+  accountId: number,
+  payload: TestAntigravityAccountPayload = {},
+) {
+  return postLong<TestAntigravityAccountResponse>(`/antigravity/accounts/${accountId}/test`, payload)
+}
 
 export function convertAntigravityAccounts(payload: AntigravityConvertAccountsPayload) {
   return postLong<AntigravityConvertAccountsResponse>('/antigravity/accounts/convert', payload)

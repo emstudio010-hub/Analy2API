@@ -393,22 +393,23 @@ func IsNonChatModel(modelID string, maxOutputTokens int, tags []string) bool {
 	return false
 }
 
-// DefaultModels 返回 WorkBuddy 5.9.3 权威兜底对话模型目录。
+// DefaultModels 返回 WorkBuddy 真实线上可用对话模型基准目录（移除虚构模型名）。
 func DefaultModels() []ModelInfo {
 	base := []ModelInfo{
-		{ID: "deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash", Vendor: "deepseek", ContextWindow: 131072, MaxOutputTokens: 16384, SupportsToolCall: true, SupportsReasoning: true},
-		{ID: "deepseek-v3-0324", Name: "DeepSeek V3 0324", Vendor: "deepseek", ContextWindow: 131072, MaxOutputTokens: 16384, SupportsToolCall: true},
-		{ID: "deepseek-r1", Name: "DeepSeek R1", Vendor: "deepseek", ContextWindow: 131072, MaxOutputTokens: 16384, SupportsReasoning: true, OnlyReasoning: true},
-		{ID: "glm-4.6", Name: "GLM 4.6", Vendor: "zhipu", ContextWindow: 131072, MaxOutputTokens: 16384, SupportsToolCall: true, SupportsReasoning: true},
-		{ID: "glm-4.5", Name: "GLM 4.5", Vendor: "zhipu", ContextWindow: 131072, MaxOutputTokens: 16384, SupportsToolCall: true, SupportsReasoning: true},
-		{ID: "kimi-k2", Name: "Kimi K2", Vendor: "moonshot", ContextWindow: 131072, MaxOutputTokens: 16384, SupportsToolCall: true},
-		{ID: "qwen3-coder", Name: "Qwen3 Coder", Vendor: "qwen", ContextWindow: 131072, MaxOutputTokens: 16384, SupportsToolCall: true},
+		{ID: "hy4std", Name: "Hy4", Vendor: "tencent", ContextWindow: 960000, MaxOutputTokens: 64000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "hy4flash", Name: "Hy4 flash", Vendor: "tencent", ContextWindow: 960000, MaxOutputTokens: 64000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "deepseek-v4.1-flash", Name: "DeepSeek-V4.1-Flash", Vendor: "deepseek", ContextWindow: 1000000, MaxOutputTokens: 128000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "glm-5.4", Name: "GLM-5.4", Vendor: "zhipu", ContextWindow: 1000000, MaxOutputTokens: 32768, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "glm-5.3", Name: "GLM-5.3", Vendor: "zhipu", ContextWindow: 1000000, MaxOutputTokens: 64000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "glm-5.3-flash", Name: "GLM-5.3-Flash", Vendor: "zhipu", ContextWindow: 1000000, MaxOutputTokens: 131072, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "glm-5.2", Name: "GLM-5.2", Vendor: "zhipu", ContextWindow: 1000000, MaxOutputTokens: 64000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "kimi-k3.1-pro", Name: "Kimi-K3.1-Pro", Vendor: "moonshot", ContextWindow: 1000000, MaxOutputTokens: 32000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "kimi-k3-1", Name: "Kimi-K3", Vendor: "moonshot", ContextWindow: 1000000, MaxOutputTokens: 32000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
+		{ID: "kimi-k2.8-preview", Name: "Kimi-K2.8-Preview", Vendor: "moonshot", ContextWindow: 1000000, MaxOutputTokens: 64000, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
 		{ID: "claude-sonnet-4.5", Name: "Claude Sonnet 4.5", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 16384, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
 		{ID: "claude-opus-4.5", Name: "Claude Opus 4.5", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 16384, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
 		{ID: "claude-3.7-sonnet", Name: "Claude 3.7 Sonnet", Vendor: "anthropic", ContextWindow: 200000, MaxOutputTokens: 16384, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
-		{ID: "gpt-5", Name: "GPT-5", Vendor: "openai", ContextWindow: 200000, MaxOutputTokens: 16384, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
 		{ID: "gemini-2.5-pro", Name: "Gemini 2.5 Pro", Vendor: "google", ContextWindow: 1000000, MaxOutputTokens: 16384, SupportsImages: true, SupportsToolCall: true, SupportsReasoning: true},
-		{ID: "hunyuan-t1", Name: "Hunyuan T1", Vendor: "tencent", ContextWindow: 65536, MaxOutputTokens: 16384, SupportsReasoning: true},
 	}
 	out := make([]ModelInfo, len(base))
 	copy(out, base)

@@ -10,6 +10,7 @@ Group=analy2api
 SupplementaryGroups=docker
 WorkingDirectory=/opt/analy2api
 Environment=TMPDIR=/opt/analy2api/tmp
+Environment=DOCKER_CONFIG=/opt/analy2api/tmp/.docker
 EnvironmentFile=/etc/analy2api/env
 ExecStart=/opt/analy2api/analy2api
 Restart=always

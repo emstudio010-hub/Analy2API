@@ -197,10 +197,11 @@ func (c *Client) probeAntigravity(ctx context.Context, target *scheduler.Target)
 		return ProbeResult{Latency: time.Since(started), Err: MapAntigravityError(err)}
 	}
 
-	probeModel := "gemini-2.5-flash"
+	probeModel := "gemini-3.8-flash-low"
 	if len(models) > 0 {
 		probeModel = models[0].ID
-		for _, pref := range probeModelPreference {
+		agProbePrefs := []string{"gemini-3.8-flash-low", "gemini-4-argon-low", "gemini-3.5-flash-low", "flash", "low"}
+		for _, pref := range agProbePrefs {
 			found := false
 			for _, m := range models {
 				if strings.Contains(strings.ToLower(m.ID), pref) {

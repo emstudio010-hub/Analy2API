@@ -792,11 +792,9 @@ func (s *AccountService) resolvePushTargetGroups(
 			SetName(groupName).
 			SetDescription("远程补号自动创建的 " + platform + " 分组").
 			SetPlatform(platform).
+			SetPromptInjectMode(domain.PromptModeAppendGlobal).
 			SetRateMultiplier(1.0).
 			SetStatus(domain.StatusActive)
-		if platform == domain.PlatformAntigravity {
-			builder = builder.SetPromptInjectMode(domain.PromptModeOff)
-		}
 		created, cErr := builder.Save(ctx)
 		if cErr != nil {
 			return nil, fmt.Errorf("按名称自动创建分组 %q 失败: %w", groupName, cErr)
@@ -822,11 +820,9 @@ func (s *AccountService) resolvePushTargetGroups(
 		SetName(defaultName).
 		SetDescription("Analy2API 远程补号默认 " + platform + " 分组").
 		SetPlatform(platform).
+		SetPromptInjectMode(domain.PromptModeAppendGlobal).
 		SetRateMultiplier(1.0).
 		SetStatus(domain.StatusActive)
-	if platform == domain.PlatformAntigravity {
-		builder = builder.SetPromptInjectMode(domain.PromptModeOff)
-	}
 	created, cErr := builder.Save(ctx)
 	if cErr != nil {
 		return nil, fmt.Errorf("自动创建平台默认分组 %q 失败: %w", defaultName, cErr)
