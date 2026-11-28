@@ -192,6 +192,53 @@ func TestNativeV1InternalDirectCLIRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFetchAntigravityQuota5hAndWeeklySummary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1internal:loadCodeAssist":
+			_, _ = w.Write([]byte(`{"cloudaicompanionProject":"aicode-consumers","currentTier":{"id":"g1-pro-tier","name":"Google AI Pro"}}`))
+		case "/v1internal:retrieveUserQuotaSummary":
+			_, _ = w.Write([]byte(`{
+				"groups":[
+					{
+						"displayName":"Claude and GPT models",
+						"description":"Models within this group: Claude Sonnet 4.6, Claude Opus 4.6, GPT-OSS 120B",
+						"buckets":[
+							{"bucketId":"3p-weekly","displayName":"Weekly Limit Remaining","window":"weekly","resetTime":"2026-12-05T05:06:39Z","remainingFraction":0.9886676},
+							{"bucketId":"3p-5h","displayName":"Five Hour Limit Remaining","window":"5h","resetTime":"2026-11-28T10:06:39Z","remainingFraction":0.9804864}
+						]
+					}
+				]
+			}`))
+		case "/v1internal:fetchAvailableModels":
+			_, _ = w.Write([]byte(`{
+				"models":{
+					"gemini-4-hydrogen-sonar":{"displayName":"Gemini 4 Hydrogen Sonar","supportsImages":true,"supportsThinking":true,"maxTokens":1048576,"maxOutputTokens":65536,"quotaInfo":{"remainingFraction":0.9637765,"resetTime":"2026-11-28T10:06:35Z"}},
+					"claude-sonnet-4-6":{"displayName":"Claude Sonnet 4.6","supportsImages":true,"supportsThinking":true,"maxTokens":200000,"maxOutputTokens":64000,"quotaInfo":{"remainingFraction":0.9804864,"resetTime":"2026-11-28T10:06:39Z"}}
+				}
+			}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	status, err := FetchAntigravityQuotaAndModels(context.Background(), srv.Client(), srv.URL, "ya29.test", "", "")
+	if err != nil {
+		t.Fatalf("FetchAntigravityQuotaAndModels error: %v", err)
+	}
+	if status.FiveHour == nil || status.FiveHour.RemainingPct == nil || *status.FiveHour.RemainingPct != 96.4 || status.FiveHour.ResetTime != "2026-11-28T10:06:35Z" {
+		t.Fatalf("unexpected FiveHour summary: %+v", status.FiveHour)
+	}
+	if status.Weekly == nil || status.Weekly.RemainingPct == nil || *status.Weekly.RemainingPct != 98.9 || status.Weekly.ResetTime != "2026-12-05T05:06:39Z" {
+		t.Fatalf("unexpected Weekly summary: %+v", status.Weekly)
+	}
+	if len(status.QuotaGroups) != 2 {
+		t.Fatalf("expected 2 quota groups (synthesized Gemini + explicit Claude/GPT), got %d", len(status.QuotaGroups))
+	}
+}
+
 func TestGoogleDesktopOAuthRedirectAndBridgeHeadlessFallback(t *testing.T) {
 	// 1. 验证公网域名自动规范化为 Google Desktop 允许的 localhost 回调，而本机地址保持原样
 	if got := NormalizeGoogleDesktopRedirectURI("https://cmd.essapi.uno/api/oauth/callback"); got != OfficialOAuthDefaultRedirectURI {

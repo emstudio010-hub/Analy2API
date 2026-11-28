@@ -2705,14 +2705,18 @@ type AntigravityAccountModelsOutput struct {
 	TierName        string                       `json:"tier_name,omitempty"`
 	Driver          string                       `json:"driver,omitempty"`
 	CLIReady        bool                         `json:"cli_ready"`
-	AvgRemainingPct *float64                     `json:"avg_remaining_pct,omitempty"`
-	EarliestResetAt string                       `json:"earliest_reset_at,omitempty"`
-	Models          []antigravity.ModelQuotaItem `json:"models"`
-	FetchedAt       string                       `json:"fetched_at"`
-	Warning         string                       `json:"warning,omitempty"`
+	AvgRemainingPct *float64                        `json:"avg_remaining_pct,omitempty"`
+	MinRemainingPct *float64                        `json:"min_remaining_pct,omitempty"`
+	EarliestResetAt string                          `json:"earliest_reset_at,omitempty"`
+	FiveHour        *antigravity.QuotaWindowBucket  `json:"five_hour,omitempty"`
+	Weekly          *antigravity.QuotaWindowBucket  `json:"weekly,omitempty"`
+	QuotaGroups     []antigravity.QuotaGroupSummary `json:"quota_groups,omitempty"`
+	Models          []antigravity.ModelQuotaItem    `json:"models"`
+	FetchedAt       string                          `json:"fetched_at"`
+	Warning         string                          `json:"warning,omitempty"`
 }
 
-// GetAccountModelsAndQuota 查询指定 AntiGravity 账号绑定容器的实时可用模型清单、套餐层级与各模型剩余额度百分比，并顺带写回账号余额快照。
+// GetAccountModelsAndQuota 查询指定 AntiGravity 账号绑定容器的实时可用模型清单、套餐层级与 5h/周剩余额度，并顺带写回账号余额快照。
 func (s *AntigravityService) GetAccountModelsAndQuota(ctx context.Context, accountID int64) (*AntigravityAccountModelsOutput, error) {
 	acc, err := s.db.Account.Query().
 		Where(account.IDEQ(accountID), account.DeletedAtIsNil()).
@@ -2775,10 +2779,12 @@ func (s *AntigravityService) GetAccountModelsAndQuota(ctx context.Context, accou
 		return nil, qErr
 	}
 
-	// 同步将额度快照持久化到 Account 表，使账号列表与 AntiGravity 列表刷新页面后依然直接可见额度
+	// 同步将 5h 与周额度快照持久化到 Account 表，使账号列表与 AntiGravity 列表刷新页面后依然直接可见双窗口额度与重置时间
 	if status != nil {
 		rem := 100.0
-		if status.AvgRemainingPct != nil {
+		if status.MinRemainingPct != nil {
+			rem = *status.MinRemainingPct
+		} else if status.AvgRemainingPct != nil {
 			rem = *status.AvgRemainingPct
 		}
 		pkgs := make([]map[string]any, 0, len(status.Models))
@@ -2791,7 +2797,7 @@ func (s *AntigravityService) GetAccountModelsAndQuota(ctx context.Context, accou
 			if mUsed < 0 {
 				mUsed = 0
 			}
-			pkgs = append(pkgs, map[string]any{
+			pkgItem := map[string]any{
 				"package_code": m.ID,
 				"package_name": m.ID,
 				"display_name": m.Name,
@@ -2802,7 +2808,16 @@ func (s *AntigravityService) GetAccountModelsAndQuota(ctx context.Context, accou
 				"total_count":  100,
 				"expired_at":   m.ResetTime,
 				"expired":      m.Exhausted,
-			})
+			}
+			if m.FiveHourRemainingPct != nil {
+				pkgItem["five_hour_remain"] = *m.FiveHourRemainingPct
+				pkgItem["five_hour_reset_at"] = m.FiveHourResetTime
+			}
+			if m.WeeklyRemainingPct != nil {
+				pkgItem["weekly_remain"] = *m.WeeklyRemainingPct
+				pkgItem["weekly_reset_at"] = m.WeeklyResetTime
+			}
+			pkgs = append(pkgs, pkgItem)
 		}
 		planName := firstNonEmptyStrSvc(status.TierName, status.TierID, "Google AI Code")
 		upd := s.db.Account.UpdateOneID(acc.ID).
@@ -2816,6 +2831,34 @@ func (s *AntigravityService) GetAccountModelsAndQuota(ctx context.Context, accou
 			if t, tErr := time.Parse(time.RFC3339, status.EarliestResetAt); tErr == nil {
 				upd = upd.SetBalancePeriodEnd(t)
 			}
+		}
+		if status.FiveHour != nil && status.FiveHour.RemainingPct != nil {
+			fhUsed := 100.0 - *status.FiveHour.RemainingPct
+			if fhUsed < 0 {
+				fhUsed = 0
+			}
+			upd = upd.SetBalance5hUsed(fhUsed).SetBalance5hCap(100.0)
+			if t, tErr := time.Parse(time.RFC3339, status.FiveHour.ResetTime); tErr == nil {
+				upd = upd.SetBalance5hResetAt(t)
+			} else {
+				upd = upd.ClearBalance5hResetAt()
+			}
+		} else {
+			upd = upd.ClearBalance5hUsed().ClearBalance5hCap().ClearBalance5hResetAt()
+		}
+		if status.Weekly != nil && status.Weekly.RemainingPct != nil {
+			wkUsed := 100.0 - *status.Weekly.RemainingPct
+			if wkUsed < 0 {
+				wkUsed = 0
+			}
+			upd = upd.SetBalanceWeeklyUsed(wkUsed).SetBalanceWeeklyCap(100.0)
+			if t, tErr := time.Parse(time.RFC3339, status.Weekly.ResetTime); tErr == nil {
+				upd = upd.SetBalanceWeeklyResetAt(t)
+			} else {
+				upd = upd.ClearBalanceWeeklyResetAt()
+			}
+		} else {
+			upd = upd.ClearBalanceWeeklyUsed().ClearBalanceWeeklyCap().ClearBalanceWeeklyResetAt()
 		}
 		_, _ = upd.Save(ctx)
 	}
@@ -2833,7 +2876,11 @@ func (s *AntigravityService) GetAccountModelsAndQuota(ctx context.Context, accou
 		Driver:          status.Driver,
 		CLIReady:        status.CLIReady,
 		AvgRemainingPct: status.AvgRemainingPct,
+		MinRemainingPct: status.MinRemainingPct,
 		EarliestResetAt: status.EarliestResetAt,
+		FiveHour:        status.FiveHour,
+		Weekly:          status.Weekly,
+		QuotaGroups:     status.QuotaGroups,
 		Models:          status.Models,
 		FetchedAt:       status.FetchedAt,
 		Warning:         status.Warning,

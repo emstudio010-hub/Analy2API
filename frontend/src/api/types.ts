@@ -2034,12 +2034,36 @@ export interface FilterPipelinePreviewResponse {
 
 // === Antigravity Live Models, Quota & Online Container Test ===
 
+export interface AntigravityQuotaWindowBucket {
+  bucket_id?: string
+  window: '5h' | 'weekly' | string
+  display_name?: string
+  remaining_fraction?: number | null
+  remaining_pct?: number | null
+  reset_time?: string
+  exhausted?: boolean
+  description?: string
+}
+
+export interface AntigravityQuotaGroupSummary {
+  group_name: string
+  description?: string
+  five_hour?: AntigravityQuotaWindowBucket | null
+  weekly?: AntigravityQuotaWindowBucket | null
+  buckets?: AntigravityQuotaWindowBucket[]
+}
+
 export interface AntigravityModelQuotaItem {
   id: string
   name: string
+  vendor?: string
   source?: string
   remaining_pct?: number | null
   reset_time?: string
+  five_hour_remaining_pct?: number | null
+  five_hour_reset_time?: string
+  weekly_remaining_pct?: number | null
+  weekly_reset_time?: string
   exhausted?: boolean
   supports_images?: boolean
 }
@@ -2057,7 +2081,11 @@ export interface AntigravityAccountModelsResponse {
   driver?: string
   cli_ready?: boolean
   avg_remaining_pct?: number | null
+  min_remaining_pct?: number | null
   earliest_reset_at?: string
+  five_hour?: AntigravityQuotaWindowBucket | null
+  weekly?: AntigravityQuotaWindowBucket | null
+  quota_groups?: AntigravityQuotaGroupSummary[]
   models: AntigravityModelQuotaItem[]
   fetched_at?: string
   warning?: string

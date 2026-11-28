@@ -22,13 +22,13 @@ import (
 )
 
 // CurrentAgyImageRev 标识当前版本内置单账号真实 agy CLI 镜像的构建修订号；升级服务端后自动检测旧镜像并重建。
-const CurrentAgyImageRev = "v1.2.5-agy-cli"
+const CurrentAgyImageRev = "v1.2.6-agy-cli"
 
 // EmbeddedAgyCLIDockerfile 内嵌 Analy2API 单账号真实 agy CLI 容器构建定义：
 // 即使部署在完全空白的 Linux 服务器（宿主机未安装 agy），只要有 Docker 即可自动构建镜像并按账号自动起独立容器；
 // 容器内内置官方 `agy` CLI 与 HTTP/2 daily-cloudcode-pa v1internal 双引擎。
 const EmbeddedAgyCLIDockerfile = `FROM debian:bookworm-slim
-LABEL io.analy2api.image.rev="v1.2.5-agy-cli"
+LABEL io.analy2api.image.rev="v1.2.6-agy-cli"
 ARG HTTP_PROXY=""
 ARG HTTPS_PROXY=""
 ARG ALL_PROXY=""
@@ -51,7 +51,7 @@ ENTRYPOINT ["/usr/local/bin/analy2api", "agy-bridge"]
 
 // EmbeddedAgyCLIFallbackDockerfile 在极端受限网络无法访问 antigravity.google 安装脚本时作为降级构建底本（仍包含最新 analy2api agy-bridge v1internal 引擎）。
 const EmbeddedAgyCLIFallbackDockerfile = `FROM debian:bookworm-slim
-LABEL io.analy2api.image.rev="v1.2.5-bridge-only"
+LABEL io.analy2api.image.rev="v1.2.6-bridge-only"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 COPY analy2api-linux-amd64 /usr/local/bin/analy2api
 RUN chmod +x /usr/local/bin/analy2api && ln -sf /usr/local/bin/analy2api /usr/local/bin/cmdwb2api && mkdir -p /app/auths/.gemini/antigravity/conversations /app/auths/.config/gcloud

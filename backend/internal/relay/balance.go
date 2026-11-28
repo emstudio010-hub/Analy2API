@@ -162,7 +162,7 @@ func (c *Client) fetchAntigravityBalance(ctx context.Context, target *scheduler.
 		if used < 0 {
 			used = 0
 		}
-		pkgs = append(pkgs, map[string]any{
+		pkgItem := map[string]any{
 			"package_code":  m.ID,
 			"package_name":  m.ID,
 			"display_name":  m.Name,
@@ -174,11 +174,22 @@ func (c *Client) fetchAntigravityBalance(ctx context.Context, target *scheduler.
 			"expired_at":    m.ResetTime,
 			"expired":       m.Exhausted,
 			"expiring_soon": rem > 0 && rem <= 20,
-		})
+		}
+		if m.FiveHourRemainingPct != nil {
+			pkgItem["five_hour_remain"] = *m.FiveHourRemainingPct
+			pkgItem["five_hour_reset_at"] = m.FiveHourResetTime
+		}
+		if m.WeeklyRemainingPct != nil {
+			pkgItem["weekly_remain"] = *m.WeeklyRemainingPct
+			pkgItem["weekly_reset_at"] = m.WeeklyResetTime
+		}
+		pkgs = append(pkgs, pkgItem)
 	}
 
 	remPct := 100.0
-	if status.AvgRemainingPct != nil {
+	if status.MinRemainingPct != nil {
+		remPct = *status.MinRemainingPct
+	} else if status.AvgRemainingPct != nil {
 		remPct = *status.AvgRemainingPct
 	}
 	planID := status.TierID
@@ -195,6 +206,26 @@ func (c *Client) fetchAntigravityBalance(ctx context.Context, target *scheduler.
 		resetPtr = parseRFC3339Ptr(status.EarliestResetAt)
 	}
 
+	toAgyWindow := func(wb *antigravity.QuotaWindowBucket) *BalanceWindow {
+		if wb == nil || wb.RemainingPct == nil {
+			return nil
+		}
+		rem := *wb.RemainingPct
+		used := 100.0 - rem
+		if used < 0 {
+			used = 0
+		}
+		if used > 100 {
+			used = 100
+		}
+		return &BalanceWindow{
+			Used:     used,
+			Cap:      100.0,
+			Exceeded: wb.Exhausted || rem <= 0,
+			ResetAt:  parseRFC3339Ptr(wb.ResetTime),
+		}
+	}
+
 	return BalanceResult{
 		Supported: true,
 		Balance: &Balance{
@@ -203,6 +234,8 @@ func (c *Client) fetchAntigravityBalance(ctx context.Context, target *scheduler.
 			PlanID:       planID,
 			PlanName:     planName,
 			PeriodEnd:    resetPtr,
+			FiveHour:     toAgyWindow(status.FiveHour),
+			Weekly:       toAgyWindow(status.Weekly),
 			Packages:     pkgs,
 			IsPaidUser:   strings.Contains(strings.ToLower(planID+" "+planName), "pro") || strings.Contains(strings.ToLower(planID+" "+planName), "ultra"),
 		},

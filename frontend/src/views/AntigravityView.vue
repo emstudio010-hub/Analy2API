@@ -55,7 +55,7 @@ import StatusPill from '@/components/ui/StatusPill.vue'
 import Textarea from '@/components/ui/Textarea.vue'
 import { useToastStore } from '@/stores/toast'
 import { copyText } from '@/utils/clipboard'
-import { formatRelative, redactProxyDisplay } from '@/utils/format'
+import { formatDateTime, formatRelative, formatResetCountdown, redactProxyDisplay } from '@/utils/format'
 
 const router = useRouter()
 const toast = useToastStore()
@@ -203,7 +203,8 @@ const testModelOptions = computed(() => {
 
 function formatQuotaPct(pct?: number | null): string {
   if (pct === null || pct === undefined || Number.isNaN(pct)) return '--'
-  return `${Math.round(pct)}%`
+  const rounded = Math.round(pct * 10) / 10
+  return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`
 }
 
 function quotaTone(pct?: number | null): 'success' | 'warning' | 'danger' | 'neutral' {
@@ -211,6 +212,70 @@ function quotaTone(pct?: number | null): 'success' | 'warning' | 'danger' | 'neu
   if (pct <= 10) return 'danger'
   if (pct <= 35) return 'warning'
   return 'success'
+}
+
+function quotaBarClass(pct?: number | null): string {
+  if (pct === null || pct === undefined || Number.isNaN(pct)) return 'bg-subtle'
+  if (pct <= 10) return 'bg-danger'
+  if (pct <= 35) return 'bg-warning'
+  return 'bg-success'
+}
+
+interface ResolvedQuotaWindow {
+  pct: number
+  resetAt: string | null
+}
+
+/** 提取账号 5 小时滚动额度剩余百分比与重置时间（兼容新版 balance.five_hour 与旧版单字段快照）。 */
+function resolveAccount5h(acc: Account | null | undefined): ResolvedQuotaWindow | null {
+  const b = acc?.balance
+  if (!b) return null
+  if (b.five_hour && b.five_hour.cap > 0) {
+    const pct = Math.max(0, Math.min(100, ((b.five_hour.cap - b.five_hour.used) / b.five_hour.cap) * 100))
+    return { pct, resetAt: b.five_hour.reset_at || b.period_end || null }
+  }
+  if (b.remaining !== null && b.remaining !== undefined) {
+    const fallbackReset = b.period_end || b.packages?.find((p) => p.expired_at)?.expired_at || null
+    return { pct: Math.max(0, Math.min(100, b.remaining)), resetAt: fallbackReset }
+  }
+  return null
+}
+
+/** 提取账号周额度剩余百分比与重置时间。 */
+function resolveAccountWeekly(acc: Account | null | undefined): ResolvedQuotaWindow | null {
+  const b = acc?.balance
+  if (!b) return null
+  if (b.weekly && b.weekly.cap > 0) {
+    const pct = Math.max(0, Math.min(100, ((b.weekly.cap - b.weekly.used) / b.weekly.cap) * 100))
+    return { pct, resetAt: b.weekly.reset_at || null }
+  }
+  const rawPkgs = (b.packages ?? []) as unknown as Array<Record<string, unknown>>
+  let minPct: number | null = null
+  let resetAt: string | null = null
+  for (const p of rawPkgs) {
+    const wRem = p.weekly_remain
+    if (typeof wRem === 'number' && Number.isFinite(wRem)) {
+      if (minPct === null || wRem < minPct) {
+        minPct = wRem
+        resetAt = typeof p.weekly_reset_at === 'string' && p.weekly_reset_at ? p.weekly_reset_at : resetAt
+      }
+    }
+  }
+  if (minPct !== null) {
+    return { pct: Math.max(0, Math.min(100, minPct)), resetAt }
+  }
+  return null
+}
+
+function model5hPct(m: AntigravityModelQuotaItem): number | null {
+  if (m.five_hour_remaining_pct !== null && m.five_hour_remaining_pct !== undefined) {
+    return m.five_hour_remaining_pct
+  }
+  return m.remaining_pct ?? null
+}
+
+function model5hReset(m: AntigravityModelQuotaItem): string | null {
+  return m.five_hour_reset_time || m.reset_time || null
 }
 
 async function refreshSingleAccountQuota(acc: Account): Promise<void> {
@@ -1164,49 +1229,98 @@ async function copyErrorDetail(text: string): Promise<void> {
                 </div>
               </td>
 
-              <!-- 5. 套餐 / Google 实时额度与支持模型 -->
-              <td class="td min-w-[13rem]">
+              <!-- 5. 套餐 / Google 5h 与周实时额度及重置时间 -->
+              <td class="td min-w-[16.5rem]">
                 <div v-if="row.account" class="space-y-1.5">
-                  <div class="flex flex-wrap items-center gap-1.5">
-                    <Badge
-                      :tone="row.account.balance?.fetched_at ? quotaTone(row.account.balance.remaining) : 'neutral'"
-                      dot
+                  <div class="flex flex-wrap items-center justify-between gap-1.5">
+                    <div class="flex flex-wrap items-center gap-1.5">
+                      <Badge
+                        :tone="row.account.balance?.fetched_at ? quotaTone(resolveAccount5h(row.account)?.pct ?? row.account.balance.remaining) : 'neutral'"
+                        dot
+                      >
+                        {{
+                          row.account.balance?.plan_id ||
+                          row.account.balance?.plan_name ||
+                          (row.account.balance?.fetched_at ? 'Google AI' : '待查额度')
+                        }}
+                      </Badge>
+                      <span
+                        v-if="row.account.balance?.packages?.length"
+                        class="font-mono text-2xs text-subtle"
+                      >
+                        {{ row.account.balance.packages.length }} 模型
+                      </span>
+                    </div>
+
+                    <button
+                      type="button"
+                      class="inline-flex items-center gap-1 rounded border border-line bg-surface px-1.5 py-0.5 text-2xs text-muted transition hover:text-fg"
+                      :disabled="refreshingQuotaId === row.account.id"
+                      title="刷新该账号 Google 5h 与周实时配额"
+                      @click="refreshSingleAccountQuota(row.account)"
                     >
-                      {{
-                        row.account.balance?.plan_id ||
-                        row.account.balance?.plan_name ||
-                        (row.account.balance?.fetched_at ? 'Google AI' : '待查额度')
-                      }}
-                    </Badge>
-                    <span
-                      v-if="row.account.balance?.remaining !== null && row.account.balance?.remaining !== undefined"
-                      class="tnum font-mono text-xs font-semibold text-fg"
-                    >
-                      剩余 {{ formatQuotaPct(row.account.balance.remaining) }}
-                    </span>
-                    <span
-                      v-if="row.account.balance?.packages?.length"
-                      class="font-mono text-2xs text-subtle"
-                    >
-                      · {{ row.account.balance.packages.length }} 模型
-                    </span>
+                      <Spinner v-if="refreshingQuotaId === row.account.id" :size="10" />
+                      <Icon v-else name="refresh" :size="10" />
+                      <span>刷新</span>
+                    </button>
                   </div>
 
+                  <!-- 5 小时滚动额度 + 重置时间 -->
                   <div
-                    v-if="row.account.balance?.remaining !== null && row.account.balance?.remaining !== undefined"
-                    class="h-1.5 w-36 overflow-hidden rounded-full bg-raised"
+                    v-if="resolveAccount5h(row.account)"
+                    class="rounded border border-line/70 bg-raised/35 px-2 py-1 space-y-1"
                   >
+                    <div class="flex items-center justify-between gap-2 text-2xs">
+                      <span class="font-medium text-muted">5h 额度</span>
+                      <span class="tnum font-mono font-semibold text-fg">
+                        剩余 {{ formatQuotaPct(resolveAccount5h(row.account)?.pct) }}
+                      </span>
+                    </div>
+                    <div class="h-1.5 w-full overflow-hidden rounded-full bg-raised">
+                      <div
+                        class="h-full rounded-full transition-all"
+                        :class="quotaBarClass(resolveAccount5h(row.account)?.pct)"
+                        :style="{ width: `${Math.max(3, Math.min(100, Math.round(resolveAccount5h(row.account)?.pct ?? 0)))}%` }"
+                      />
+                    </div>
                     <div
-                      class="h-full rounded-full transition-all"
-                      :class="
-                        (row.account.balance.remaining ?? 100) <= 10
-                          ? 'bg-danger'
-                          : (row.account.balance.remaining ?? 100) <= 35
-                            ? 'bg-warning'
-                            : 'bg-success'
-                      "
-                      :style="{ width: `${Math.max(3, Math.min(100, Math.round(row.account.balance.remaining ?? 0)))}%` }"
-                    />
+                      class="flex items-center justify-between gap-1 font-mono text-[10.5px] text-subtle"
+                      :title="resolveAccount5h(row.account)?.resetAt ? `精确重置时间: ${formatDateTime(resolveAccount5h(row.account)?.resetAt)}` : ''"
+                    >
+                      <span>重置</span>
+                      <span class="text-muted">
+                        {{ formatResetCountdown(resolveAccount5h(row.account)?.resetAt) }}
+                      </span>
+                    </div>
+                  </div>
+
+                  <!-- 周滚动额度 + 重置时间 -->
+                  <div
+                    v-if="resolveAccountWeekly(row.account)"
+                    class="rounded border border-line/70 bg-raised/35 px-2 py-1 space-y-1"
+                  >
+                    <div class="flex items-center justify-between gap-2 text-2xs">
+                      <span class="font-medium text-muted">周额度</span>
+                      <span class="tnum font-mono font-semibold text-fg">
+                        剩余 {{ formatQuotaPct(resolveAccountWeekly(row.account)?.pct) }}
+                      </span>
+                    </div>
+                    <div class="h-1.5 w-full overflow-hidden rounded-full bg-raised">
+                      <div
+                        class="h-full rounded-full transition-all"
+                        :class="quotaBarClass(resolveAccountWeekly(row.account)?.pct)"
+                        :style="{ width: `${Math.max(3, Math.min(100, Math.round(resolveAccountWeekly(row.account)?.pct ?? 0)))}%` }"
+                      />
+                    </div>
+                    <div
+                      class="flex items-center justify-between gap-1 font-mono text-[10.5px] text-subtle"
+                      :title="resolveAccountWeekly(row.account)?.resetAt ? `精确重置时间: ${formatDateTime(resolveAccountWeekly(row.account)?.resetAt)}` : ''"
+                    >
+                      <span>重置</span>
+                      <span class="text-muted">
+                        {{ formatResetCountdown(resolveAccountWeekly(row.account)?.resetAt) }}
+                      </span>
+                    </div>
                   </div>
 
                   <div class="flex flex-wrap items-center gap-1.5 pt-0.5">
@@ -1216,18 +1330,7 @@ async function copyErrorDetail(text: string): Promise<void> {
                       @click="openModelsQuotaModal(row.account)"
                     >
                       <Icon name="layers" :size="11" />
-                      <span>查看支持模型与额度</span>
-                    </button>
-                    <button
-                      type="button"
-                      class="inline-flex items-center gap-1 rounded border border-line bg-surface px-1.5 py-0.5 text-2xs text-muted transition hover:text-fg"
-                      :disabled="refreshingQuotaId === row.account.id"
-                      title="刷新该账号 Google 实时配额"
-                      @click="refreshSingleAccountQuota(row.account)"
-                    >
-                      <Spinner v-if="refreshingQuotaId === row.account.id" :size="10" />
-                      <Icon v-else name="refresh" :size="10" />
-                      <span>刷新</span>
+                      <span>查看支持模型与 5h/周明细</span>
                     </button>
                   </div>
                 </div>
@@ -1280,7 +1383,7 @@ async function copyErrorDetail(text: string): Promise<void> {
                     v-if="row.account"
                     variant="secondary"
                     size="xs"
-                    title="查看该账号支持的真实模型清单与各模型剩余额度百分比"
+                    title="查看该账号支持的真实模型清单与 5h / 周剩余额度及重置时间"
                     @click="openModelsQuotaModal(row.account)"
                   >
                     <Icon name="layers" :size="11" />
@@ -1431,11 +1534,11 @@ async function copyErrorDetail(text: string): Promise<void> {
       </DataTable>
     </Card>
 
-    <!-- 弹窗 1：查看该账号支持的真实模型与 Google 实时配额 -->
+    <!-- 弹窗 1：查看该账号支持的真实模型与 Google 5h / 周实时配额 -->
     <Modal
       :open="quotaModalAccount !== null"
-      :title="`支持模型与 Google 实时额度 · ${quotaModalAccount?.email || quotaModalAccount?.name || ''}`"
-      subtitle="通过专属容器出口代理直查 agy models 与 Google Cloud Code 实时剩余额度百分比（绝无虚构模型）"
+      :title="`支持模型与 5h / 周实时额度 · ${quotaModalAccount?.email || quotaModalAccount?.name || ''}`"
+      subtitle="通过专属容器出口代理直查 Google Cloud Code 官方 5 小时限额、周限额及精确重置时间"
       size="lg"
       @update:open="quotaModalAccount = null"
     >
@@ -1444,6 +1547,9 @@ async function copyErrorDetail(text: string): Promise<void> {
           <div class="flex flex-wrap items-center gap-2 text-xs">
             <Badge tone="accent" dot>
               套餐：{{ quotaData?.tier_name || quotaData?.tier_id || '检测中…' }}
+              <template v-if="quotaData?.tier_id && quotaData?.tier_name && quotaData.tier_id !== quotaData.tier_name">
+                ({{ quotaData.tier_id }})
+              </template>
             </Badge>
             <Badge v-if="quotaData?.project_id" tone="info" mono>
               Project: {{ quotaData.project_id }}
@@ -1451,12 +1557,6 @@ async function copyErrorDetail(text: string): Promise<void> {
             <Badge :tone="quotaData?.cli_ready ? 'success' : 'neutral'" mono>
               {{ quotaData?.cli_ready ? `真实 CLI (${quotaData.driver || 'agy'})` : (quotaData?.driver || 'cloudcode-pa') }}
             </Badge>
-            <span
-              v-if="quotaData?.avg_remaining_pct !== null && quotaData?.avg_remaining_pct !== undefined"
-              class="font-mono text-xs font-semibold text-fg"
-            >
-              均值剩余 {{ formatQuotaPct(quotaData.avg_remaining_pct) }}
-            </span>
           </div>
 
           <div class="flex items-center gap-2">
@@ -1470,6 +1570,87 @@ async function copyErrorDetail(text: string): Promise<void> {
               <template #leading><Icon name="refresh" :size="12" /></template>
               刷新实时配额
             </Button>
+          </div>
+        </div>
+
+        <!-- 分组级 5 小时额度 + 周额度 双窗口总览卡片 -->
+        <div
+          v-if="quotaData?.quota_groups?.length"
+          class="grid gap-3 sm:grid-cols-2"
+        >
+          <div
+            v-for="(grp, gIdx) in quotaData.quota_groups"
+            :key="`${grp.group_name}-${gIdx}`"
+            class="rounded-md border border-line bg-raised/35 p-3 space-y-2.5"
+          >
+            <div>
+              <div class="text-xs font-semibold text-fg">{{ grp.group_name }}</div>
+              <p v-if="grp.description" class="mt-0.5 text-2xs text-subtle">
+                {{ grp.description }}
+              </p>
+            </div>
+
+            <div class="space-y-2">
+              <!-- 5h 窗口 -->
+              <div v-if="grp.five_hour" class="rounded border border-line/70 bg-surface px-2.5 py-1.5 space-y-1">
+                <div class="flex items-center justify-between text-2xs">
+                  <span class="font-medium text-muted">5 小时额度 (5h)</span>
+                  <span class="tnum font-mono font-semibold text-fg">
+                    剩余 {{ formatQuotaPct(grp.five_hour.remaining_pct) }}
+                  </span>
+                </div>
+                <div class="h-1.5 w-full overflow-hidden rounded-full bg-raised">
+                  <div
+                    class="h-full rounded-full"
+                    :class="quotaBarClass(grp.five_hour.remaining_pct)"
+                    :style="{ width: `${Math.max(3, Math.min(100, Math.round(grp.five_hour.remaining_pct ?? 0)))}%` }"
+                  />
+                </div>
+                <div class="flex items-center justify-between font-mono text-[10.5px] text-subtle">
+                  <span>重置倒计时</span>
+                  <span class="text-fg">
+                    {{ formatResetCountdown(grp.five_hour.reset_time) }}
+                  </span>
+                </div>
+                <div v-if="grp.five_hour.reset_time" class="flex items-center justify-between font-mono text-[10.5px] text-subtle">
+                  <span>精确重置时刻</span>
+                  <span>{{ formatDateTime(grp.five_hour.reset_time) }}</span>
+                </div>
+              </div>
+
+              <!-- 周窗口 -->
+              <div v-if="grp.weekly" class="rounded border border-line/70 bg-surface px-2.5 py-1.5 space-y-1">
+                <div class="flex items-center justify-between text-2xs">
+                  <span class="font-medium text-muted">周额度 (Weekly)</span>
+                  <span class="tnum font-mono font-semibold text-fg">
+                    剩余 {{ formatQuotaPct(grp.weekly.remaining_pct) }}
+                  </span>
+                </div>
+                <div class="h-1.5 w-full overflow-hidden rounded-full bg-raised">
+                  <div
+                    class="h-full rounded-full"
+                    :class="quotaBarClass(grp.weekly.remaining_pct)"
+                    :style="{ width: `${Math.max(3, Math.min(100, Math.round(grp.weekly.remaining_pct ?? 0)))}%` }"
+                  />
+                </div>
+                <div class="flex items-center justify-between font-mono text-[10.5px] text-subtle">
+                  <span>重置倒计时</span>
+                  <span class="text-fg">
+                    {{ formatResetCountdown(grp.weekly.reset_time) }}
+                  </span>
+                </div>
+                <div v-if="grp.weekly.reset_time" class="flex items-center justify-between font-mono text-[10.5px] text-subtle">
+                  <span>精确重置时刻</span>
+                  <span>{{ formatDateTime(grp.weekly.reset_time) }}</span>
+                </div>
+              </div>
+              <div
+                v-else
+                class="rounded border border-dashed border-line/70 bg-surface/60 px-2.5 py-1.5 text-2xs text-subtle"
+              >
+                周额度：当前套餐下该模型组仅受 5 小时滚动限额约束（无独立周卡点）
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1490,20 +1671,20 @@ async function copyErrorDetail(text: string): Promise<void> {
 
         <div v-if="quotaLoading && !quotaData" class="flex items-center justify-center gap-2 py-10 text-xs text-muted">
           <Spinner :size="16" />
-          <span>正在通过容器专属代理解析 Google 账号配额与支持模型…</span>
+          <span>正在通过容器专属代理解析 Google 5h / 周配额与支持模型…</span>
         </div>
 
         <div
           v-else-if="filteredQuotaModels.length > 0"
-          class="max-h-[26rem] overflow-y-auto rounded-md border border-line"
+          class="max-h-[24rem] overflow-y-auto rounded-md border border-line"
         >
           <table class="w-full text-left text-xs">
             <thead class="sticky top-0 bg-raised text-2xs text-subtle">
               <tr>
                 <th class="px-3 py-2 font-medium">真实模型 ID</th>
                 <th class="px-3 py-2 font-medium">来源</th>
-                <th class="px-3 py-2 font-medium">剩余额度</th>
-                <th class="px-3 py-2 font-medium">额度重置时间</th>
+                <th class="px-3 py-2 font-medium">5 小时额度 &amp; 重置时间</th>
+                <th class="px-3 py-2 font-medium">周额度 &amp; 重置时间</th>
                 <th class="px-3 py-2 text-right font-medium">操作</th>
               </tr>
             </thead>
@@ -1522,29 +1703,55 @@ async function copyErrorDetail(text: string): Promise<void> {
                     {{ m.source || 'live' }}
                   </Badge>
                 </td>
+                <!-- 5h 额度列 -->
                 <td class="px-3 py-2">
-                  <div v-if="m.remaining_pct !== null && m.remaining_pct !== undefined" class="flex items-center gap-2">
-                    <div class="h-1.5 w-20 overflow-hidden rounded-full bg-raised">
-                      <div
-                        class="h-full rounded-full"
-                        :class="
-                          m.remaining_pct <= 10
-                            ? 'bg-danger'
-                            : m.remaining_pct <= 35
-                              ? 'bg-warning'
-                              : 'bg-success'
-                        "
-                        :style="{ width: `${Math.max(3, Math.min(100, Math.round(m.remaining_pct)))}%` }"
-                      />
+                  <div v-if="model5hPct(m) !== null" class="space-y-0.5">
+                    <div class="flex items-center gap-2">
+                      <div class="h-1.5 w-16 overflow-hidden rounded-full bg-raised">
+                        <div
+                          class="h-full rounded-full"
+                          :class="quotaBarClass(model5hPct(m))"
+                          :style="{ width: `${Math.max(3, Math.min(100, Math.round(model5hPct(m) ?? 0)))}%` }"
+                        />
+                      </div>
+                      <span class="tnum font-mono text-2xs font-semibold text-fg">
+                        {{ formatQuotaPct(model5hPct(m)) }}
+                      </span>
                     </div>
-                    <span class="tnum font-mono text-2xs font-semibold text-fg">
-                      {{ formatQuotaPct(m.remaining_pct) }}
-                    </span>
+                    <div
+                      v-if="model5hReset(m)"
+                      class="font-mono text-[10.5px] text-subtle"
+                      :title="formatDateTime(model5hReset(m))"
+                    >
+                      {{ formatResetCountdown(model5hReset(m)) }}
+                    </div>
                   </div>
                   <span v-else class="text-2xs text-subtle">可用</span>
                 </td>
-                <td class="px-3 py-2 font-mono text-2xs text-muted">
-                  {{ m.reset_time ? formatRelative(m.reset_time) : '--' }}
+                <!-- 周额度列 -->
+                <td class="px-3 py-2">
+                  <div v-if="m.weekly_remaining_pct !== null && m.weekly_remaining_pct !== undefined" class="space-y-0.5">
+                    <div class="flex items-center gap-2">
+                      <div class="h-1.5 w-16 overflow-hidden rounded-full bg-raised">
+                        <div
+                          class="h-full rounded-full"
+                          :class="quotaBarClass(m.weekly_remaining_pct)"
+                          :style="{ width: `${Math.max(3, Math.min(100, Math.round(m.weekly_remaining_pct)))}%` }"
+                        />
+                      </div>
+                      <span class="tnum font-mono text-2xs font-semibold text-fg">
+                        {{ formatQuotaPct(m.weekly_remaining_pct) }}
+                      </span>
+                    </div>
+                    <div
+                      v-if="m.weekly_reset_time"
+                      class="font-mono text-[10.5px] text-subtle"
+                      :title="formatDateTime(m.weekly_reset_time)"
+                    >
+                      {{ formatResetCountdown(m.weekly_reset_time) }}
+                    </div>
+                  </div>
+                  <span v-else class="font-mono text-[10.5px] text-subtle">仅 5h 滚动</span>
                 </td>
                 <td class="px-3 py-2 text-right">
                   <div class="inline-flex items-center gap-1">

@@ -209,8 +209,8 @@ func toBalanceDTO(acc *ent.Account) accountBalanceDTO {
 		packages = append(packages, pkg)
 	}
 	dto := accountBalanceDTO{
-		// WorkBuddy 与 Command Code 均支持余额/积分快照查询。
-		Supported:    platform == domain.PlatformWorkBuddy || platform == domain.PlatformCommandCode,
+		// WorkBuddy、AntiGravity 与 Command Code 均支持余额/配额快照查询。
+		Supported: platform == domain.PlatformWorkBuddy || platform == domain.PlatformAntigravity || platform == domain.PlatformCommandCode,
 		FetchedAt:    timePtr(acc.BalanceFetchedAt),
 		Error:        acc.BalanceError,
 		Remaining:    acc.BalanceRemaining,

@@ -173,6 +173,30 @@ export function formatExpiry(value: string | null | undefined): string {
   return formatDateTime(value)
 }
 
+/**
+ * 配额窗口未来重置时间展示：同时给出剩余倒计时与本地具体重置时刻（如 `3h36m后 (18:06)` 或 `6天22h后 (12-05 13:06)`）。
+ */
+export function formatResetCountdown(value: string | null | undefined): string {
+  const date = parse(value)
+  if (!date) return '—'
+  const diffMs = date.getTime() - Date.now()
+  if (diffMs <= 0) return '即将重置'
+  const totalMins = Math.max(1, Math.round(diffMs / 60_000))
+  const hhmm = `${pad(date.getHours())}:${pad(date.getMinutes())}`
+  if (totalMins < 60) {
+    return `${totalMins}分后 (${hhmm})`
+  }
+  if (totalMins < 24 * 60) {
+    const h = Math.floor(totalMins / 60)
+    const m = totalMins % 60
+    return `${h}h${m > 0 ? `${m}m` : ''}后 (${hhmm})`
+  }
+  const d = Math.floor(totalMins / 1440)
+  const h = Math.floor((totalMins % 1440) / 60)
+  const mmddhhmm = `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${hhmm}`
+  return `${d}天${h > 0 ? `${h}h` : ''}后 (${mmddhhmm})`
+}
+
 export function isExpired(value: string | null | undefined): boolean {
   const date = parse(value)
   return date !== null && date.getTime() < Date.now()

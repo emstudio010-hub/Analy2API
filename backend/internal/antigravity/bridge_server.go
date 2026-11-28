@@ -1122,6 +1122,16 @@ func inheritFamilyQuota(dst *ModelQuotaItem, pool []ModelQuotaItem) {
 				rf := *cand.RemainingFraction
 				dst.RemainingFraction = &rf
 			}
+			if cand.FiveHourRemainingPct != nil {
+				fh := *cand.FiveHourRemainingPct
+				dst.FiveHourRemainingPct = &fh
+				dst.FiveHourResetTime = cand.FiveHourResetTime
+			}
+			if cand.WeeklyRemainingPct != nil {
+				wk := *cand.WeeklyRemainingPct
+				dst.WeeklyRemainingPct = &wk
+				dst.WeeklyResetTime = cand.WeeklyResetTime
+			}
 			dst.ResetTime = cand.ResetTime
 			dst.Exhausted = cand.Exhausted
 			return
